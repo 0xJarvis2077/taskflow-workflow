@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from taskflow import execution, execution_review
-from taskflow.contracts import TaskflowError, read_json, write_json
+from taskflow.contracts import TaskflowError, canonical, read_json, write_json
 from taskflow.execution_lifecycle import advance_lifecycle, resume_path_transport
 from taskflow.execution_store import evidence_ref
 from tests import test_execution_experiment as fixtures
@@ -115,10 +115,41 @@ class EvaluationIntakeResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskflowError, "traceable typed-locator"):
             resume_path_transport(self.store, self.record["flow_id"], self.resolution)
         verification.write_bytes(original)
-        board = self.store.dashboard()
-        next(row for row in board["attempts"] if row["attempt_id"] == self.record["state"]["score_attempt"]["attempt_id"])["state"] = "uncertain"
-        with patch.object(self.store, "dashboard", return_value=board), self.assertRaisesRegex(TaskflowError, "no automatic redraw"):
-            resume_path_transport(self.store, self.record["flow_id"], self.resolution)
+        from taskflow.execution_completion import completion_owner
+
+        score = self.record["state"]["score_attempt"]
+        originals = {}
+        # A sealed ended attempt can now be received legitimately. Keep this
+        # negative as an unresolved original still owned by its collector.
+        with self.store._db(True) as db:
+            for table, identity in (("attempts", score["attempt_id"]), ("work", score["work_id"])):
+                row = db.execute("SELECT state,data FROM " + table + " WHERE id=?", (identity,)).fetchone()
+                originals[table] = (identity, row["state"], row["data"])
+                value = json.loads(row["data"])
+                value["state"] = "uncertain"
+                db.execute("UPDATE " + table + " SET state=?,data=? WHERE id=?",
+                           ("uncertain", canonical(value).decode(), identity))
+        original_lookup = self.store.list_attempts
+        requested = []
+
+        def original_score_lookup(work_id):
+            requested.append(work_id)
+            rows = original_lookup(work_id)
+            if work_id == score["work_id"]:
+                self.assertEqual([score["attempt_id"]], [row["attempt_id"] for row in rows])
+                self.assertEqual("uncertain", rows[0]["state"])
+            return rows
+
+        try:
+            with completion_owner(Path(score["runtime_path"])) as owned:
+                self.assertTrue(owned)
+                with patch.object(self.store, "list_attempts", side_effect=original_score_lookup), self.assertRaisesRegex(TaskflowError, "no automatic redraw"):
+                    resume_path_transport(self.store, self.record["flow_id"], self.resolution)
+            self.assertIn(score["work_id"], requested)
+        finally:
+            with self.store._db(True) as db:
+                for table, (identity, state, data) in originals.items():
+                    db.execute("UPDATE " + table + " SET state=?,data=? WHERE id=?", (state, data, identity))
         self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
 
 

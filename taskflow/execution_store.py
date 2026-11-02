@@ -3216,9 +3216,20 @@ class ExecutionStore:
         with self._db() as db:
             return self._load(db, "attempts", attempt_id)
 
+    def list_attempts(self, work_id: str) -> list[dict[str, Any]]:
+        """Read one work's attempts in the existing ledger insertion order."""
+        work_id = validate_id(work_id, "work_id")
+        with self._db() as db:
+            return [_data(row) for row in db.execute(
+                "SELECT data FROM attempts WHERE work_id=? ORDER BY rowid", (work_id,))]
+
     def get_work(self, work_id: str) -> dict[str, Any]:
         with self._db() as db:
             return self._load(db, "work", work_id)
+
+    def get_decision(self, decision_id: str) -> dict[str, Any]:
+        with self._db() as db:
+            return self._load(db, "decisions", decision_id)
 
     def get_candidate(self, candidate_id: str) -> dict[str, Any]:
         with self._db() as db:
@@ -3339,9 +3350,12 @@ class ExecutionStore:
         return value
 
     @staticmethod
-    def _latest_observations(db: sqlite3.Connection) -> list[dict[str, Any]]:
+    def _latest_observations(db: sqlite3.Connection, task_id: str | None = None) -> list[dict[str, Any]]:
         latest: dict[str, tuple[datetime, int, dict[str, Any]]] = {}
-        for row in db.execute("SELECT seq,data FROM observations ORDER BY seq"):
+        query = "SELECT seq,data FROM observations"
+        rows = db.execute(query + " ORDER BY seq") if task_id is None else db.execute(
+            query + " WHERE task_id=? ORDER BY seq", (task_id,))
+        for row in rows:
             value = _data(row)
             try:
                 instant, basis, issue = _observation_time(value)
@@ -3356,6 +3370,18 @@ class ExecutionStore:
             if previous is None or candidate[:2] > previous[:2]:
                 latest[value["task_id"]] = candidate
         return [latest[task_id][2] for task_id in sorted(latest)]
+
+    def dispatch_ownership_snapshot(self, task_id: str) -> dict[str, Any]:
+        """Read one task's existing dispatch owner and dated observation only."""
+        task_id = validate_id(task_id, "task_id")
+        with self._db() as db:
+            row = db.execute("SELECT data FROM ownership WHERE task_id=?", (task_id,)).fetchone()
+            ownership = _data(row) if row is not None else None
+            if ownership is not None and ownership.get("scope") == "work_item":
+                ownership = None
+            observations = self._latest_observations(db, task_id)
+            return {"ownership": ownership,
+                    "observation": observations[0] if observations else None}
 
     def transfer_owner(self, task_id: str, previous_owner: str, new_owner: str,
                        evidence: list[dict[str, Any]], scope: str = "future_dispatch",

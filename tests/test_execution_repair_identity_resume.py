@@ -220,17 +220,32 @@ class RepairIdentityResumeTests(unittest.TestCase):
         self.assertEqual(self.child, self.store.get_flow(self.child["flow_id"]))
 
     def test_wrong_actual_author_duplicate_attempt_foreign_node_and_new_hold_reject(self):
-        board = self.store.dashboard()
+        original_lookup = self.store.list_attempts
+        requested = []
+
+        def changed_attempts(work_id, change=None, duplicate=False):
+            requested.append(work_id)
+            rows = original_lookup(work_id)
+            if work_id != self.attempt["work_id"]:
+                return rows
+            self.assertEqual([self.attempt["attempt_id"]], [row["attempt_id"] for row in rows])
+            rows = copy.deepcopy(rows)
+            if duplicate:
+                rows.append(copy.deepcopy(rows[0]))
+            else:
+                rows[0].update(change)
+            return rows
+
         for change in ({"role": "quality"}, {"state": "running"}, {"state": "failed"}, {"process_exit": True},
                        {"candidate_id": "foreign"}, {"cli_sid": "foreign-sid"}, {"request_digest": "0" * 64}):
-            wrong = copy.deepcopy(board)
-            next(row for row in wrong["attempts"] if row["attempt_id"] == self.attempt["attempt_id"]).update(change)
-            with self.subTest(change=change), patch.object(self.store, "dashboard", return_value=wrong), self.assertRaises(TaskflowError):
+            requested.clear()
+            with self.subTest(change=change), patch.object(self.store, "list_attempts", side_effect=lambda key: changed_attempts(key, change)), self.assertRaises(TaskflowError):
                 self.resume_child()
-        wrong = copy.deepcopy(board)
-        wrong["attempts"].append(copy.deepcopy(self.attempt))
-        with patch.object(self.store, "dashboard", return_value=wrong), self.assertRaises(TaskflowError):
+            self.assertIn(self.attempt["work_id"], requested)
+        requested.clear()
+        with patch.object(self.store, "list_attempts", side_effect=lambda key: changed_attempts(key, duplicate=True)), self.assertRaises(TaskflowError):
             self.resume_child()
+        self.assertIn(self.attempt["work_id"], requested)
         get_flow = self.store.get_flow
         for change in ({"pending_business_scope": {"reason": "new business choice"}}, {"current_node_id": "foreign"},
                        {"exception": {"reason": "Unknown decision", "work_id": self.attempt["work_id"]}}):

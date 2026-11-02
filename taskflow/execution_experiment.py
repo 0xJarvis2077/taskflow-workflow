@@ -6,7 +6,7 @@ import re
 
 from taskflow.contracts import PUBLIC_ROLES, REVIEW_KINDS, TaskflowError, canonical, relative_path, sha256
 from taskflow.execution import enqueue_spec
-from taskflow.execution_flow import _identity
+from taskflow.execution_flow import _get_or_none, _identity
 from taskflow.execution_formal import _handoff_errors, import_formal, prepare_formal, prepare_release, projected_quality_reports
 from taskflow.execution_review import (
     ingest_signed_evaluation, prepare_facts_runner, prepare_score_runner, seal_existing_facts,
@@ -268,16 +268,18 @@ def _work(store: object, record: dict, role: str, purpose: str, dependencies=Non
 
 
 def _completed(store: object, record: dict) -> tuple[dict | None, str]:
+    from taskflow.execution_completion import reconcile_ended_attempt
+
     identity = record["state"]["current_work_id"]
     work = store.get_work(identity)
-    attempts = [item for item in store.dashboard()["attempts"] if item["work_id"] == identity]
+    attempts = store.list_attempts(identity)
     if not attempts:
         if work["state"] != "ready":
             raise TaskflowError("experiment work has no original attempt and is not ready")
         return None, "original_worker_not_started"
     if len(attempts) != 1:
         raise TaskflowError("one experiment intent has more than one original attempt")
-    attempt = attempts[0]
+    attempt = reconcile_ended_attempt(store, attempts[0])
     if attempt["state"] in ACTIVE:
         return None, "original_worker_owns_completion"
     if attempt["state"] != "completed":
@@ -593,7 +595,8 @@ def _advance(store: object, record: dict) -> dict:
         purpose = packet["business_investment"]["unresolved_business_question"]
         work = _work(store, record, "solver", purpose)
         decision_id = _node(record, "experiment-decision")
-        decisions = [item for item in store.dashboard()["decisions"] if item["decision_id"] == decision_id]
+        decision = _get_or_none(store.get_decision, decision_id)
+        decisions = [] if decision is None else [decision]
         if not decisions:
             store.record_decision(decision_id, definition["task_id"], state["candidate_id"], action="experiment",
                 rationale=packet["business_investment"]["action"], evidence=[definition["authorization"]],
@@ -604,9 +607,12 @@ def _advance(store: object, record: dict) -> dict:
         if definition.get("source_author_flow_id"):
             config["authorization_item"] = definition["business_packet_item"]
         inner = Path(technical["formal_runtime_root"]) / run_id
-        prepared = prepare_formal(config=config, release=state["release"], candidate=candidate, runtime=inner)
+        preparation = {"config": config, "release": state["release"], "candidate": candidate, "runtime": inner}
+        if state.get("formal_preparation_recovery") is not None:
+            preparation["preparation_recovery"] = state["formal_preparation_recovery"]
+        prepared = prepare_formal(**preparation)
         outer = directory / "runtimes" / _node(record, "solver")
-        existing = next((item for item in store.dashboard()["work"] if item["work_id"] == work["work_id"]), None)
+        existing = _get_or_none(store.get_work, work["work_id"])
         if existing:
             if (existing["intent_id"] != work["intent_id"] or existing["candidate_id"] != work["candidate_id"]
                     or existing["runtime_path"] != str(outer)):
@@ -709,6 +715,11 @@ def _advance(store: object, record: dict) -> dict:
                             "evaluation_id": evaluation_id, "source_sha256": result["source_sha256"], "signer_sid": result["signer_sid"]}]
         state["archives"] = [*state["archives"], result["review_archive"]["path"]]
         if eligible:
+            # A completed first-run recovery cannot authorize a different run.
+            recovery = state.pop("formal_preparation_recovery", None)
+            if recovery is not None:
+                state["history"] = [*state["history"], {"kind": "run_preparation_recovery_retired",
+                    "run_id": run_id, "preparation": recovery}]
             state.update(stage="formal_prepare", run_index=1, confirmation_authorized=True,
                          confirmation_basis=eligibility, runs=runs, waiting=None)
             return _save(store, record, state, "experiment_single_confirmation_authorized")

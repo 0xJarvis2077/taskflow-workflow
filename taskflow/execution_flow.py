@@ -117,12 +117,10 @@ def register_workflow(store: ExecutionStore, definition: dict, evidence: list[di
         raise TaskflowError("workflow registration cannot replace its original definition/evidence")
     # A controller moving its own previously observed task to the unified entry
     # needs a single future-dispatch receipt, not a human handoff at every node.
-    ownership = store.dashboard()["ownership"]
-    general = next((item for item in ownership if item["task_id"] == definition["task_id"]
-                    and item.get("scope") != "work_item"), None)
+    dispatch = store.dispatch_ownership_snapshot(definition["task_id"])
+    general = dispatch["ownership"]
     if general is None:
-        observed = next((item for item in store.dashboard()["observations"]
-                         if item["task_id"] == definition["task_id"]), None)
+        observed = dispatch["observation"]
         if observed is not None:
             store.transfer_owner(definition["task_id"], observed["owner"], definition["owner"],
                                  refs, scope="future_dispatch")
@@ -140,7 +138,7 @@ def _completed_repair_identity(store: ExecutionStore, record: dict, work_id: str
     from taskflow.execution_flow_contracts import _ids, validate_completed_repair_identity
 
     definition, state = record["definition"], record["state"]
-    attempts = [row for row in store.dashboard()["attempts"] if row["work_id"] == work_id]
+    attempts = store.list_attempts(work_id)
     if len(attempts) != 1 or state.get("pending_business_scope"):
         raise TaskflowError("repair identity needs one original attempt and no business hold")
     attempt = attempts[0]
@@ -233,7 +231,7 @@ def resume_workflow(store: ExecutionStore, flow_id: str, *, reason: str, evidenc
         if work and (work["intent_id"] != node_id or work["candidate_id"] != state["candidate_id"]
                      or work["runtime_path"] != str(runtime)):
             raise TaskflowError("exception node has a different launch binding")
-        attempts = [item for item in store.dashboard()["attempts"] if item["work_id"] == work_id]
+        attempts = store.list_attempts(work_id)
         projection = None
         identity_proof = None
         if state.get("exception", {}).get("reason") == "repair defect_ids: list required":
@@ -1026,7 +1024,7 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
         if not state["current_work_id"]:
             return _prepare_node(store, record)
         work = store.get_work(state["current_work_id"])
-        attempts = [item for item in store.dashboard()["attempts"] if item["work_id"] == work["work_id"]]
+        attempts = store.list_attempts(work["work_id"])
         if not attempts:
             return record
         attempt = attempts[-1]
@@ -1035,11 +1033,21 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
             if (root / "termination.json").exists():
                 reconcile(store, attempt["attempt_id"])
             elif attempt["state"] == "uncertain":
+                from taskflow.execution import _record_result
+                from taskflow.execution_completion import completion_owner
                 from taskflow.execution_runner import reconcile_attempt
 
-                observed = reconcile_attempt(root)
-                if observed.get("status") != "running":
-                    raise TaskflowError("launch remains uncertain after original-process reconciliation")
+                with completion_owner(root) as owned:
+                    if not owned:
+                        return record
+                    current = store.get_attempt(attempt["attempt_id"])
+                    if current["state"] not in ACTIVE:
+                        return record
+                    observed = reconcile_attempt(root)
+                    if observed.get("process_ended"):
+                        _record_result(store, current, observed)
+                    elif observed.get("status") != "running":
+                        raise TaskflowError("launch remains uncertain after original-process reconciliation")
             return record
         adopted_repair = (state["stage"] == "repair" and attempt["state"] == "failed"
                           and (attempt.get("delivery_resolution") or {}).get("status") == "accepted_auxiliary_omission")

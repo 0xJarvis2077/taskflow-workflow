@@ -18,7 +18,7 @@ from taskflow.execution_formal import _handoff_errors
 from taskflow.execution_store import ExecutionStore, validate_evidence
 
 
-KINDS = {"evaluation_tail_v1", "experiment_v1", "author_quality_v1"}
+KINDS = {"evaluation_tail_v1", "experiment_v1", "author_quality_v1", "teacher_successor_v1"}
 
 
 def register_lifecycle(store: ExecutionStore, definition: dict, evidence: list[dict]) -> dict:
@@ -37,11 +37,16 @@ def register_lifecycle(store: ExecutionStore, definition: dict, evidence: list[d
     from taskflow.contracts import read_json
 
     packet = read_json(Path(authorization["path"]))
-    if packet.get("controller") != definition["owner"]:
+    authority_owner = packet.get("owner") if definition["kind"] == "teacher_successor_v1" else packet.get("controller")
+    if authority_owner != definition["owner"]:
         raise TaskflowError("lifecycle owner differs from business authority")
     if packet.get("task_id") and packet["task_id"] != definition["task_id"]:
         raise TaskflowError("lifecycle task differs from business authority")
     store.get_policy(definition["policy_id"])
+    if definition["kind"] == "teacher_successor_v1":
+        from taskflow.execution_teacher_successor import validate_teacher_successor_definition
+
+        validate_teacher_successor_definition(store, definition)
     if definition["kind"] == "author_quality_v1":
         attempt = store.get_attempt(definition["source_author_attempt"])
         binding = {key: attempt[key] for key in ("work_id", "intent_id", "candidate_id", "task_id")}
@@ -609,7 +614,9 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
                "later independent rejection/conflict covers the accepted scope; old acceptance is not current",
                "historical negative lacks exact current whole repair coverage",
                "historical negative is outside the current repaired quality graph",
-               "Composition cannot silently inherit changed package/scoring metadata"}
+               "Composition cannot silently inherit changed package/scoring metadata",
+               "native quality coverage must explicitly delimit whole or affected files"}
+    whole_finding_locations = reason == "native quality coverage must explicitly delimit whole or affected files"
     historical_closed_ancestor = reason == "historical negative lacks exact current whole repair coverage"
     historical_repaired_graph = reason == "historical negative is outside the current repaired quality graph"
     scoring_mirror = reason == "Composition cannot silently inherit changed package/scoring metadata"
@@ -621,7 +628,7 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
             or state.get("exception") != {"stage": "experiment_v1", "reason": reason}
             or not isinstance(reason, str) or reason not in allowed
             or not definition.get("source_author_flow_id") or state.get("pending_business_scope")
-            or ((scoring_mirror or historical_closed_ancestor or historical_repaired_graph) and state.get("pending_business_scope") is not None)
+            or ((scoring_mirror or historical_closed_ancestor or historical_repaired_graph or whole_finding_locations) and state.get("pending_business_scope") is not None)
             or state.get("candidate_id") or state.get("accepted_review_id") or state.get("runs") or state.get("release")
             or state.get("run_index", 0) != 0):
         raise TaskflowError("source transport resume requires its exact received initial zero-launch exception")
@@ -630,7 +637,7 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
     if (received.get("flow_id") != record["flow_id"] or received.get("status") != "exception"
             or received.get("exception") != state["exception"]):
         raise TaskflowError("source transport original exception receipt differs")
-    if (repair_alias or historical_negative or limited_findings or scoring_mirror or historical_closed_ancestor or historical_repaired_graph) and (received.get("controller") != definition["owner"]
+    if (repair_alias or historical_negative or limited_findings or scoring_mirror or historical_closed_ancestor or historical_repaired_graph or whole_finding_locations) and (received.get("controller") != definition["owner"]
             or any(received.get(key) != state.get(key) for key in ("history", "archives", "result"))
             or Path(original["path"]).name != "exception-" + sha256(canonical(received))[:16] + ".json"):
         raise TaskflowError("repair alias transport differs from its original received history/hash")
@@ -644,7 +651,7 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
         raise TaskflowError("source transport cannot wait, alter or receive a different author outcome")
     child, initial = bound["source"], bound["initial"]
     if (historical_negative and any(flow["state"].get("pending_business_scope") for flow in (parent, child))
-            or (scoring_mirror or historical_closed_ancestor or historical_repaired_graph) and any(flow["state"].get("pending_business_scope") is not None
+            or (scoring_mirror or historical_closed_ancestor or historical_repaired_graph or whole_finding_locations) and any(flow["state"].get("pending_business_scope") is not None
                                       or flow["state"].get("exception") is not None for flow in (parent, child))):
         raise TaskflowError("source transport cannot clear a source business hold")
     candidate = store.get_candidate(child["state"]["candidate_id"])
@@ -669,7 +676,7 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
             or (row.get("candidate_id") == candidate["candidate_id"] and row.get("role") == "solver")
             for row in [*board["work"], *board["attempts"]])
             or any(path.exists() or path.is_symlink() for path in paths)
-            or ((historical_negative or scoring_mirror or historical_closed_ancestor or historical_repaired_graph) and any(row.get("decision_id") == _node(record, "experiment-decision")
+            or ((historical_negative or scoring_mirror or historical_closed_ancestor or historical_repaired_graph or whole_finding_locations) and any(row.get("decision_id") == _node(record, "experiment-decision")
                 or (row.get("candidate_id") == candidate["candidate_id"] and row.get("action") == "experiment")
                 for row in board["decisions"]))):
         raise TaskflowError("source transport has an existing formal publication, preparation, work or attempt")
@@ -733,6 +740,26 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
             raise TaskflowError("source transport must preserve its original limited nonblocking calculation signature")
     elif handoff["certification"].get("composite_quality_coverage") != graph:
         raise TaskflowError("source transport native certification differs from the actual canonical coverage graph")
+    if whole_finding_locations:
+        repaired = handoff["certification"].get("repaired_candidate_acceptance", {})
+        prior = repaired.get("prior_whole_findings", {})
+        witness = prior.get("finding_locations", {})
+        paths = prior.get("affected_paths", [])
+        if (not graph or repaired != handoff["protocol_map"].get("repaired_candidate_acceptance")
+                or prior != handoff["certification"].get("whole", {}).get("prior_whole_findings")
+                or prior.get("coverage") != "whole_package" or prior.get("outcome") != "revision_required"
+                or not prior.get("blocking_issue_ids") or not paths
+                or type(witness.get("schema_version")) is not int or witness["schema_version"] != 1
+                or witness.get("kind") != "original_negative_whole_finding_locations"
+                or witness.get("coverage") != "whole_package" or witness.get("outcome") != "revision_required"
+                or witness.get("pointer") != "/native_signoff/affected_paths"
+                or witness.get("actual_value") != paths
+                or witness.get("blocking_issue_ids") != prior["blocking_issue_ids"]
+                or not isinstance(witness.get("targets"), list)
+                or {row.get("package_path") for row in witness["targets"]} != set(paths)
+                or any(witness.get("report", {}).get(key) != graph["whole_source"]["report"].get(key)
+                       for key in ("path", "sha256"))):
+            raise TaskflowError("source transport requires its exact validated original whole finding locations")
     if limited_findings:
         repaired = handoff["certification"].get("repaired_candidate_acceptance", {})
         prior = repaired.get("prior_whole_findings", {})
@@ -749,6 +776,7 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
     state.pop("exception", None)
     state.pop("receipt", None)
     return _save(store, record, state, "lifecycle_source_quality_transport_resumed")
+
 
 
 def _resume_unpublished_release_metadata(store: ExecutionStore, record: dict, resolution: dict, refs: list[dict]) -> dict:
@@ -1151,7 +1179,171 @@ def _resume_validated_intake(store: ExecutionStore, record: dict, resolution: di
     return _save(store, record, state, "lifecycle_validated_evaluation_intake_resumed")
 
 
-def _resume_validated_host_preparation(store: ExecutionStore, record: dict, resolution: dict, refs: list[dict]) -> dict:
+
+@_handoff_errors
+def _confirmation_first_run_footprint(store: ExecutionStore, record: dict, packet: dict, candidate: dict) -> dict:
+    """Read the one accepted first run that may precede a zero-call confirmation."""
+    from taskflow.execution import _check_work_binding
+    from taskflow.execution_experiment import _confirmation_limit, _local_configuration_reasons, _node
+    from taskflow.execution_review import _local_assessment, _managed_projection_context, _source_binding, _time
+    from taskflow.execution_runner import _info, _read, _regular, _trace, _validate, _validated_collection, _validated_facts_seal
+    from taskflow.execution_store import evidence_ref
+    from taskflow.execution_teacher_successor import _archive
+    from taskflow.packages import verify_snapshot
+    from taskflow.records import verify_evaluation, verify_run
+
+    definition, state = record["definition"], record["state"]
+    rows = state.get("runs")
+    if (type(state.get("run_index")) is not int or state["run_index"] != 1
+            or state.get("confirmation_authorized") is not True
+            or state.get("confirmation_basis", {}).get("eligible") is not True
+            or type(packet.get("single_confirmation", {}).get("max_additional_attempts")) is not int
+            or packet["single_confirmation"]["max_additional_attempts"] != 1
+            or not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict)):
+        raise TaskflowError("confirmation recovery requires its one authorized accepted original run")
+    original = rows[0]
+    first = {**record, "state": {**state, "run_index": 0}}
+    work_id = _node(first, "solver")
+    work = store.get_work(work_id)
+    attempts = store.list_attempts(work_id)
+    if (len(attempts) != 1 or attempts[0].get("attempt_id") != original.get("solver_attempt_id")
+            or not isinstance(original.get("solver_sid"), str) or not original["solver_sid"]):
+        raise TaskflowError("confirmation recovery has no unique actual first solver attempt")
+    attempt = attempts[0]
+    runtime = Path(definition["directory"]) / "runtimes" / work_id
+    expected = {"work_id": work_id, "intent_id": work_id + "-intent", "task_id": candidate["task_id"],
+        "candidate_id": candidate["candidate_id"], "role": "solver", "policy_id": definition["policy_id"],
+        "dispatch_owner": definition["owner"], "runtime_path": str(runtime), "state": "completed"}
+    if (any(row.get(key) != value for row in (work, attempt) for key, value in expected.items())
+            or attempt.get("cli_sid") != original["solver_sid"]
+            or work.get("purpose") != packet["business_investment"]["unresolved_business_question"]
+            or attempt.get("purpose") != work.get("purpose")):
+        raise TaskflowError("confirmation recovery first solver identity, owner, purpose or completion differs")
+    manifest = _validate(runtime)
+    collected = _validated_collection(runtime, manifest)
+    _check_work_binding(attempt, candidate, manifest)
+    trace = _trace(runtime / "trace.jsonl", original["solver_sid"])
+    if (any(collected.get(key) is not True for key in ("process_ended", "technical_accepted", "delivery_complete", "model_completed"))
+            or collected.get("sid") != original["solver_sid"] or trace.get("model_completed") is not True
+            or any(row.get("request_digest") != manifest["request"]["sha256"] for row in (work, attempt))
+            or any(manifest["model"].get("requested" if key == "model" else key) != definition["technical"]["formal_config_base"][key]
+                   for key in ("model", "reasoning_effort") if key in definition["technical"]["formal_config_base"])
+            or manifest["candidate_binding"] != {key: candidate[key] for key in
+                ("candidate_id", "task_id", "content_digest", "input_digest", "evaluation_digest")}):
+        raise TaskflowError("confirmation recovery first solver lacks its complete sealed original delivery")
+    formal_archive, _, _ = _archive(state["formal_archive"], "solver")
+    if (formal_archive != Path(definition["directory"]) / "archives" / attempt["attempt_id"]
+            or any(_info(runtime / name) != _info(formal_archive / name)
+                   for name in ("manifest.json", "manifest-lock.json", "collection.json", "collection-lock.json"))):
+        raise TaskflowError("confirmation recovery first solver differs from its full sealed original archive")
+    decision_id = _node(first, "experiment-decision")
+    decision = store.get_decision(decision_id)
+    if (work.get("experiment_decision_id") != decision_id or attempt.get("experiment_decision_id") != decision_id
+            or decision.get("candidate_id") != candidate["candidate_id"] or decision.get("task_id") != candidate["task_id"]
+            or decision.get("action") != "experiment" or decision.get("authorized") is not True
+            or decision.get("experiment_purpose") != work["purpose"]
+            or validate_evidence(decision.get("evidence")) != validate_evidence([definition["authorization"]])):
+        raise TaskflowError("confirmation recovery first run differs from its exact original authorized decision")
+    first_run = validate_id(packet["formal"]["first_run_id"], "first run_id")
+    destination = Path(definition["directory"]) / "evaluations" / first_run
+    receipt_path = destination / "receipt.json"
+    receipt, binding = _read(receipt_path), _read(destination / "binding.json")
+    if (canonical({key: value for key, value in original.items() if key not in {"solver_attempt_id", "solver_sid"}}) != canonical(receipt)
+            or receipt.get("accepted") is not True or receipt.get("state") != "accepted"
+            or receipt.get("receipt") != str(receipt_path) or receipt.get("run") != state["imported_run"]["run_path"]):
+        raise TaskflowError("confirmation recovery original row differs from its fixed accepted intake receipt")
+    run_path = Path(receipt["run"])
+    run, snapshot = verify_run(run_path), verify_snapshot(Path(state["release"]["snapshot"]["path"]))
+    evaluation_path = run_path / "evaluations" / packet["independent_review"]["score_id"]
+    evaluation = verify_evaluation(evaluation_path)
+    if (run.get("run_id") != first_run or run.get("task_id") != candidate["task_id"]
+            or receipt.get("evaluation") != str(evaluation_path) or receipt.get("evaluation_id") != evaluation["evaluation_id"]
+            or evaluation.get("kind") != "original" or evaluation.get("validation_issues")
+            or receipt.get("record_digest") != evaluation["record_digest"]
+            or binding["config"].get("run_directory") != str(run_path)
+            or binding["config"].get("snapshot_directory") != state["release"]["snapshot"]["path"]
+            or binding["config"].get("evaluation_id") != packet["independent_review"]["score_id"]
+            or validate_evidence(binding["config"].get("evidence")) != validate_evidence([definition["authorization"]])
+            or any(value != run["run_digest"] for value in (receipt.get("run_digest"), binding.get("run_digest"), evaluation.get("run_digest")))
+            or run.get("snapshot_digest") != snapshot["snapshot_digest"]
+            or evaluation.get("evaluation_digest") != candidate["evaluation_digest"]
+            or any(snapshot.get(key) != candidate[key] for key in ("task_id", "content_digest", "input_digest", "evaluation_digest"))):
+        raise TaskflowError("confirmation recovery original run/evaluation/frozen version differs")
+    actual_trace = _info(runtime / "trace.jsonl")
+    if not any(all(row.get(key) == value for key, value in actual_trace.items()) for row in run.get("artifacts", [])):
+        raise TaskflowError("confirmation recovery native run lacks the actual first solver trace")
+    phases = {}
+    for label, role in (("facts", "review-facts"), ("score", "review-score")):
+        saved, prepared = state[label + "_attempt"], state[label + "_prepared"]
+        actual = store.get_attempt(saved["attempt_id"])
+        roots = Path(actual["runtime_path"])
+        part, source = _source_binding(roots, Path(prepared["review_binding"]))
+        collection = _validated_collection(roots, part)
+        _check_work_binding(actual, candidate, part)
+        review_work = store.get_work(actual["work_id"])
+        archive = receipt["review_archive"][label]
+        archived_root, archived_manifest, _ = _archive(archive, role)
+        if (actual.get("state") != "completed" or actual.get("role") != role or actual.get("cli_sid") != receipt.get("signer_sid")
+                or actual.get("candidate_id") != candidate["candidate_id"] or actual.get("policy_id") != definition["policy_id"]
+                or saved.get("work_id") != actual.get("work_id") or actual.get("work_id") != _node(first, role)
+                or prepared.get("work", {}).get("work_id") != actual["work_id"]
+                or any(actual.get(key) != review_work.get(key) for key in
+                       ("work_id", "intent_id", "task_id", "candidate_id", "role", "policy_id", "dispatch_owner", "runtime_path", "request_digest"))
+                or review_work.get("state") != "completed" or actual.get("dispatch_owner") != definition["owner"]
+                or actual.get("intent_id") != actual["work_id"] + "-intent"
+                or actual.get("request_digest") != part["request"]["sha256"]
+                or roots != Path(binding["config"][label + "_attempt"])
+                or _info(roots / "manifest.json") != _info(archived_root / "manifest.json")
+                or _info(roots / "collection.json") != _info(archived_root / "collection.json")
+                or source.get("run_digest") != run["run_digest"] or part["candidate_binding"] != manifest["candidate_binding"]
+                or any(collection.get(key) is not True for key in ("process_ended", "technical_accepted", "delivery_complete", "model_completed"))
+                or _trace(roots / "trace.jsonl", receipt["signer_sid"]).get("model_completed") is not True
+                or Path(archive["path"]) != destination / "full-archive" / label):
+            raise TaskflowError("confirmation recovery original facts/score managed source or sealed archive differs")
+        seal_name = "facts-seal.json" if label == "facts" else "first-score-seal.json"
+        if _info(roots / seal_name) != _info(archived_root / seal_name):
+            raise TaskflowError("confirmation recovery original review seal bytes differ from the archive")
+        phases[label] = (roots, part, source, collection)
+    facts_root, facts_manifest, facts_binding, _ = phases["facts"]
+    score_root, score_manifest, score_binding, score_collection = phases["score"]
+    facts = _validated_facts_seal(facts_root)
+    score_seal = _read(score_root / "first-score-seal.json")
+    raw_score = _read(Path(score_seal["score"]["path"]))
+    native = _read(evaluation_path / "record.original.json")
+    if (facts.get("sid") != receipt["signer_sid"] or score_manifest.get("resume_sid") != facts["sid"]
+            or facts["sid"] == original["solver_sid"] or facts["sid"] in facts_binding.get("excluded_sids", [])
+            or facts_manifest.get("resume_sid")
+            or score_seal.get("thread_id") != facts["sid"] or score_seal.get("facts_sha256") != receipt["facts_sha256"]
+            or facts["facts"]["sha256"] != receipt["facts_sha256"] or binding.get("facts") != facts
+            or binding.get("score") != score_seal["score"] or score_manifest.get("facts_seal") != facts
+            or score_binding.get("facts_seal") != facts or score_manifest.get("facts_attempt") != str(facts_root)
+            or score_seal.get("manifest") != _info(score_root / "manifest.json")
+            or score_seal.get("collection") != _info(score_root / "collection.json")
+            or _info(Path(score_seal["score"]["path"])) != score_collection["artifacts"].get(binding["config"].get("score_file", "first-score.json"))
+            or score_seal["score"]["sha256"] != receipt["source_sha256"]
+            or _regular(destination / "evaluation.original.json") != _regular(evaluation_path / "record.original.json")
+            or native.get("signed_original_score") != raw_score or native.get("source_sha256") != receipt["source_sha256"]
+            or native.get("total") != receipt["score"]
+            or not (_time(facts["at"]) <= _time(score_manifest["created_at"]) <= _time(score_collection["termination"]["started_at"]))):
+        raise TaskflowError("confirmation recovery original same-SID facts/score seals or signed evaluation differs")
+    rows = _read(Path(facts_binding["selector"]["path"]))["allowed_direct_artifacts"]
+    context = _managed_projection_context(score_root, score_manifest,
+        {**score_binding, "selector": facts_binding["selector"]}, facts, score_seal, rows)
+    if _local_assessment(raw_score, context, run, snapshot) != receipt.get("local_profile_assessment"):
+        raise TaskflowError("confirmation recovery original local eligibility no longer matches its sealed signed evidence")
+    maximum = _confirmation_limit(packet, _read(Path(state["release"]["snapshot"]["path"]) / "task.json")["scoring"]["total"])
+    if (maximum is None or receipt["score"] > maximum or run.get("completion") != "completed"
+            or run.get("input_binding") != "matched" or _local_configuration_reasons(record, receipt, run)):
+        raise TaskflowError("confirmation recovery original does not satisfy its existing one-confirmation authorization")
+    return {"work_id": work_id, "attempt_id": attempt["attempt_id"], "sid": attempt["cli_sid"],
+            "receipt": evidence_ref(receipt_path, "validated first original intake before this confirmation"),
+            "manifest": evidence_ref(runtime / "manifest.json", "exact completed first solver manifest"),
+            "collection": evidence_ref(runtime / "collection.json", "exact completed first solver collection"),
+            "run_digest": run["run_digest"], "record_digest": evaluation["record_digest"]}
+
+
+def _resume_validated_host_preparation(store: ExecutionStore, record: dict, resolution: dict, refs: list[dict], *,
+                                       public_probe: bool = False) -> dict:
     from taskflow.execution_experiment import _native_handoff, _node, _packet, _run_id
     from taskflow.execution_formal import _checked_ref, validate_formal_preparation_recovery
     from taskflow.execution_runner import _read
@@ -1160,6 +1352,9 @@ def _resume_validated_host_preparation(store: ExecutionStore, record: dict, reso
 
     definition, state = record["definition"], dict(record["state"])
     exception = state.get("exception", {})
+    if public_probe and (state.get("pending_business_scope") is not None
+                         or state.get("formal_preparation_recovery") is not None):
+        raise TaskflowError("public-probe preparation resume cannot clear a business hold or replace a recovery")
     if (definition.get("kind") != "experiment_v1" or state.get("status") != "exception"
             or state.get("stage") != "formal_prepare" or state.get("current_work_id") or not state.get("receipt")
             or exception.get("stage") != "formal_prepare" or not isinstance(exception.get("reason"), str)
@@ -1170,7 +1365,18 @@ def _resume_validated_host_preparation(store: ExecutionStore, record: dict, reso
     candidate = store.get_candidate(state["candidate_id"])
     inner = Path(definition["technical"]["formal_runtime_root"]) / run_id
     outer = Path(definition["directory"]) / "runtimes" / work_id
-    dashboard = store.dashboard()
+    first_footprint = (_confirmation_first_run_footprint(store, record, packet, candidate)
+                       if public_probe and state.get("run_index") == 1 else None)
+    if public_probe:
+        import json
+
+        with store._db() as db:
+            dashboard = {table: [json.loads(row["data"]) for row in db.execute(
+                "SELECT data FROM " + table + (" WHERE id<>?" if first_footprint else ""),
+                (first_footprint["work_id" if table == "work" else "attempt_id"],) if first_footprint else ())]
+                         for table in ("work", "attempts")}
+    else:
+        dashboard = store.dashboard()
     if (any(row.get("work_id") == work_id or row.get("intent_id") == work_id + "-intent"
             or row.get("runtime_path") in (str(inner), str(outer))
             or (row.get("role") == "solver" and row.get("candidate_id") == candidate["candidate_id"])
@@ -1212,26 +1418,50 @@ def _resume_validated_host_preparation(store: ExecutionStore, record: dict, reso
     if _read(intent) != identity:
         raise TaskflowError("host preparation intent/config digest differs from the original run")
     recovery_path, _ = _checked_ref(resolution["preparation"])
-    proof = validate_formal_preparation_recovery(config=config, release=release, candidate=candidate,
-                                                runtime=inner, recovery=resolution["preparation"])
+    if public_probe:
+        from taskflow.execution_formal import validate_formal_public_probe_recovery
+
+        validator = validate_formal_public_probe_recovery
+    else:
+        validator = validate_formal_preparation_recovery
+    proof = validator(config=config, release=release, candidate=candidate,
+                      runtime=inner, recovery=resolution["preparation"])
     if (proof.get("binding") != identity or proof.get("run_id") != run_id or proof.get("runtime") != str(inner)
             or type(proof.get("model_calls")) is not int or proof["model_calls"] != 0):
         raise TaskflowError("host recovery proof does not bind this exact zero-model preparation")
     for name in ("plan", "acceptance", "reservation", "intent", "recovery_process"):
         _checked_ref(proof[name])
+    if public_probe:
+        source_change = proof.get("source_change", {})
+        if (type(proof.get("schema_version")) is not int or proof["schema_version"] != 1
+                or proof.get("kind") != "validated_zero_inference_public_probe_source_recovery"
+                or not isinstance(source_change, dict)
+                or source_change.get("kind") != "deterministic_public_probe_target_v1"
+                or any(not isinstance(source_change.get(name), dict) for name in ("original", "replacement", "executed"))
+                or not isinstance(proof.get("recovery"), dict)
+                or any(proof["recovery"].get(key) != resolution["preparation"].get(key) for key in ("path", "sha256"))):
+            raise TaskflowError("public-probe preparation requires its explicit typed source recovery proof")
+        for name in ("original", "replacement", "executed"):
+            _checked_ref(source_change[name])
     prior = evidence_ref(Path(state["receipt"]), "original failed host preparation exception preserved")
     received = _read(Path(prior["path"]))
     if (received.get("flow_id") != record["flow_id"] or received.get("status") != "exception"
             or received.get("exception") != exception):
         raise TaskflowError("host preparation original exception receipt differs")
-    state["history"] = [*state["history"], {"kind": "validated_host_formal_preparation_resolution", "resolution": resolution,
+    history_kind = "validated_public_probe_formal_preparation_resolution" if public_probe else "validated_host_formal_preparation_resolution"
+    state["history"] = [*state["history"], {"kind": history_kind, "resolution": resolution,
         "evidence": refs, "previous_exception": exception, "previous_receipt": prior,
         "preparation": evidence_ref(recovery_path, "validated same-run zero-model host preparation"),
         "preparation_validation": proof, "work_id": work_id, "run_id": run_id, "new_model_dispatched": False}]
+    if first_footprint is not None:
+        state["history"][-1]["completed_first_run_exclusion"] = first_footprint
+    if public_probe:
+        state["formal_preparation_recovery"] = dict(resolution["preparation"])
     state.update(status="active", waiting=None)
     state.pop("exception", None)
     state.pop("receipt", None)
-    return _save(store, record, state, "lifecycle_validated_host_formal_preparation_resumed")
+    event = "lifecycle_validated_public_probe_preparation_resumed" if public_probe else "lifecycle_validated_host_formal_preparation_resumed"
+    return _save(store, record, state, event)
 
 
 def _resume_validated_composition(store: ExecutionStore, record: dict, resolution: dict, refs: list[dict]) -> dict:
@@ -1693,7 +1923,7 @@ def resume_path_transport(store: ExecutionStore, identity: str, resolution: dict
                        "resume_unclaimed_public_preparation", "resume_unclaimed_formal_preparation",
                        "resume_resolved_quality_dependency", "resume_validated_source_quality_transport", "resume_unpublished_release_metadata", "resume_validated_evaluation_intake",
                        "resume_unpublished_release_report_binding",
-                        "resume_validated_host_formal_preparation", "resume_validated_quality_composition",
+                        "resume_validated_host_formal_preparation", "resume_validated_public_probe_preparation", "resume_validated_quality_composition",
                         "resume_validated_score_preparation", "accept_declaration_only_candidate_transport",
                          "resume_resolved_declaration_dependency", "resume_resolved_author_preparation_dependency"}
             or not isinstance(resolution.get("reason"), str) or not resolution["reason"].strip()):
@@ -1727,6 +1957,8 @@ def resume_path_transport(store: ExecutionStore, identity: str, resolution: dict
             return _resume_validated_intake(store, record, resolution, refs)
         if action == "resume_validated_host_formal_preparation":
             return _resume_validated_host_preparation(store, record, resolution, refs)
+        if action == "resume_validated_public_probe_preparation":
+            return _resume_validated_host_preparation(store, record, resolution, refs, public_probe=True)
         if action == "resume_validated_quality_composition":
             return _resume_validated_composition(store, record, resolution, refs)
         if action == "resume_validated_score_preparation":
@@ -1802,6 +2034,10 @@ def advance_lifecycle(store: ExecutionStore, identity: str) -> dict:
         if state["status"] in ("accepted", "exception"):
             return _receive(store, record)
         kind = record["definition"]["kind"]
+        if kind == "teacher_successor_v1":
+            from taskflow.execution_teacher_successor import advance_teacher_successor
+
+            return advance_teacher_successor(store, record)
         if kind == "author_quality_v1":
             from taskflow.execution_author import advance_author
 
@@ -1852,6 +2088,22 @@ def run_lifecycle(store: ExecutionStore, identity: str, *, allow_model: bool = F
             state = record["state"]
             if state["status"] in ("accepted", "exception") and state.get("receipt"):
                 return record
+            if (record["definition"]["kind"] == "teacher_successor_v1"
+                    and state.get("author_lifecycle_id")):
+                # A mechanical tick never calls a model. Normal successor
+                # execution remains in this explicit allow_model consumer path.
+                try:
+                    followed = run_lifecycle(store, state["author_lifecycle_id"], allow_model=allow_model,
+                                             poll_seconds=poll_seconds)
+                except TaskflowError as exc:
+                    if str(exc) != "this lifecycle already has a consumer":
+                        raise
+                    return {**record, "execution": "existing_author_consumer_retained",
+                            "author_lifecycle_id": state["author_lifecycle_id"]}
+                if followed.get("execution") == "ready_requires_explicit_model_permission":
+                    return {**record, "execution": "ready_requires_explicit_model_permission",
+                            "author_lifecycle_id": followed["flow_id"]}
+                continue
             if state.get("current_work_id"):
                 work = store.get_work(state["current_work_id"])
                 if work["state"] == "ready":

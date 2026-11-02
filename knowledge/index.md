@@ -16,6 +16,7 @@
 | 选岗、系列题规划与实质去重 | [方向组合](methods/topic-portfolio.md) |
 | 业务任务、必要条件、公开预解题、参考与评分 | [设计与质量审查](methods/design-review.md) |
 | 完整岗位任务、正常短解、增难与投入选择 | [难度设计](methods/difficulty-design.md) |
+| 公开加工深度、独立判断与高分归因研究 | [研究路径](methods/difficulty-design.md#研究公开加工如何替代独立判断)、[加工边界](methods/design-review.md#公开材料的加工边界) |
 | 隔离运行、模型身份、事实封存与独立评分 | [压测](methods/stress-testing.md) |
 | 全卷正确／错误／遗漏、归因和返修 | [读卷复盘](methods/post-run-review.md) |
 | 历史自测方法及其适用范围 | [自测协议](methods/selftest-protocol.md) |

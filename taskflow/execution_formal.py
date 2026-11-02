@@ -4,11 +4,13 @@ These adapters neither grant an experiment nor grade a package. The caller
 records the exact investment decision and dispatches through the normal worker.
 """
 
+import ast
 import importlib.util
 import json
 from functools import wraps
 from pathlib import Path
 import re
+import stat
 import subprocess
 from typing import Any
 import uuid
@@ -512,6 +514,50 @@ def _prior_native_scope(signoff: dict, required: list[str], blocking: list[str])
             "coverage_basis": _signoff_text(signoff.get("coverage_basis"), "prior coverage basis")}
 
 
+def _whole_finding_locations(report: dict, required: list[str], manifest: dict,
+                              root: Path, refs: dict, issues: list[dict], candidate: dict | None = None) -> dict:
+    """Keep a negative whole review's explicit finding targets as original data."""
+    signoff, routing = report["native_signoff"], report["execution_routing"]
+    affected = signoff.get("affected_paths")
+    if signoff.get("coverage") != "whole_package" or not affected:
+        return {}
+    paths = _signoff_strings(affected, "original whole finding paths", nonempty=True)
+    blocking = _signoff_strings(routing.get("blocking_issue_ids"), "original whole blocking IDs", nonempty=True)
+    if (routing.get("scope") != "whole_package" or routing.get("outcome") != "revision_required"
+            or len(set(paths)) != len(paths) or set(paths) != set(required)
+            or not any(row.get("affirmed") is False for row in signoff["dimensions"].values())):
+        raise TaskflowError("negative whole finding paths require exact original blocking targets and false affirmations")
+    targets = []
+    for path in paths:
+        path = relative_path(path)
+        inputs = [row for row in manifest["inputs"] if row["target"] == path and row["kind"] in {"public", "teacher"}]
+        if len(inputs) != 1:
+            raise TaskflowError("original whole finding target has no unique original payload input")
+        row = inputs[0]
+        if candidate is not None:
+            files = [item for item in candidate["files"] if item["package_path"] == path]
+            if (len(files) != 1 or files[0]["path"] != row["source"] or files[0]["sha256"] != row["sha256"]
+                    or row["kind"] != ("public" if files[0]["role"] in PUBLIC_ROLES else "teacher")):
+                raise TaskflowError("original whole finding input is not its captured candidate payload")
+        source = Path(row["source"])
+        staged = root / "inputs" / path
+        expected = {key: row[key] for key in ("sha256", "size")}
+        if _info(source) != expected or _info(staged) != expected:
+            raise TaskflowError("original whole finding source/staged bytes drifted")
+        pointers = [{"reference": refs["issues"], "pointer": f"/issues/{index}/affected_paths",
+                     "issue_id": issue["id"], "actual_value": issue["affected_paths"]}
+                    for index, issue in enumerate(issues) if issue["id"] in blocking and path in issue["affected_paths"]]
+        if not pointers:
+            raise TaskflowError("original whole finding target has no signed blocking-issue pointer")
+        targets.append({"package_path": path, "input": row, "source": _ref(source), "staged": _ref(staged),
+                        "issue_targets": pointers})
+    return {"affected_paths": paths, "coverage_basis": _signoff_text(signoff.get("coverage_basis"), "original whole coverage basis"),
+            "finding_locations": {"schema_version": 1, "kind": "original_negative_whole_finding_locations",
+                "coverage": "whole_package", "outcome": "revision_required", "report": refs["adoption"],
+                "pointer": "/native_signoff/affected_paths", "actual_value": affected,
+                "candidate_binding": manifest["candidate_binding"], "blocking_issue_ids": blocking, "targets": targets}}
+
+
 def _prior_whole_findings(candidate: dict, attempt: dict, manifest: dict, root: Path,
                           refs: dict, report: dict) -> dict:
     """Read a real blocking whole review without relabeling its false dimensions."""
@@ -541,6 +587,7 @@ def _prior_whole_findings(candidate: dict, attempt: dict, manifest: dict, root: 
         raise TaskflowError("prior whole source has no exact original blocking findings")
     required = sorted({path for row in parsed["defects"] for path in row["affected_paths"]})
     scope = _prior_native_scope(signoff, required, blocking)
+    scope.update(_whole_finding_locations(report, required, manifest, root, refs, rows, candidate))
     return {"schema_version": 1, "kind": "original_whole_package_findings", "scope": "whole_package",
             "coverage": signoff["coverage"], "outcome": "revision_required", "blocking_issue_ids": blocking,
             "report": refs["adoption"], "issues": refs["issues"], "original_dimensions": signoff["dimensions"],
@@ -663,7 +710,8 @@ def _native_quality_source(store: object, candidate: dict, attempt_id: str,
     files = {item["package_path"] for item in candidate["files"]}
     if len(set(affected)) != len(affected) or any(relative_path(path) not in files for path in affected):
         raise TaskflowError("native quality affected paths must name unique current candidate files")
-    if (coverage == "whole_package" and affected) or (coverage != "whole_package" and not affected):
+    if ((coverage == "whole_package" and affected and not (prior_whole_findings and outcome == "revision_required"))
+            or (coverage != "whole_package" and not affected)):
         raise TaskflowError("native quality coverage must explicitly delimit whole or affected files")
     _signoff_text(signed.get("coverage_basis"), "coverage basis")
     dimensions = signed.get("dimensions")
@@ -941,6 +989,8 @@ def _repaired_certificate_sources(native: dict, candidate: dict, material: dict)
                           if row["id"] in report["execution_routing"]["blocking_issue_ids"] for path in row["affected_paths"]})}
     expected_prior.update(_prior_native_scope(report["native_signoff"], expected_prior["required_associations"],
                                               expected_prior["blocking_issue_ids"]))
+    expected_prior.update(_whole_finding_locations(report, expected_prior["required_associations"], manifest, root,
+        {"adoption": prior["report"], "issues": prior["issues"]}, issues["issues"]))
     if (report["execution_routing"].get("scope") != "whole_package"
             or report["execution_routing"].get("outcome") != "revision_required"
             or report["execution_routing"].get("blocking_issue_ids") != prior["blocking_issue_ids"]
@@ -1346,9 +1396,13 @@ def validate_formal_authority(*, config: dict, candidate: dict) -> dict:
 
 
 @_handoff_errors
-def prepare_formal(*, config: dict, release: dict, candidate: dict, runtime: Path) -> dict:
+def prepare_formal(*, config: dict, release: dict, candidate: dict, runtime: Path,
+                   preparation_recovery: dict | None = None) -> dict:
     """Prepare and validate the existing formal adapter; never enqueue or execute."""
     runtime = _destination(runtime)
+    recovered = (_validate_formal_preparation_recovery(config=config, release=release, candidate=candidate,
+                 runtime=runtime, recovery=preparation_recovery, public_probe=True, allow_draft=True)
+                 if preparation_recovery is not None else None)
     if release["candidate_binding"] != _binding(candidate):
         raise TaskflowError("formal release belongs to a different candidate")
     snapshot = Path(release["snapshot"]["path"])
@@ -1398,7 +1452,8 @@ def prepare_formal(*, config: dict, release: dict, candidate: dict, runtime: Pat
             or plan.get("launcher_python") != python):
         raise TaskflowError("prepared formal plan belongs to different request/frozen/configuration bytes")
     for name in needed | {"prepare_diagnostic.py"}:
-        expected = config["adapter"]["sha256"] if name == "prepare_diagnostic.py" else files[name]
+        expected = (recovered["source_change"]["executed"]["sha256"] if recovered is not None
+                    else config["adapter"]["sha256"]) if name == "prepare_diagnostic.py" else files[name]
         if _info(runtime / name)["sha256"] != expected:
             raise TaskflowError("prepared formal source differs from its approved adapter: " + name)
     validation = subprocess.run([python, str(runtime / "execute_diagnostic.py")], capture_output=True, timeout=60, check=False)
@@ -1444,17 +1499,68 @@ def _recovery_tree(path: Path, files: dict) -> None:
 @_handoff_errors
 def validate_formal_preparation_recovery(*, config: dict, release: dict, candidate: dict,
                                          runtime: Path, recovery: dict) -> dict:
-    """Read an explicit host-preparation proof; never prepare, probe or launch."""
+    """Read the exact listener-EPERM recovery; never prepare, probe or launch."""
+    return _validate_formal_preparation_recovery(config=config, release=release, candidate=candidate,
+                                               runtime=runtime, recovery=recovery)
+
+
+@_handoff_errors
+def validate_formal_public_probe_recovery(*, config: dict, release: dict, candidate: dict,
+                                          runtime: Path, recovery: dict) -> dict:
+    """Validate an explicit same-run public-probe source correction and real probes."""
+    return _validate_formal_preparation_recovery(config=config, release=release, candidate=candidate,
+                                               runtime=runtime, recovery=recovery, public_probe=True)
+
+
+def _public_probe_source_change(config: dict, runtime: Path, change: dict) -> dict:
+    """Only replace the redundant public target; retain all other adapter bytes."""
+    if (not isinstance(change, dict) or set(change) != {"kind", "original", "replacement", "executed"}
+            or change["kind"] != "deterministic_public_probe_target_v1"):
+        raise TaskflowError("formal public-probe recovery requires its exact source-change witness")
+    original, raw = _recovery_reference(change["original"], Path(config["adapter"]["path"]))
+    _checked_ref(config["adapter"])
+    old = b"work / 'draft/input/prompt.md'"
+    replacement = b"work / next(iter(plan['public_tree']))"
+    try:
+        parsed_source = ast.parse(raw)
+    except SyntaxError as error:
+        raise TaskflowError("formal public-probe original source is invalid") from error
+    functions = [node for node in parsed_source.body if isinstance(node, ast.FunctionDef) and node.name == "shell_probes"]
+    targets = [node.value for function in functions for node in function.body if isinstance(node, ast.Assign)
+               and any(isinstance(target, ast.Name) and target.id == "targets" for target in node.targets)]
+    first = (targets[0].elts[0].elts[1] if len(targets) == 1 and isinstance(targets[0], ast.List)
+             and targets[0].elts and isinstance(targets[0].elts[0], ast.Tuple) and len(targets[0].elts[0].elts) == 4 else None)
+    if (raw.count(old) != 1 or len(functions) != 1 or first is None
+            or ast.get_source_segment(raw.decode("utf-8"), first) != old.decode("utf-8")):
+        raise TaskflowError("formal public-probe source must have one original fixed first target expression")
+    updated, updated_raw = _recovery_reference(change["replacement"])
+    executed, executed_raw = _recovery_reference(change["executed"], runtime / "prepare_diagnostic.py")
+    if (updated in (original, executed) or updated_raw != raw.replace(old, replacement)
+            or executed_raw != updated_raw):
+        raise TaskflowError("formal public-probe source differs beyond the one permitted target expression")
+    for name, digest in config["adapter"]["files"].items():
+        _checked_ref({"path": str(updated.parent / name), "sha256": digest})
+    return {"prepare_diagnostic.py": sha256(updated_raw), **config["adapter"]["files"]}
+
+
+def _validate_formal_preparation_recovery(*, config: dict, release: dict, candidate: dict,
+                                         runtime: Path, recovery: dict, public_probe: bool = False,
+                                         allow_draft: bool = False) -> dict:
     runtime = _destination(runtime)
     proof_path, raw = _recovery_reference(recovery)
     proof = parse_json(raw, str(proof_path))
     binding = {"config_digest": sha256(canonical(config)), "release_receipt": release["receipt"],
                "candidate_binding": _binding(candidate), "runtime": str(runtime)}
     run_id = validate_id(config["run_id"], "run_id")
+    draft = (public_probe and allow_draft and proof.get("kind") == "public_probe_source_recovery_preparation"
+             and proof.get("completed") is False)
+    recovery_kind = ("public_probe_source_recovery_preparation" if draft else
+                     "validated_zero_inference_public_probe_source_recovery" if public_probe
+                     else "validated_zero_inference_host_preparation_recovery")
     if (type(proof.get("schema_version")) is not int or proof["schema_version"] != 1
-            or proof.get("kind") != "validated_zero_inference_host_preparation_recovery"
+            or proof.get("kind") != recovery_kind
             or proof.get("binding") != binding or proof.get("runtime") != str(runtime) or proof.get("run_id") != run_id
-            or proof.get("completed") is not True or type(proof.get("model_calls")) is not int or proof["model_calls"] != 0):
+            or proof.get("completed") is not (not draft) or type(proof.get("model_calls")) is not int or proof["model_calls"] != 0):
         raise TaskflowError("formal recovery proof does not bind a completed zero-inference preparation")
     validate_formal_authority(config=config, candidate=candidate)
     if release["candidate_binding"] != _binding(candidate):
@@ -1472,14 +1578,18 @@ def validate_formal_preparation_recovery(*, config: dict, release: dict, candida
     reservation_path = Path(release["publication_root"]) / "reports/runtime-reservations" / (run_id + ".json")
     _, reservation_raw = _recovery_reference(proof["reservation"], reservation_path)
     reservation = parse_json(reservation_raw, "original run reservation")
-    token_path = runtime.with_name(run_id + ".host-preparation-recovery.json")
+    token_path = runtime.with_name(run_id + (".public-probe-preparation-recovery.json" if public_probe
+                                           else ".host-preparation-recovery.json"))
     _, token_raw = _recovery_reference(proof["recovery_token"], token_path)
     token = parse_json(token_raw, "exclusive recovery token")
     if (type(token.get("schema_version")) is not int or token["schema_version"] != 1
-            or token.get("kind") != "exclusive_zero_inference_preparation_recovery"
+            or token.get("kind") != ("exclusive_zero_inference_public_probe_source_recovery" if public_probe
+                                    else "exclusive_zero_inference_preparation_recovery")
             or token.get("binding") != binding or token.get("run_id") != run_id or token.get("runtime") != str(runtime)
             or type(token.get("model_calls")) is not int or token["model_calls"] != 0):
         raise TaskflowError("formal recovery exclusive token belongs to different preparation")
+    if public_probe and token.get("source_change") != proof.get("source_change"):
+        raise TaskflowError("formal public-probe exclusive token has a different source correction")
     previous = proof["previous_runtime"]
     archive = _destination(Path(previous["path"]))
     retained = runtime.with_name(run_id + ".failed-preparation-" + sha256(token_raw)[:12])
@@ -1492,36 +1602,64 @@ def validate_formal_preparation_recovery(*, config: dict, release: dict, candida
     files = parse_json(manifest_raw, "failed runtime manifest")["files"]
     expected_names = {"baseline-plan.json", "runtime_gate.py", "prepare_diagnostic.py", "execute_diagnostic.py", "file_evidence.py",
                       "request.md", "source-lock.json", "shell-probes.json", "preparation-process.json", "preparation-failure.json"}
+    if public_probe:
+        expected_names.remove("shell-probes.json")
     if not isinstance(files, dict) or set(files) != expected_names:
-        raise TaskflowError("formal recovery requires exactly the original failed preparation's ten files")
+        raise TaskflowError("formal recovery requires exactly the original failed preparation files")
     _recovery_tree(archive, files)
     _recovery_tree(retained, files)
     adapter, _ = _checked_ref(config["adapter"])
     approved = {**config["adapter"]["files"], "prepare_diagnostic.py": config["adapter"]["sha256"]}
     if set(approved) != expected_names - {"request.md", "source-lock.json", "shell-probes.json", "preparation-process.json", "preparation-failure.json"}:
         raise TaskflowError("formal recovery needs all five approved source/baseline files")
+    current_sources = (_public_probe_source_change(config, runtime, proof["source_change"])
+                       if public_probe else approved)
     for name, digest in approved.items():
-        for path in (adapter.parent / name, archive / name, runtime / name):
+        for path in (adapter.parent / name, archive / name):
             _checked_ref({"path": str(path), "sha256": digest})
+        _checked_ref({"path": str(runtime / name), "sha256": current_sources[name]})
+    if public_probe:
+        for name in expected_names:
+            if stat.S_IMODE((archive / name).stat().st_mode) != stat.S_IMODE((retained / name).stat().st_mode):
+                raise TaskflowError("formal public-probe retained file permissions drifted")
+        for name in set(approved) | {"request.md"}:
+            if stat.S_IMODE((archive / name).stat().st_mode) != stat.S_IMODE((runtime / name).stat().st_mode):
+                raise TaskflowError("formal public-probe copied source/request permissions changed")
     _, request_raw = _checked_ref(config["request"])
     if _regular(archive / "request.md") != request_raw or _regular(runtime / "request.md") != request_raw:
         raise TaskflowError("formal recovery changed the original request")
     old_process = _read(archive / "preparation-process.json")
     old_failure = _read(archive / "preparation-failure.json")
-    old_probe = _read(archive / "shell-probes.json")
+    old_probe = _read(archive / "shell-probes.json") if not public_probe else None
     zero = lambda value: type(value) is int and value == 0
-    if (old_failure.get("nature") != "preparation_failure_no_inference" or old_failure.get("run_id") != run_id
-            or old_failure.get("type") != "PermissionError" or old_failure.get("message") != "[Errno 1] Operation not permitted"
-            or not all(zero(item.get("model_calls")) for item in (old_failure, old_process, old_probe))
-            or type(old_process.get("exit_code")) is not int or old_process["exit_code"] != 1
-            or old_process.get("stdout") != "" or not isinstance(old_process.get("stderr"), str)
-            or "listener.bind(address)" not in old_process["stderr"]
-            or "PermissionError: [Errno 1] Operation not permitted" not in old_process["stderr"]
-            or old_probe.get("nature") != "no_inference_existing_target_boundary_probes" or old_probe.get("passed") is not False
-            or old_probe.get("tcp", {}).get("listener_created") is not False
-            or old_probe.get("exception", {}).get("type") != "PermissionError"
-            or old_probe.get("exception", {}).get("message") != "[Errno 1] Operation not permitted"):
-        raise TaskflowError("formal recovery original failure is not the exact zero-inference host listener EPERM")
+    if public_probe:
+        prefix = "Negative probe is invalid without existing target: "
+        message = old_failure.get("message", "")
+        missing = Path(message[len(prefix):]) if isinstance(message, str) and message.startswith(prefix) else None
+        if (old_failure.get("nature") != "preparation_failure_no_inference" or old_failure.get("run_id") != run_id
+                or old_failure.get("type") != "ValueError" or missing is None or not missing.is_absolute()
+                or tuple(missing.parts[-3:]) != ("draft", "input", "prompt.md")
+                or missing.exists() or missing.is_symlink()
+                or not all(zero(item.get("model_calls")) for item in (old_failure, old_process))
+                or type(old_process.get("exit_code")) is not int or old_process["exit_code"] != 1
+                or old_process.get("stdout") != "" or not isinstance(old_process.get("stderr"), str)
+                or "ValueError: " + message not in old_process["stderr"]
+                or "shell_probes(plan)" not in old_process["stderr"]):
+            raise TaskflowError("formal public-probe recovery lacks the exact missing fixed-target zero-inference failure")
+        old_work = missing.parents[2]
+    else:
+        if (old_failure.get("nature") != "preparation_failure_no_inference" or old_failure.get("run_id") != run_id
+                or old_failure.get("type") != "PermissionError" or old_failure.get("message") != "[Errno 1] Operation not permitted"
+                or not all(zero(item.get("model_calls")) for item in (old_failure, old_process, old_probe))
+                or type(old_process.get("exit_code")) is not int or old_process["exit_code"] != 1
+                or old_process.get("stdout") != "" or not isinstance(old_process.get("stderr"), str)
+                or "listener.bind(address)" not in old_process["stderr"]
+                or "PermissionError: [Errno 1] Operation not permitted" not in old_process["stderr"]
+                or old_probe.get("nature") != "no_inference_existing_target_boundary_probes" or old_probe.get("passed") is not False
+                or old_probe.get("tcp", {}).get("listener_created") is not False
+                or old_probe.get("exception", {}).get("type") != "PermissionError"
+                or old_probe.get("exception", {}).get("message") != "[Errno 1] Operation not permitted"):
+            raise TaskflowError("formal recovery original failure is not the exact zero-inference host listener EPERM")
     python = str(Path(config["launcher_python"]).resolve())
     argv = [python, str(runtime / "prepare_diagnostic.py"), "--solver", release["solver"]["path"],
             "--evaluation-directory", str(snapshot_root / "draft/evaluation"), "--run-id", run_id,
@@ -1541,7 +1679,10 @@ def validate_formal_preparation_recovery(*, config: dict, release: dict, candida
             or not zero(process.get("model_calls")) or not isinstance(process.get("stdout"), str)
             or not isinstance(process.get("stderr"), str)):
         raise TaskflowError("formal recovery process did not complete the same zero-inference preparation")
-    for name in ("execution-claim.json", "execution-attempt.json", "real-run", "initial-input-binding.json"):
+    markers = ("execution-claim.json", "execution-attempt.json", "real-run", "initial-input-binding.json")
+    if public_probe:
+        markers += ("launch.json", "dispatch.json", "process.json", "termination.json", "collection.json", "trace.jsonl")
+    for name in markers:
         if (runtime / name).exists() or (runtime / name).is_symlink():
             raise TaskflowError("formal recovery cannot accept an executed or uncertain model slot")
     _, plan_raw = _recovery_reference(proof["plan"], runtime / "execution-plan.json")
@@ -1561,23 +1702,41 @@ def validate_formal_preparation_recovery(*, config: dict, release: dict, candida
             or reservation.get("frozen_binding") != plan.get("frozen_binding")):
         raise TaskflowError("formal recovery plan/configuration/frozen/reservation binding differs")
     source_locks = [_read(path / "source-lock.json") for path in (archive, runtime)]
-    for lock in source_locks:
+    for index, lock in enumerate(source_locks):
         if (lock.get("no_repository_dynamic_imports") is not True or not isinstance(lock.get("files"), list)
                 or not lock["files"] or len({row["path"] for row in lock["files"]}) != len(lock["files"])):
             raise TaskflowError("formal recovery source lock is incomplete or ambiguous")
         by_path = {row["path"]: row for row in lock["files"]}
-        for name, digest in approved.items():
+        for name, digest in (approved if index == 0 else current_sources).items():
             if by_path.get(str(runtime / name), {}).get("sha256") != digest:
                 raise TaskflowError("formal recovery source lock omits its approved copied source")
         for reference in lock["files"]:
-            observed_source = _info(Path(reference["path"]))
+            path = Path(reference["path"])
+            if public_probe and index == 0 and path.parent == runtime and path.name in approved:
+                path = archive / path.name
+            observed_source = _info(path)
             if (observed_source["sha256"] != reference.get("sha256")
                     or ("size" in reference and observed_source["size"] != reference["size"])):
                 raise TaskflowError("formal recovery locked dependency bytes drifted")
     gate_path = runtime / "runtime_gate.py"
     namespace = {"__file__": str(gate_path), "__name__": "taskflow_readonly_formal_recovery_gate"}
     exec(compile(_regular(gate_path), str(gate_path), "exec"), namespace)
-    namespace["validate"](plan, require_review=True)
+    namespace["validate"](plan, require_review=not draft)
+    if public_probe:
+        if namespace["public_tree"](old_work) != namespace["public_tree"](Path(release["solver"]["path"])):
+            raise TaskflowError("formal public-probe original copied public bytes drifted")
+        target = str(Path(plan["cwd"]) / next(iter(plan["public_tree"])))
+        probe = _read(runtime / "shell-probes.json")
+        targets = probe.get("host_existence_checked", [])
+        if (not targets or targets[0].get("name") != "public" or targets[0].get("path") != target
+                or targets[0].get("expected_readable") is not True
+                or targets[0].get("expected_sha256") != plan["public_tree"][next(iter(plan["public_tree"]))]["sha256"]):
+            raise TaskflowError("formal public-probe evidence does not bind the deterministic real public member")
+    if draft:
+        return {"schema_version": 1, "kind": recovery_kind, "completed": False, "source_change": proof["source_change"],
+                "binding": binding, "run_id": run_id, "runtime": str(runtime), "model_calls": 0,
+                **{key: proof[key] for key in ("plan", "reservation", "intent", "previous_runtime", "recovery_process")},
+                "recovery": recovery}
     _, acceptance_raw = _recovery_reference(proof["acceptance"], runtime / "launch-review.json")
     acceptance = parse_json(acceptance_raw, "recovered formal acceptance")
     if (acceptance.get("approved") is not True or acceptance.get("preparation_binding") != binding
@@ -1608,7 +1767,8 @@ def validate_formal_preparation_recovery(*, config: dict, release: dict, candida
             or observed.get("private_denied") is not True or observed.get("deny_code") not in ("EPERM", "EACCES")
             or any(observed.get(key) is not True for key in ("own_write", "fork_ipc", "sqlite"))):
         raise TaskflowError("formal recovery recorded native normal-tool checks did not pass")
-    return {"binding": binding, "run_id": run_id, "runtime": str(runtime), "model_calls": 0,
+    return {**({"schema_version": 1, "kind": recovery_kind, "completed": True, "source_change": proof["source_change"]} if public_probe else {}),
+            "binding": binding, "run_id": run_id, "runtime": str(runtime), "model_calls": 0,
             **{key: proof[key] for key in ("plan", "acceptance", "reservation", "intent", "previous_runtime", "recovery_process")},
             "recovery": recovery}
 

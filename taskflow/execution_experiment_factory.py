@@ -12,9 +12,9 @@ from typing import Iterator
 
 from taskflow.contracts import TaskflowError, canonical, sha256, validate_id
 from taskflow.execution_flow import _identity, _publish_once
-from taskflow.execution_lifecycle import _lifecycle_lock, register_lifecycle
+from taskflow.execution_lifecycle import KINDS, _lifecycle_lock, register_lifecycle
 from taskflow.execution_runner import _identity as _process_identity
-from taskflow.execution_runner import _publish, _read
+from taskflow.execution_runner import _info, _publish, _read
 from taskflow.execution_store import evidence_ref, validate_evidence
 
 
@@ -72,17 +72,138 @@ def _exclusive_intent(path: Path, value: dict) -> None:
         os.fsync(handle.fileno())
 
 
+def _consumer_argv(store: object, record: dict) -> list[str]:
+    return [str(Path(sys.executable).resolve()), "-m", "taskflow", "execution", "--db", str(store.path),
+            "lifecycle-run", "--flow-id", record["flow_id"], "--allow-model"]
+
+
+def _consumer_definition(record: dict) -> dict:
+    return {"flow_id": record["flow_id"], "definition_digest": record["definition_digest"],
+            **{key: record["definition"].get(key) for key in ("kind", "task_id", "owner", "policy_id")}}
+
+
+def _consumer_launch_chain(directory: Path, current: dict, store: object, repository: Path) -> tuple[Path, Path, dict, dict, int]:
+    """Read every retained launch generation; never jump an unrecorded window."""
+    root_intent, root_receipt = directory / "consumer-launch-intent.json", directory / "consumer-launch.json"
+    generations = directory / "consumer-generations"
+    paths = [(root_intent, root_receipt)]
+    if generations.exists():
+        if generations.is_symlink() or not generations.is_dir():
+            raise TaskflowError("consumer generation root is not a controlled directory")
+        entries = sorted(generations.iterdir())
+        for number, entry in enumerate(entries, 1):
+            if entry.name != f"{number:06d}" or entry.is_symlink() or not entry.is_dir():
+                raise TaskflowError("consumer generation membership is ambiguous")
+            paths.append((entry / "consumer-launch-intent.json", entry / "consumer-launch.json"))
+    previous = None
+    for generation, (intent_path, receipt_path) in enumerate(paths):
+        if not intent_path.exists() or not receipt_path.exists():
+            raise TaskflowError("original launch intent has no PID receipt; no relaunch")
+        intent, receipt = _read(intent_path), _read(receipt_path)
+        argv = _consumer_argv(store, current)
+        if (not isinstance(intent, dict) or intent.get("flow_id") != current["flow_id"]
+                or intent.get("definition_digest") != current["definition_digest"]
+                or intent.get("database") != str(store.path) or intent.get("cwd") != str(repository)
+                or intent.get("allow_model") is not True or intent.get("argv") != argv
+                or intent.get("stdout") != str(intent_path.parent / "consumer.stdout.log")
+                or intent.get("stderr") != str(intent_path.parent / "consumer.stderr.log")):
+            raise TaskflowError("original consumer launch intent binding differs")
+        if (not isinstance(receipt, dict) or receipt.get("flow_id") != current["flow_id"]
+                or receipt.get("launch_intent") != evidence_ref(intent_path, "original consumer launch intent")
+                or receipt.get("stdout") != intent["stdout"] or receipt.get("stderr") != intent["stderr"]):
+            raise TaskflowError("original consumer PID receipt does not bind its launch intent")
+        process = receipt.get("process", {})
+        if (not isinstance(process, dict) or type(process.get("pid")) is not int or process["pid"] <= 0
+                or not isinstance(process.get("start_identity"), str) or not process["start_identity"].strip()):
+            raise TaskflowError("consumer original proven start identity is missing; no relaunch")
+        refs = validate_evidence(intent["evidence"])
+        if not {(ref["path"], ref["sha256"]) for ref in current["evidence"]} <= {(ref["path"], ref["sha256"]) for ref in refs}:
+            raise TaskflowError("consumer original business authority is not retained")
+        # Source observations describe the code loaded at that earlier launch.
+        # A later reviewed publication must not reinterpret them as current bytes.
+        inventory = intent.get("source_refs")
+        if not isinstance(inventory, list) or not inventory:
+            raise TaskflowError("consumer original source inventory is missing")
+        historical_paths = set()
+        for item in inventory:
+            if (not isinstance(item, dict) or not isinstance(item.get("path"), str)
+                    or not Path(item["path"]).is_absolute() or ".." in Path(item["path"]).parts
+                    or item["path"] in historical_paths or not isinstance(item.get("sha256"), str)
+                    or len(item["sha256"]) != 64 or not isinstance(item.get("location"), str) or not item["location"].strip()):
+                raise TaskflowError("consumer original historical source inventory is malformed")
+            historical_paths.add(item["path"])
+        if generation:
+            if (intent.get("generation") != generation or intent.get("definition_binding") != _consumer_definition(current)
+                    or intent.get("previous_launch") != previous
+                    or intent.get("original_launch") != {"intent": evidence_ref(root_intent, "original consumer launch intent"),
+                                                         "receipt": evidence_ref(root_receipt, "original consumer PID receipt")}):
+                raise TaskflowError("consumer generation does not bind the exact preceding/original launch")
+        previous = {"intent": evidence_ref(intent_path, "preceding consumer launch intent"),
+                    "receipt": evidence_ref(receipt_path, "preceding consumer PID receipt")}
+    return paths[-1][0], paths[-1][1], intent, receipt, len(paths) - 1
+
+
+def _consumer_recovery(repository: Path, recovery: dict | None) -> dict:
+    """Verify an explicit reviewed publication plus the complete current code list."""
+    if not isinstance(recovery, dict) or set(recovery) != {"publication", "source_refs"}:
+        raise TaskflowError("dead consumer recovery requires explicit publication and current source refs")
+    publication = validate_evidence([recovery["publication"]])[0]
+    proof = _read(Path(publication["path"]))
+    if (not isinstance(proof, dict) or type(proof.get("schema_version")) is not int or proof["schema_version"] != 1
+            or proof.get("kind") != "validated_execution_source_publication" or proof.get("accepted") is not True):
+        raise TaskflowError("consumer recovery publication is not a validated execution source publication")
+    paths = {}
+    for name in ("before", "after"):
+        rows = proof.get(name)
+        if not isinstance(rows, list) or not rows:
+            raise TaskflowError("consumer source publication requires before/after byte manifests")
+        paths[name] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise TaskflowError("consumer source publication file binding must be an object")
+            path = Path(row.get("path", ""))
+            if (not path.is_absolute() or ".." in path.parts or any(part.is_symlink() for part in (path, *path.parents))
+                    or not path.is_relative_to(repository) or str(path) in paths[name]
+                    or type(row.get("size")) is not int or row["size"] < 0
+                    or not isinstance(row.get("sha256"), str) or len(row["sha256"]) != 64):
+                raise TaskflowError("consumer source publication has an unsafe/ambiguous file binding")
+            if name == "after":
+                if _info(path) != {key: row[key] for key in ("sha256", "size")}:
+                    raise TaskflowError("consumer source publication differs from current published bytes")
+            elif "preserved_source" in row:
+                preserved = validate_evidence([row["preserved_source"]])[0]
+                if _info(Path(preserved["path"])) != {key: row[key] for key in ("sha256", "size")}:
+                    raise TaskflowError("consumer source publication preserved old bytes differ")
+            paths[name][str(path)] = row
+    if not paths["before"].keys() <= paths["after"].keys() or str(Path(__file__).resolve()) not in paths["after"]:
+        raise TaskflowError("consumer source publication omits its launcher or drops a prior file")
+    publication_evidence = validate_evidence(proof.get("evidence"))
+    sources = validate_evidence(recovery["source_refs"])
+    expected = _source_refs(repository)
+    actual_pairs = [(row["path"], row["sha256"]) for row in sources]
+    if len(actual_pairs) != len(set(actual_pairs)) or set(actual_pairs) != {(row["path"], row["sha256"]) for row in expected}:
+        raise TaskflowError("consumer recovery source inventory is not the complete exact current taskflow source set")
+    for row in sources:
+        if "size" in row and (type(row["size"]) is not int or _info(Path(row["path"]))["size"] != row["size"]):
+            raise TaskflowError("consumer recovery current source size differs")
+    return {"publication": publication, "source_refs": sources, "publication_evidence": publication_evidence}
+
+
 def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
-                              evidence: list[dict] | None = None) -> dict:
-    """Launch one registered lifecycle once; uncertain launches never redraw."""
+                              evidence: list[dict] | None = None, resume_dead: bool = False,
+                              recovery: dict | None = None) -> dict:
+    """Launch once, or explicitly append a generation for a proven dead consumer."""
+    if type(resume_dead) is not bool or (recovery is not None and not resume_dead):
+        raise TaskflowError("consumer recovery requires explicit resume_dead=True")
     repository = Path(repository).resolve()
     if repository != Path(__file__).resolve().parents[1]:
         raise TaskflowError("consumer repository differs from the running execution package")
     refs = validate_evidence([*record["evidence"], *(evidence or [])])
     current = store.get_flow(record["flow_id"])
-    if current["definition_digest"] != record["definition_digest"]:
+    if (current["definition_digest"] != record["definition_digest"]
+            or current["definition_digest"] != sha256(canonical(current["definition"]))):
         raise TaskflowError("consumer record differs from its registered immutable definition")
-    if current["definition"].get("kind") not in ("experiment_v1", "author_quality_v1", "evaluation_tail_v1"):
+    if current["definition"].get("kind") not in KINDS:
         raise TaskflowError("consumer launch requires an existing execution lifecycle")
     directory = Path(current["definition"]["directory"])
     base = {"flow_id": current["flow_id"], "revision": current["revision"],
@@ -92,40 +213,64 @@ def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
         if receipt:
             return {**base, "status": "terminal_reused", "receipt": evidence_ref(Path(receipt), "existing terminal lifecycle result")}
         return {**base, "status": "attention", "reason": "terminal lifecycle has no received result yet; no relaunch"}
+    if resume_dead and (current["state"].get("pending_business_scope") is not None
+                        or current["state"].get("exception") is not None):
+        return {**base, "status": "attention", "reason": "consumer recovery cannot bypass a pending business scope or exception"}
     with _bootstrap_lock(directory):
         intent_path, receipt_path = directory / "consumer-launch-intent.json", directory / "consumer-launch.json"
+        generation, previous, original, recovered = 0, None, None, None
         if intent_path.exists():
-            intent = _read(intent_path)
-            if (not isinstance(intent, dict) or intent.get("flow_id") != current["flow_id"]
-                    or intent.get("definition_digest") != current["definition_digest"]
-                    or intent.get("database") != str(store.path)):
-                return {**base, "status": "attention", "reason": "original consumer launch intent binding differs"}
-            if not receipt_path.exists():
-                return {**base, "status": "attention", "reason": "original launch intent has no PID receipt; no relaunch",
-                        "launch_intent": evidence_ref(intent_path, "original launch intent retained")}
-            launched = _read(receipt_path)
-            expected = evidence_ref(intent_path, "original consumer launch intent")
-            if not isinstance(launched, dict) or launched.get("launch_intent") != expected:
-                return {**base, "status": "attention", "reason": "original consumer PID receipt does not bind its launch intent"}
-            validate_evidence(intent["evidence"])
-            validate_evidence(intent["source_refs"])
-            status, reason = _process_status(launched.get("process", {}))
-            return {**base, "status": "alive_reused" if status == "alive" else "attention",
-                    "reason": reason, "process_status": status, "process": launched.get("process"),
-                    "launch_receipt": evidence_ref(receipt_path, "original consumer PID receipt")}
+            try:
+                latest_intent, latest_receipt, intent, launched, generation = _consumer_launch_chain(
+                    directory, current, store, repository)
+            except (TaskflowError, OSError, ValueError, KeyError, TypeError) as error:
+                return {**base, "status": "attention", "reason": str(error)}
+            identity = launched.get("process", {})
+            status, reason = _process_status(identity)
+            if not resume_dead or status != "dead":
+                return {**base, "status": "alive_reused" if status == "alive" else "attention",
+                        "reason": reason, "process_status": status, "process": identity,
+                        "launch_receipt": evidence_ref(latest_receipt, "original consumer PID receipt")}
+            if not isinstance(identity, dict) or not isinstance(identity.get("start_identity"), str) or not identity["start_identity"].strip():
+                return {**base, "status": "attention", "reason": "dead consumer has no original proven start identity; no relaunch"}
+            recovered = _consumer_recovery(repository, recovery)
+            refs = validate_evidence([*refs, recovered["publication"], *recovered["publication_evidence"]])
+            previous = {"intent": evidence_ref(latest_intent, "preceding consumer launch intent"),
+                        "receipt": evidence_ref(latest_receipt, "preceding consumer PID receipt")}
+            original = {"intent": evidence_ref(intent_path, "original consumer launch intent"),
+                        "receipt": evidence_ref(receipt_path, "original consumer PID receipt")}
+            generation += 1
+        elif resume_dead or receipt_path.exists() or (directory / "consumer-generations").exists():
+            return {**base, "status": "attention", "reason": "dead consumer recovery has no original launch intent; no launch"}
         try:
             with _lifecycle_lock(store, current["flow_id"]):
-                pass
+                if resume_dead and canonical(store.get_flow(current["flow_id"])) != canonical(current):
+                    return {**base, "status": "attention", "reason": "consumer lifecycle changed during recovery validation"}
         except TaskflowError:
             return {**base, "status": "attention", "reason": "existing lifecycle consumer owns its lock; no second launch"}
-        stdout_path, stderr_path = directory / "consumer.stdout.log", directory / "consumer.stderr.log"
-        argv = [str(Path(sys.executable).resolve()), "-m", "taskflow", "execution", "--db", str(store.path),
-                "lifecycle-run", "--flow-id", current["flow_id"], "--allow-model"]
+        launch_directory = directory
+        if generation:
+            base = {**base, "generation": generation}
+            # The bootstrap lock serializes this exact chain; an empty directory
+            # after a crash is an unknown generation, never permission to skip it.
+            (directory / "consumer-generations").mkdir(exist_ok=True)
+            launch_directory = directory / "consumer-generations" / f"{generation:06d}"
+            launch_directory.mkdir()
+            intent_path, receipt_path = launch_directory / "consumer-launch-intent.json", launch_directory / "consumer-launch.json"
+        stdout_path, stderr_path = launch_directory / "consumer.stdout.log", launch_directory / "consumer.stderr.log"
+        argv = _consumer_argv(store, current)
         intent = {"schema_version": 1, "flow_id": current["flow_id"], "definition_digest": current["definition_digest"],
                   "database": str(store.path), "argv": argv, "cwd": str(repository), "allow_model": True,
                   "created_at": datetime.now(timezone.utc).isoformat(), "launcher_pid": os.getpid(),
                   "stdout": str(stdout_path), "stderr": str(stderr_path), "evidence": refs,
                   "source_refs": _source_refs(repository)}
+        if generation:
+            if canonical(_consumer_recovery(repository, recovery)) != canonical(recovered):
+                raise TaskflowError("consumer recovery source publication changed before launch")
+            intent.update(generation=generation, previous_launch=previous, original_launch=original,
+                          definition_binding=_consumer_definition(current),
+                          recovery={key: recovered[key] for key in ("publication", "source_refs")},
+                          old_source_refs_are_historical=True)
         _exclusive_intent(intent_path, intent)
         process = None
         try:
@@ -143,7 +288,7 @@ def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
                        "stdout": str(stdout_path), "stderr": str(stderr_path)}
             _publish(receipt_path, receipt)
         except (OSError, ValueError) as exc:
-            _publish_once(directory / "consumer-launch-error.json", {"flow_id": current["flow_id"],
+            _publish_once(launch_directory / "consumer-launch-error.json", {"flow_id": current["flow_id"],
                           "reason": str(exc), "spawned_pid": process.pid if process is not None else None,
                           "original_intent_retained": True, "automatic_retry": False})
             return {**base, "status": "attention", "consumer_spawned": process is not None,

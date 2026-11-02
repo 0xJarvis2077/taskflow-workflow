@@ -132,6 +132,10 @@ native角色必须显式提供`native_permissions`，经`probe_native_attempt`�
 
 `execution reconcile ATTEMPT_ID` 只核原进程/启动身份、监督进程回执、原trace、占位与成果，从不启动模型。启动前已占位、PID登记前中断或进程无法核验时保持uncertain；重新启动worker不会重派同一意图。已证明终止后按实际响应及成果分别收集，不以退出0计完成。采集与归档逐文件原子发布，保留中断意图；源文件漂移拒绝覆盖原件。
 
+正常作者、公开重建、质量及实验消费者也会检查原 ACTIVE 尝试的实际终止证据，并沿同一 `reconcile` 入口接收该尝试。没有终止证据仍等待原角色；不明启动不会变成新尝试。消费者在模型结束后、成果收集前中断时，恢复原消费者即可继续原件接收和后继独立检查。读取某工作项的尝试或归属使用窄状态查询；真正交接时的独立质量门仍照常验证，不因读取看板而重验所有无关候选。
+
+新工作进程与接收入口共享每个 runtime 的成果收集互斥，覆盖实际运行直至成果封存和数据库接收。终止回执先于原工作进程收尾出现时，其他接收者只等待；原工作进程完成收尾或退出并释放互斥后才能接收同一尝试。升级前已在途的进程不会自动取得新锁或热加载新代码，须沿原消费者收尾，或在其确已退出的自然边界恢复。
+
 Markdown看板将原主控的R&D观察与已交接的工作项逐行展开，显示各自负责人；未派发、运行、待核证及技术完成分别呈现。进程已结束、模型响应完成和产物技术接收不能从主控文档的`running`文字互相推断。JSON保留完整工作项、尝试、质量及来源时间；非受管角色的实际终止与trace观察仅作旁路证据，不替原主控接收或签业务结论。
 
 `apply`调用`set_control(scope, action, reason)`：scope为all、task:ID或work:ID；pause/cancel仅约束后续领取，cancel仅取消ready，不杀在途CLI；resume不复活已取消工作。对不明尝试先核证，技术重试另建有说明的新意图，保留原尝试。没有“自动无限重试”。
@@ -203,6 +207,19 @@ python3 -m taskflow execution author-start --help
 
 作者必须实际交付`research.md`、`candidate-decision.md`、`handoff.md`、`handoff.json`和`issues.json`。候选目录是可选成果，研究结束不因此被判缺交。完成后先封完整原件，再按原签`handoff.json`分支：研究结束只归档并接收具体结论；业务选择未决只停该生命周期；完整候选经真实作者/完整来源绑定后才准备新的严格公开重建及独立整包质量、必要返修和复检。最终仅接收研究质量资产，不自动派发正式作答。相同packet重入复用原意图；修改packet、替换模板或不明尝试不能暗中变成第二次调用。
 
+### 原评接收后的明确教师后继
+
+`teacher-successor-start` 消费主控明确选择的有界后继包，连接已接收的原卷／事实／评分与唯一下一研究作者。包使用 `schema_version: 1`、`kind: explicit_bounded_post_original_teacher_business_successors`、`owner`、`batch_scope`、`author_factory: REF` 及非空 `items`。每项绑定 `predecessor_run`、`predecessor_receipt: REF`、`registered_original: REF`、`author_intent` 和 `author_packet: REF`。原分如有提供，仅用于核对原件，不触发作者或改题规则。
+
+```sh
+python3 -m taskflow execution teacher-successor-start --packet TEACHER-BUSINESS.json --directory execution/teacher-successors
+python3 -m taskflow execution teacher-successor-start --packet TEACHER-BUSINESS.json --directory execution/teacher-successors --allow-model
+```
+
+省略开关只登记并准备，机械 tick 不派模型。已有接收器与完整归档验证实际原卷、评价摘要、事实封存、同一评阅 SID 的评分及其先后关系，并在当前状态中绑定唯一已接收前驱。每个作者意图只能有一个不可替换的教师后继绑定。新作者沿原 author factory 准备、原 worker 领取及原独立质量链继续；已在途作者只按原 factory-intent、spec、request、manifest 和 attempt 身份接收，不启动第二个消费者或重写原请求。失败、不明尝试或缺失原件保留待处理。
+
+该入口延续同一已授权批次，原模型确认门保持；不为新批次代选模型。作者交付仍须由正常独立角色检查真实改稿，绑定或请求准备不等于内容问题已关闭。正式实验需要主控另行登记具体用途与授权；研究结束及真实业务未决仍返回其已登记主控。
+
 完整候选的未审报告使用`task.reviews`中对应的`id/kind/path`；报告路径须在`reports/`且不重复声明为payload。作者自检、原始观察和归属说明保存在私有provenance，不冒充独立签发。严格unsigned占位须有`schema_version=1`、对应`review_id/kind`、`status=inconclusive`、`independent_quality_passed=false`和`new_formal_score=null`，其余字段仍受接收器允许集约束。已有原报告不符合此元数据形状时，原JSON、路径、SHA、作者和异常先保留，显式派生包装再接收；不回写原作者输出或已锁请求。
 
 `accept_declaration_only_candidate_transport`另接明确的`declaration_transport={schema_version:1,kind,original:REF,projected:REF,evidence:[REF]}`，逐次重核原completed作者及完整采集归档。`referenced_rubric_role_v1`仅能更正已被`scoring.rubric_file`唯一引用、与当前评分完整对应的私有teacher角色为rubric；`declared_unsigned_report_layout_v1`仅能把三个原私有未审报告同字节移入作者provenance，并将对应`reviews.path`指向`reports/`中的严格unsigned包装。包装须保留完整原JSON、原相对路径和SHA。其余题包、公开内容、评分和payload字节保持原样。后者允许对原已存在的私有零字节JSONL追加[合同规定的`empty_content`](task-contract.md)，须有真实生产/解析依据；它证明零记录格式声明，不证明业务控制正确。
@@ -220,6 +237,7 @@ experiment release 在 canonical kind producer 与严格 required-ID consumer �
 | `resume_resolved_quality_dependency` | 子质量flow已显式解决原精确`repair defect_ids: list required`字段传递异常（原repair角色`covered_defect_ids`与assigned集合相同），或已用明确repair-record投影解决原精确技术异常，或已显式解决零派发`public_rebuild`的仓库内runtime错误后，核原作者、公开前驱、同一子flow/节点和原异常回执，恢复其传播到作者父flow或尚无solver工作的后继实验的依赖异常。不能跳过未解决的质量缺陷、失败/不明尝试或独立业务等待条件。 |
 | `resume_validated_evaluation_intake` | 处理 `evaluation_intake` 的原精确错误 `signed evidence path/location is missing`，或 `signed source has no unique same-byte native run artifact: <signed source>`。恢复JSON另给`receipt: REF`，指向该flow固定`evaluations/<run_id>/receipt.json`的已成功接收原件。前者保留原 typed-locator 验证；后者核原 `source_path_map` 的每项公开包路径、角色、首阶段输入、selector、唯一同名同字节run原件、全部引用投影与完整归档。均核同SID、当前候选四摘要、原封score/facts/规范与原生评价后仅恢复同stage。 |
 | `resume_validated_host_formal_preparation` | 仅处理原run在宿主监听EPERM处停止、尚无solver work/attempt或执行痕迹的零模型准备。另给`preparation: REF`，绑定原intent/reservation、完整失败目录封存、同路径准备、全部原隔离/上下文/正常工具探针及完成回执；验证后恢复原`formal_prepare`，不重新准备或claim。 |
+| `resume_validated_public_probe_preparation` | 仅处理原准备器把公开正向读取探针写死为不存在路径的零模型失败。另给 `preparation: REF`，完整保留原九文件失败目录、intent、reservation、request 与用途；显式新准备源码只允许把该公开目标改为已锁定公开树中的真实成员。新 source-lock 如实记录新字节，其他源码、全部负向隔离、上下文及正常工具探针不变。只有实际完成的最终验收侧证能恢复同一 `formal_prepare`；准备引导的 draft 不能用于恢复。动作不 prepare、claim 或重派模型，旧 EPERM 分支保持原边界。 |
 | `resume_validated_score_preparation` | 原精确规范角色覆盖错误已由有效独立规范证书解决后，另给`preparation: REF`指向原`prepare_score_runner`返回原件；仅接同facts SID/seal、同冻结run的ready评分工作且score attempt为0，保留异常回执，恢复原`score_prepare`。动作不准备、不重封facts、不claim。 |
 | `resume_validated_source_quality_transport` | 仅处理原初始experiment_v1已接收源的明确运输异常；先重验同一原作者/候选、原签或已登记canonical组合、当前native handoff、原异常回执及零solver准备/工作/尝试，再恢复原stage。`different/later revision`仅在确有上述同字节别名闭合、原接收history/hash一致且当前原签为独立whole时可恢复。精确`later independent rejection/conflict covers the accepted scope; old acceptance is not current`仅用于同一原接收history/hash、当前别名gate及原作者子flow的既有canonical组合全部通过，并且无原实验decision、任何formal足迹或源业务hold的情况。resolution只追加，动作不创建组合、不签业务通过、不补三true，不消除pending_business_scope或独立业务hold，不重开complete。部署须使用重新导入当前源码的新消费者，旧进程不会热加载。 |
 | `resume_unpublished_release_metadata` | 仅接原初次release的`snapshot file manifest mismatch`异常，原终态异常回执、来源与三份投影均重验；publication、暂存、锁、formal及solver足迹须确实不存在。只恢复同packet/候选/版本的release首次原子提交，不adopt或覆盖已存在发布，也不派发模型。 |
@@ -234,6 +252,10 @@ experiment release 在 canonical kind producer 与严格 required-ID consumer �
 上述操作均在生命周期锁内追加历史，保留原异常、回执、定义、尝试和原签分。validated intake恢复不重新导入或调用模型；正常消费者幂等接收同一evaluation，active状态或已消费恢复不能再次使用。
 
 历史负面结论的旧修订图可作为来源证据，但不能因此成为当前通过。接收器须重建该负面结论自己的实际返修、独立 affected 闭合及完整祖先别名；当前独立整包签发或持久化派生图均须通过原始验证，再逐项证明后继重叠负面结论已闭合。空图和伪造摘要不能代替真实当前来源。默认调用仍拒绝失效旧图；上下文不放宽 whole/affected 范围，不修改原签或补充 covered IDs。初始实验收到`historical negative is outside the current repaired quality graph`时，也只能在上述当前图验证及原有零足迹、回执和业务 hold 检查通过后，使用`resume_validated_source_quality_transport`恢复。
+
+原独立整包负评若明确声明 whole，非空 `affected_paths` 只有在恰为原 blocking findings 的实际目标时，才能作为缺陷定位运输。侧证保留原 coverage、路径、false 维度和逐目标原件／暂存字节绑定；旧负评仍不是通过，当前返修闭合图必须另外有效。初始实验的精确范围字段错误可沿同一 source-quality 恢复入口接收该侧证；未知范围、正面 whole 附带局部路径、定位不符或业务 hold 均不能借此清除。
+
+公开探针准备恢复侧证仅绑定其原 run。原评分实际接收且符合既有唯一确认授权时，活跃侧证退役入历史，不随新 run 自动使用。确认 run 若自身出现同类零模型准备失败，须有它自己的完整侧证；只有该 flow 已完整封存并接收原卷、事实及评分的唯一首跑，才可从本次重复派发检查中精确排除。当前 run、其它用途、失败、不明或未封存的 solver 足迹仍阻止恢复。
 
 宿主准备恢复须先按明确授权核正确宿主权限，独占同run恢复标记并完整保留旧inner，原intent和reservation路径及字节不变；仅在原canonical路径执行批准准备程序的`--in-runtime`分支及全部原探针。不得再stage抢预约、跳过隔离检查、放宽目标profile或重抽失败/不明模型。恢复操作不自动重试；任何已有solver派发或证据漂移均停止。完成回执经只读验证后，既有生命周期仍须照常验证prepared plan，才可沿原授权唯一派发。
 
@@ -259,7 +281,9 @@ python3 -m taskflow execution lifecycle-run --flow-id LIFECYCLE_ID --allow-model
 python3 -m taskflow execution experiment-start --packet EXPERIMENT-PACKET.json --factory /path/to/experiment-factory.json --allow-model
 ```
 
-历史兼容入口必须显式传 `--factory FILE`，CLI 不再提供旧工厂默认值；新批次使用 `batch-experiment-start`。省略`--allow-model`只登记独立`experiment_v1`定义；带开关启动每项自己的`lifecycle-run --allow-model`普通消费者。新实验等待对应作者质量结果并核确切候选、来源与授权，不修改旧作者的no-auto实验定义，不全库动态发现。启动先保存不可替换的意图，使用`start_new_session`、`stdin=DEVNULL`及独立stdout/stderr日志，随后保存PID、启动身份和进程组；同一生命周期还有进程锁。已证明存活的同源消费者复用，完成结果复用；意图缺PID收据、身份不明或已退出均返回attention，不自动重拉原模型。持久状态与日志可供接续，系统睡眠/重启后持续运行仍不在已验证范围。
+历史兼容入口必须显式传 `--factory FILE`，CLI 不再提供旧工厂默认值；新批次使用 `batch-experiment-start`。省略`--allow-model`只登记独立`experiment_v1`定义；带开关启动每项自己的`lifecycle-run --allow-model`普通消费者。新实验等待对应作者质量结果并核确切候选、来源与授权，不修改旧作者的no-auto实验定义，不全库动态发现。启动先保存不可替换的意图，使用`start_new_session`、`stdin=DEVNULL`及独立stdout/stderr日志，随后保存PID、启动身份和进程组；同一生命周期还有进程锁。已证明存活的同源消费者复用，完成结果复用；意图缺PID收据、身份不明或已退出时默认返回attention，不自动重拉原模型。持久状态与日志可供接续，系统睡眠/重启后持续运行仍不在已验证范围。
+
+工程显式调用 `launch_lifecycle_consumer(..., resume_dead=True, recovery=...)` 可恢复已证明退出的原消费者。`recovery` 绑定经过验收的源码发布回执和当前完整源码清单；重验原意图、定义、用途、授权、PID 启动身份及空闲生命周期锁。恢复只追加 `consumer-generations/000001/` 等新一代意图、PID 收据和日志，每代指向原锚及上一代，旧文件保留。任一代缺少收据、启动身份不明、原业务 hold、锁被占用或证据漂移均拒绝；原工作项和尝试仍按其原状态接收，不新造模型重试。旧启动源码清单保留为当时记录，不冒充本次实际源码。
 
 
 原 repair 缺陷字段与依赖恢复：`validate_repair` 可消费原repair角色的

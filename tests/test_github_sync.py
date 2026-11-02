@@ -464,14 +464,17 @@ class MirrorFlowTests(TemporaryProject):
 class SnapshotRunnerTests(TemporaryProject):
     def test_real_offline_runner_and_environment(self):
         log = self.root / "test.log"
-        with patch.dict(os.environ, {"TASKFLOW_TEST_FORMAL_ADAPTER": "must-not-propagate"}):
+        optional = {"TASKFLOW_TEST_FORMAL_ADAPTER": "must-not-propagate",
+                    "TASKFLOW_TEST_PUBLIC_PROBE_ADAPTER_ROOT": "must-not-propagate"}
+        with patch.dict(os.environ, optional):
             result = sync._test_snapshot(self.source, log)
         self.assertEqual(result["tests"], 1)
         self.assertIn(b"OK", log.read_bytes())
         self.assertFalse(list(self.source.rglob("__pycache__")))
-        with patch.object(sync.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"Ran 1 test\nOK")) as run:
+        with patch.dict(os.environ, optional), patch.object(sync.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"Ran 1 test\nOK")) as run:
             sync._test_snapshot(self.source, log)
             self.assertNotIn("TASKFLOW_TEST_FORMAL_ADAPTER", run.call_args.kwargs["env"])
+            self.assertNotIn("TASKFLOW_TEST_PUBLIC_PROBE_ADAPTER_ROOT", run.call_args.kwargs["env"])
             self.assertEqual(run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "1")
 
     def test_failed_empty_and_timed_out_tests(self):

@@ -200,7 +200,7 @@ def load_config(path: Path) -> dict:
 def _test_snapshot(snapshot: Path, log: Path) -> dict:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    for key in ("TASKFLOW_TEST_FORMAL_ADAPTER", "PYTHONPATH", "PYTHONHOME"):
+    for key in ("TASKFLOW_TEST_FORMAL_ADAPTER", "TASKFLOW_TEST_PUBLIC_PROBE_ADAPTER_ROOT", "PYTHONPATH", "PYTHONHOME"):
         env.pop(key, None)
     try:
         result = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-q"],

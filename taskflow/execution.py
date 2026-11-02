@@ -75,6 +75,10 @@ def parser() -> argparse.ArgumentParser:
     author_start.add_argument("--packet", type=Path, required=True)
     author_start.add_argument("--factory", type=Path, required=True, help="explicit original historical factory; never inferred")
     author_start.add_argument("--allow-model", action="store_true")
+    teacher_start = commands.add_parser("teacher-successor-start", help="bind explicit accepted-original teacher successors once through the existing author factory")
+    teacher_start.add_argument("--packet", type=Path, required=True)
+    teacher_start.add_argument("--directory", type=Path, required=True, help="separate receipt directory for these once-only links")
+    teacher_start.add_argument("--allow-model", action="store_true")
     batch_check = commands.add_parser("batch-check", help="read-only new batch model/scope/binding check; no database or model")
     batch_check.add_argument("--plan", type=Path, required=True)
     batch_freeze = commands.add_parser("batch-freeze", help="freeze confirmed choices and evidence without a database or model")
@@ -359,69 +363,85 @@ def _record_result(store: object, attempt: dict, result: dict) -> dict:
 def run_worker(store: object, worker_id: str, allow_model: bool = False,
                work_ids: list[str] | None = None) -> dict:
     from taskflow.execution_runner import run_attempt
+    from taskflow.execution_completion import completion_owner
 
     attempt = store.claim(worker_id, work_ids=work_ids)
     if attempt is None:
         return {"state": "waiting", "reason": "no eligible ready work"}
     # Claim is a durable attempt. Failure here preserves it; it is never silently
     # returned to the ready queue or interpreted as an unused model call.
-    try:
-        if not attempt.get("runtime_path"):
-            raise TaskflowError("claimed work has no prepared runtime; preserve and reconcile")
-        runtime = Path(attempt["runtime_path"])
-        manifest = read_json(runtime / "manifest.json")
-        if manifest.get("mode") != "test_fixture" and not allow_model:
-            raise TaskflowError("non-fixture execution requires --allow-model")
-        policy = store.get_policy(attempt["policy_id"])
-        _check_work_binding(attempt, store.get_candidate(attempt["candidate_id"]), manifest)
-        from taskflow.execution_batch import policy_setting
-        from taskflow.execution_batch_binding import validate_batch_source
-
-        setting = policy_setting(policy["config"], attempt["role"], attempt.get("model_slot"), attempt["task_id"])
-        validate_batch_source(attempt, manifest, store)
-        if (manifest["model"]["requested"] != setting["model"]
-                or manifest["model"]["reasoning_effort"] != setting["reasoning_effort"]
-                or manifest["timeout_seconds"] != setting["timeout_seconds"]
-                or manifest["request"]["sha256"] != attempt["request_digest"]
-                or manifest["policy_version"] != attempt["policy_id"]):
-            raise TaskflowError("prepared request differs from the claimed versioned policy")
-        for key in ("reasoning_selection", "reasoning_context"):
-            if key in setting and manifest.get(key) != setting[key]:
-                raise TaskflowError("prepared reasoning selection differs from the claimed policy")
-        if setting.get("formal_baseline_sha256"):
-            baseline = str(Path(manifest["isolated"]["runtime"]) / "baseline-plan.json")
-            if manifest["dependencies"].get(baseline, {}).get("sha256") != setting["formal_baseline_sha256"]:
-                raise TaskflowError("formal baseline differs from the claimed versioned policy")
-        store.mark_starting(attempt["attempt_id"])
-        def on_process(identity: dict) -> None:
-            if identity.get("start_identity"):
-                store.record_process(attempt["attempt_id"], identity["pid"], identity["start_identity"])
-            else:
-                store.mark_uncertain(attempt["attempt_id"], "process started; startup identity unavailable")
-
-        result = run_attempt(runtime, on_process=on_process)
-        if not result.get("process_ended"):
-            return store.mark_uncertain(attempt["attempt_id"], "runner has no proved termination")
+    if not attempt.get("runtime_path"):
+        reason = "claimed work has no prepared runtime; preserve and reconcile"
+        store.mark_uncertain(attempt["attempt_id"], reason)
+        raise TaskflowError(reason)
+    runtime = Path(attempt["runtime_path"])
+    with completion_owner(runtime) as owned:
+        if not owned:
+            return store.get_attempt(attempt["attempt_id"])
         current = store.get_attempt(attempt["attempt_id"])
-        if current["state"] == "starting":
-            store.mark_uncertain(attempt["attempt_id"], "terminated before process identity was collected")
-        store.mark_collecting(attempt["attempt_id"])
-        return _record_result(store, attempt, result)
-    except (OSError, TaskflowError, ValueError) as exc:
-        store.mark_uncertain(attempt["attempt_id"], str(exc))
-        raise
+        if current["state"] != "claimed":
+            return current
+        try:
+            manifest = read_json(runtime / "manifest.json")
+            if manifest.get("mode") != "test_fixture" and not allow_model:
+                raise TaskflowError("non-fixture execution requires --allow-model")
+            policy = store.get_policy(attempt["policy_id"])
+            _check_work_binding(attempt, store.get_candidate(attempt["candidate_id"]), manifest)
+            from taskflow.execution_batch import policy_setting
+            from taskflow.execution_batch_binding import validate_batch_source
+
+            setting = policy_setting(policy["config"], attempt["role"], attempt.get("model_slot"), attempt["task_id"])
+            validate_batch_source(attempt, manifest, store)
+            if (manifest["model"]["requested"] != setting["model"]
+                    or manifest["model"]["reasoning_effort"] != setting["reasoning_effort"]
+                    or manifest["timeout_seconds"] != setting["timeout_seconds"]
+                    or manifest["request"]["sha256"] != attempt["request_digest"]
+                    or manifest["policy_version"] != attempt["policy_id"]):
+                raise TaskflowError("prepared request differs from the claimed versioned policy")
+            for key in ("reasoning_selection", "reasoning_context"):
+                if key in setting and manifest.get(key) != setting[key]:
+                    raise TaskflowError("prepared reasoning selection differs from the claimed policy")
+            if setting.get("formal_baseline_sha256"):
+                baseline = str(Path(manifest["isolated"]["runtime"]) / "baseline-plan.json")
+                if manifest["dependencies"].get(baseline, {}).get("sha256") != setting["formal_baseline_sha256"]:
+                    raise TaskflowError("formal baseline differs from the claimed versioned policy")
+            store.mark_starting(attempt["attempt_id"])
+            def on_process(identity: dict) -> None:
+                if identity.get("start_identity"):
+                    store.record_process(attempt["attempt_id"], identity["pid"], identity["start_identity"])
+                else:
+                    store.mark_uncertain(attempt["attempt_id"], "process started; startup identity unavailable")
+
+            result = run_attempt(runtime, on_process=on_process)
+            if not result.get("process_ended"):
+                return store.mark_uncertain(attempt["attempt_id"], "runner has no proved termination")
+            current = store.get_attempt(attempt["attempt_id"])
+            if current["state"] == "starting":
+                store.mark_uncertain(attempt["attempt_id"], "terminated before process identity was collected")
+            store.mark_collecting(attempt["attempt_id"])
+            return _record_result(store, attempt, result)
+        except (OSError, TaskflowError, ValueError) as exc:
+            store.mark_uncertain(attempt["attempt_id"], str(exc))
+            raise
 
 
 def reconcile(store: object, attempt_id: str) -> dict:
     from taskflow.execution_runner import reconcile_attempt
+    from taskflow.execution_completion import completion_owner
 
     attempt = store.get_attempt(attempt_id)
     if attempt["state"] in ("completed", "failed", "cancelled"):
         return attempt
-    result = reconcile_attempt(Path(attempt["runtime_path"]))
-    if result.get("process_ended"):
-        return _record_result(store, attempt, result)
-    return store.mark_uncertain(attempt_id, result.get("reason", "process or result unproved"))
+    with completion_owner(Path(attempt["runtime_path"])) as owned:
+        if not owned:
+            return store.get_attempt(attempt_id)
+        attempt = store.get_attempt(attempt_id)
+        if attempt["state"] in ("completed", "failed", "cancelled"):
+            return attempt
+        result = reconcile_attempt(Path(attempt["runtime_path"]))
+        if result.get("process_ended"):
+            return _record_result(store, attempt, result)
+        return store.mark_uncertain(attempt_id, result.get("reason", "process or result unproved"))
 
 
 def dashboard_markdown(dashboard: dict) -> str:
@@ -626,6 +646,13 @@ def main(argv: list[str] | None = None) -> int:
                     template_spec_ref=factory["template_spec_ref"],
                     directory=Path(factory["research_root"]) / packet["items"][0]["intent_id"],
                     allow_model=args.allow_model, factory_config=factory)
+            elif args.operation == "teacher-successor-start":
+                from taskflow.execution_teacher_successor import start_teacher_successors_from_packet
+                from taskflow.execution_store import evidence_ref
+
+                output = start_teacher_successors_from_packet(store,
+                    packet_ref=evidence_ref(args.packet.resolve(), "explicit bounded post-original teacher business successors"),
+                    directory=args.directory.resolve(), allow_model=args.allow_model)
             elif args.operation == "capture":
                 output = capture_candidate(store, args.task, args.candidate_id,
                                            args.parent_id, args.author_attempt,

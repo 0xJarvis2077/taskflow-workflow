@@ -21,6 +21,31 @@ from taskflow.execution_store import ACTIVE, evidence_ref, validate_evidence
 from taskflow.packages import check_task
 
 
+INFORMED_PUBLIC_MATERIAL_GUIDANCE = (
+    "Public-material responsibility boundary for informed authors and teachers: authors and repairers keep the actual "
+    "private job, reference and normal legitimate alternatives complete. Independent quality/recheck reviewers first "
+    "form their own judgment from public originals, then compare the existing complete private work within their signed "
+    "scope; they do not produce a replacement answer and self-sign it. Keep sufficient contemporaneously available original records, necessary "
+    "rules and institutional conditions, field definitions and formulas, stable business keys, timing, permissions and "
+    "association evidence. Reduce pre-solved analysis: leave the intended object allocation, relationship mapping, "
+    "applicability and premise checks, evidence selection, method choice, case-specific arrangements and reconciliation "
+    "of competing schemes to the recipient. Verification conditions are not this case's verification conclusion. "
+    "If completeness, applicability or absence of cross-object interference is to be tested, supply the originals needed "
+    "to verify or refute it rather than an unconditional guarantee.\n"
+    "Preserve genuinely authorized upstream results with their actual source and scope, and deduct the work they already "
+    "perform from claimed independent responsibility. When the task only executes given premises, state that limited "
+    "scope honestly. Keep necessary facts, conditions, normal links and stable keys; do not create difficulty by deletion, "
+    "disorder, artificial conflicts or forced lengthy methods. If a relevant relationship remains to be checked, provide "
+    "its sufficient original evidence instead of merely deleting the conclusion or inventing a unique outcome. Keep "
+    "sourced version differences and local opinions; verify their applicability against the originals and allow supported "
+    "conditional branches instead of pre-filling a final reconciliation.\n"
+    "In existing responsibility/issue records trace the exact original location and wording -> actual change or evidenced "
+    "retention -> remaining judgment -> business consequence -> recheck of retained conditions and legitimate branches. "
+    "Use the same original materials to verify what was really left to the recipient. This guidance adds no deliverable, "
+    "score rule, approval layer or claim that a rendered instruction proves business quality."
+)
+
+
 def _factory_reference(reference: dict, label: str) -> tuple[dict, dict]:
     source = {**reference, "location": reference.get("location", label)}
     validated = validate_evidence([source])[0]
@@ -40,13 +65,13 @@ def _factory_paths(value: object, replacements: dict[str, str]) -> object:
 
 
 def _factory_owner(store: object, task_id: str, owner: str, refs: list[dict]) -> None:
-    dashboard = store.dashboard()
-    general = next((item for item in dashboard["ownership"] if item["task_id"] == task_id and item.get("scope") != "work_item"), None)
+    context = store.dispatch_ownership_snapshot(task_id)
+    general = context["ownership"]
     if general is not None:
         if general["owner"] != owner:
             raise TaskflowError("author factory cannot take another controller's future dispatch ownership")
         return
-    observed = next((item for item in dashboard["observations"] if item["task_id"] == task_id), None)
+    observed = context["observation"]
     if observed is not None:
         if observed["owner"] != owner:
             raise TaskflowError("author factory packet differs from the observed controller")
@@ -62,7 +87,7 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
     exact intent, while a recorded attempt is always adopted without relaunch.
     """
     from taskflow.execution_batch import policy_setting, validate_batch_policy
-    from taskflow.execution_lifecycle import register_lifecycle, run_lifecycle
+    from taskflow.execution_lifecycle import run_lifecycle
 
     if type(allow_model) is not bool:
         raise TaskflowError("author factory allow_model must be an explicit boolean")
@@ -174,6 +199,7 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
         "Do not start other model requests, model CLIs, agents or chats, change shared skills or old originals/scores, purchase services, submit externally or operate production. "
         "Ordinary shell, Node, Python, SQL and analysis tools remain allowed. "
         "First complete the private job/reference/legitimate alternatives/normal and wrong controls, then report the actual disposition; do not manufacture a candidate.\n"
+        + INFORMED_PUBLIC_MATERIAL_GUIDANCE + "\n"
         + json.dumps({"author_work": packet["author_work"], "current_business_item": item,
                       "output_contract": packet["output_contract"],
                       "preauthorized_normal_successors": packet["preauthorized_normal_successors"],
@@ -223,32 +249,8 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
     queued = _get_or_none(store.get_work, work_id)
     if queued is None:
         queued = enqueue_spec(store, spec, runtime, resume_prepared=True, probe_native=True)["work"]
-    elif any(queued[key] != spec["work"][key] for key in
-             ("task_id", "candidate_id", "intent_id", "role", "policy_id", "purpose", "dispatch_owner")) or queued["runtime_path"] != str(runtime):
-        raise TaskflowError("author factory work is already bound to a different intent")
     else:
-        from taskflow.execution import _check_work_binding
-        from taskflow.execution_runner import _validate
-
-        manifest = _validate(runtime)
-        _check_work_binding(queued, candidate, manifest)
-        expected_inputs = [(str(Path(entry["path"]).absolute()), entry["kind"],
-                            entry.get("target", f"{index:04d}-{Path(entry['path']).name}"))
-                           for index, entry in enumerate(spec["runner"]["inputs"])]
-        if expected_inputs != [(entry["source"], entry["kind"], entry["target"]) for entry in manifest["inputs"]]:
-            raise TaskflowError("queued author inputs differ from the published specification")
-        if any(_info(Path(entry["source"])) != {key: entry[key] for key in ("sha256", "size")}
-               for entry in manifest["inputs"]):
-            raise TaskflowError("queued author inputs differ from their original source bytes")
-        request = [f"Role: author. Intent: {intent_id}."]
-        request += [f"Input ({entry['kind']}): {runtime / 'inputs' / entry['target']}" for entry in manifest["inputs"]]
-        for entry in spec["runner"]["request_sections"]:
-            if not isinstance(entry, dict) or not isinstance(entry.get("text"), str) or not isinstance(entry.get("kind"), str):
-                raise TaskflowError("published author request sections are not typed original text")
-            request.append(entry["text"])
-        if (queued["request_digest"] != manifest["request"]["sha256"]
-                or _regular(runtime / "request.md") != ("\n\n".join(request) + "\n").encode("utf-8")):
-            raise TaskflowError("queued author request differs from its published original and locked digest")
+        _validated_prepared_author(store, spec, runtime)
     result = {"work_id": work_id, "candidate_id": candidate_id, "runtime": str(runtime), "spec": str(directory / "spec.json"),
               "factory_intent": str(directory / "factory-intent.json"), "model_calls_by_factory_preparation": 0}
     if not allow_model:
@@ -281,29 +283,8 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
                 break
             time.sleep(.01)
             attempt = _active_attempt(store, work_id)
-        definition = {"schema_version": 1, "kind": "author_quality_v1", "flow_id": lifecycle_id,
-                      "task_id": task_id, "owner": owner, "policy_id": factory_config["policy_id"],
-                      "directory": str(lifecycle_root), "authorization": packet_source,
-                      "source_author_attempt": attempt["attempt_id"],
-                      "source_author_binding": {key: attempt[key] for key in ("work_id", "intent_id", "candidate_id", "task_id")},
-                      "source_author_work": str(work), "role_template_ref": role_source,
-                      "business_item": item, "author_contract": packet["output_contract"],
-                      "next": packet["preauthorized_normal_successors"]}
-        _publish_once(directory / "lifecycle-spec.json", {"definition": definition, "evidence": refs})
-        before_registration = store.get_attempt(attempt["attempt_id"])
-        registered = register_lifecycle(store, definition, refs)
-        after_registration = store.get_attempt(attempt["attempt_id"])
-        registration_path = directory / "lifecycle-registration.json"
-        registration_identity = {"flow_id": lifecycle_id, "definition_digest": registered["definition_digest"],
-                                 "source_attempt_id": attempt["attempt_id"]}
-        if registration_path.exists():
-            previous = _read(registration_path)
-            if any(previous.get(key) != value for key, value in registration_identity.items()):
-                raise TaskflowError("author lifecycle registration belongs to a different original attempt")
-        else:
-            _publish_once(registration_path, {**registration_identity,
-                         "source_state_at_registration": before_registration["state"],
-                         "source_state_after_registration": after_registration["state"]})
+        registered = register_prepared_author_lifecycle(store, directory=directory,
+            factory_config=factory_config, attempt_id=attempt["attempt_id"])
         received = run_lifecycle(store, lifecycle_id, allow_model=True)
         if future is not None:
             try:
@@ -313,6 +294,160 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
                     raise
         return {**result, "state": received["state"]["status"], "attempt_id": attempt["attempt_id"],
                 "lifecycle_id": lifecycle_id, "lifecycle": received}
+
+
+def _validated_prepared_author(store: object, spec: dict, runtime: Path) -> tuple[dict, dict, dict]:
+    """Read the queued original and its already prepared request without dispatch."""
+    from taskflow.execution import _check_work_binding
+    from taskflow.execution_runner import _validate
+
+    queued = store.get_work(spec["work"]["work_id"])
+    candidate = store.get_candidate(spec["work"]["candidate_id"])
+    if (any(queued[key] != spec["work"][key] for key in
+            ("task_id", "candidate_id", "intent_id", "role", "policy_id", "purpose", "dispatch_owner"))
+            or queued["runtime_path"] != str(runtime)
+            or queued.get("model_slot") != spec["work"].get("model_slot")):
+        raise TaskflowError("author factory work is already bound to a different intent")
+    if (type(queued.get("evidence")) is not list or type(spec["work"].get("evidence")) is not list
+            or canonical(queued["evidence"]) != canonical(validate_evidence(spec["work"]["evidence"]))):
+        raise TaskflowError("prepared author evidence differs from its original queued sources")
+    manifest = _validate(runtime)
+    _check_work_binding(queued, candidate, manifest)
+    if manifest["mode"] == "native_role":
+        from taskflow.execution_batch_binding import make_batch_binding
+
+        prepared_config = copy.deepcopy(spec["runner"])
+        prepared_config["candidate_binding"] = _binding(candidate)
+        policy = store.get_policy(queued["policy_id"])
+        batch = make_batch_binding(policy, "author", queued.get("model_slot"), queued["task_id"])
+        if batch is not None:
+            prepared_config.update(model_slot=batch["model_slot"], batch_binding=batch)
+        if (manifest.get("preparation_config_digest") is not None
+                and manifest["preparation_config_digest"] != sha256(canonical(prepared_config))):
+            raise TaskflowError("queued native author configuration differs from its complete published specification")
+    expected_inputs = [(str(Path(entry["path"]).absolute()), entry["kind"],
+                        entry.get("target", f"{index:04d}-{Path(entry['path']).name}"))
+                       for index, entry in enumerate(spec["runner"]["inputs"])]
+    if expected_inputs != [(entry["source"], entry["kind"], entry["target"]) for entry in manifest["inputs"]]:
+        raise TaskflowError("queued author inputs differ from the published specification")
+    if any(_info(Path(entry["source"])) != {key: entry[key] for key in ("sha256", "size")}
+           for entry in manifest["inputs"]):
+        raise TaskflowError("queued author inputs differ from their original source bytes")
+    request = [f"Role: author. Intent: {queued['intent_id']}."]
+    request += [f"Input ({entry['kind']}): {runtime / 'inputs' / entry['target']}" for entry in manifest["inputs"]]
+    for entry in spec["runner"]["request_sections"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("text"), str) or not isinstance(entry.get("kind"), str):
+            raise TaskflowError("published author request sections are not typed original text")
+        request.append(entry["text"])
+    if (queued["request_digest"] != manifest["request"]["sha256"]
+            or _regular(runtime / "request.md") != ("\n\n".join(request) + "\n").encode("utf-8")):
+        raise TaskflowError("queued author request differs from its published original and locked digest")
+    return queued, candidate, manifest
+
+
+def register_prepared_author_lifecycle(store: object, *, directory: Path,
+                                      factory_config: dict, attempt_id: str) -> dict:
+    """Register one prepared original author; never prepare, claim or consume it."""
+    from taskflow.execution_batch import policy_setting, validate_batch_policy
+    from taskflow.execution_lifecycle import register_lifecycle
+
+    directory = Path(directory).absolute()
+    if (type(factory_config.get("schema_version")) is not int or factory_config["schema_version"] != 1
+            or ".." in directory.parts or any(path.is_symlink() for path in (directory, *directory.parents))):
+        raise TaskflowError("prepared author needs its original ordinary factory directory/configuration")
+    identity = _read(directory / "factory-intent.json")
+    packet_source, packet = _factory_reference(identity["packet"], "original prepared author authority")
+    template_source, template = _factory_reference(identity["template"], "original prepared author template")
+    role_source, _ = _factory_reference(factory_config["role_template_ref"], "approved conditional public/quality role infrastructure")
+    if (type(packet.get("schema_version")) is not int or packet["schema_version"] != 1
+            or not isinstance(packet.get("items"), list) or len(packet["items"]) != 1
+            or template.get("runner", {}).get("mode") != "native_role"
+            or template["runner"].get("role") != "author"):
+        raise TaskflowError("prepared author requires its one original packet item/native template")
+    item = packet["items"][0]
+    task_id, intent_id, candidate_id, owner = item["task_id"], item["intent_id"], item["candidate_id"], packet["controller"]
+    expected_identity = {"schema_version": 1, "packet": packet_source, "template": template_source,
+        "factory_config_digest": sha256(canonical(factory_config)), "directory": str(directory),
+        "task_id": task_id, "intent_id": intent_id, "candidate_id": candidate_id}
+    if (canonical(identity) != canonical(expected_identity)
+            or any(factory_config.get("template_spec_ref", template_source).get(key) != template_source[key]
+                   for key in ("path", "sha256"))
+            or factory_config.get("research_root") and not directory.is_relative_to(
+                Path(factory_config["research_root"]).absolute())):
+        raise TaskflowError("prepared author factory identity/configuration differs from the original")
+    work_id = validate_id(task_id + "-" + intent_id, "author work_id")
+    runtime, work = directory / "runtime", directory / "work"
+    lifecycle_id = validate_id(intent_id + "-author-quality", "author lifecycle_id")
+    lifecycle_root = Path(factory_config["lifecycle_root"]).absolute() / lifecycle_id
+    if any(lifecycle_root.is_relative_to(path) or path.is_relative_to(lifecycle_root)
+           for path in (work, directory / "scratch", runtime, Path(item["baseline_root"]).absolute())):
+        raise TaskflowError("author lifecycle archives must be separate from original author/baseline roots")
+    refs = [packet_source, template_source, role_source]
+    spec = _read(directory / "spec.json")
+    expected_work = {"work_id": work_id, "task_id": task_id, "candidate_id": candidate_id,
+        "role": "author", "policy_id": factory_config["policy_id"], "intent_id": intent_id,
+        "purpose": item["direction"] + " " + item.get("why", ""), "modifies": True,
+        "dispatch_owner": owner, "evidence": refs}
+    policy = store.get_policy(factory_config["policy_id"])
+    snapshot = validate_batch_policy(policy["config"])
+    if snapshot is not None:
+        if (factory_config.get("batch_snapshot") != policy["config"]["batch_snapshot"]
+                or packet.get("batch_id") != snapshot["batch_id"]):
+            raise TaskflowError("prepared author differs from its confirmed batch")
+        expected_work["model_slot"] = "author"
+    elif "batch_snapshot" in factory_config:
+        raise TaskflowError("prepared batch author requires its original registered policy")
+    if canonical(spec["work"]) != canonical(expected_work):
+        raise TaskflowError("prepared author specification differs from its exact original packet")
+    queued, candidate, manifest = _validated_prepared_author(store, spec, runtime)
+    expected_inputs = [{"path": str(Path(item["baseline_root"]).absolute() / "task.json"),
+                        "kind": "source_metadata", "target": "execution/task.json"},
+                       {"path": packet_source["path"], "kind": "source_metadata", "target": "protocol/current-author-packet.json"}]
+    expected_inputs += [{"path": row["path"], "kind": "public" if row["role"] in PUBLIC_ROLES else "teacher",
+                         "target": row["package_path"]} for row in candidate["files"]]
+    setting = policy_setting(policy["config"], "author", expected_work.get("model_slot"), task_id)
+    if (canonical(spec["runner"]["inputs"]) != canonical(expected_inputs)
+            or manifest["cwd"] != str(work) or manifest["role"] != "author"
+            or any(spec["runner"].get(key) != value for key, value in
+                   (("cwd", str(work)), ("intent_id", intent_id), ("role", "author"),
+                    ("policy_version", factory_config["policy_id"])))
+            or set(manifest["outputs"]) != {"research.md", "candidate-decision.md", "handoff.md", "handoff.json", "issues.json"}
+            or any(spec["runner"].get(key) != setting[key] for key in
+                   ("model", "reasoning_effort", "timeout_seconds"))
+            or any(manifest["model"][key] != setting[name] for key, name in
+                   (("requested", "model"), ("reasoning_effort", "reasoning_effort")))
+            or manifest["timeout_seconds"] != setting["timeout_seconds"]):
+        raise TaskflowError("prepared author input/output/runtime policy differs from its original")
+    attempt = store.get_attempt(attempt_id)
+    originals = store.list_attempts(work_id)
+    if (len(originals) != 1 or originals[0]["attempt_id"] != attempt_id
+            or any(attempt.get(key) != queued.get(key) for key in
+                   ("work_id", "intent_id", "task_id", "candidate_id", "role", "policy_id", "runtime_path",
+                    "request_digest", "dispatch_owner", "ownership_event_seq", "model_slot"))):
+        raise TaskflowError("prepared author registration needs its one exact original claimed attempt")
+    definition = {"schema_version": 1, "kind": "author_quality_v1", "flow_id": lifecycle_id,
+                  "task_id": task_id, "owner": owner, "policy_id": factory_config["policy_id"],
+                  "directory": str(lifecycle_root), "authorization": packet_source,
+                  "source_author_attempt": attempt_id,
+                  "source_author_binding": {key: attempt[key] for key in ("work_id", "intent_id", "candidate_id", "task_id")},
+                  "source_author_work": str(work), "role_template_ref": role_source,
+                  "business_item": item, "author_contract": packet["output_contract"],
+                  "next": packet["preauthorized_normal_successors"]}
+    _publish_once(directory / "lifecycle-spec.json", {"definition": definition, "evidence": refs})
+    registered = register_lifecycle(store, definition, refs)
+    after_registration = store.get_attempt(attempt_id)
+    registration_path = directory / "lifecycle-registration.json"
+    registration_identity = {"flow_id": lifecycle_id, "definition_digest": registered["definition_digest"],
+                             "source_attempt_id": attempt_id}
+    if registration_path.exists():
+        previous = _read(registration_path)
+        if any(previous.get(key) != value for key, value in registration_identity.items()):
+            raise TaskflowError("author lifecycle registration belongs to a different original attempt")
+    else:
+        _publish_once(registration_path, {**registration_identity,
+                     "source_state_at_registration": attempt["state"],
+                     "source_state_after_registration": after_registration["state"]})
+    return registered
 
 
 def _save(store: object, record: dict, state: dict, kind: str) -> dict:
@@ -452,7 +587,7 @@ def _roles(store: object, definition: dict) -> dict:
                     {"tree": "{{public_archive}}/supplemental/trees/inner/work", "kind": "submission", "target": "actual-public-work"},
                     {"tree": "{{public_archive}}/supplemental/trees/inner/scratch", "kind": "submission", "target": "actual-public-scratch"},
                     {"path": "{{public_archive}}/observed-trace.jsonl", "kind": "trace", "target": "actual-public-trace.jsonl"}]
-            runner["request_sections"] = [{"kind": "operation", "text": operation}]
+            runner["request_sections"] = [{"kind": "operation", "text": operation + "\n\n" + INFORMED_PUBLIC_MATERIAL_GUIDANCE}]
         roles[name] = role
     return roles
 
@@ -525,7 +660,7 @@ def _public_root(record: dict) -> Path:
 
 
 def _active_attempt(store: object, work_id: str) -> dict | None:
-    attempts = [item for item in store.dashboard()["attempts"] if item["work_id"] == work_id]
+    attempts = store.list_attempts(work_id)
     return attempts[-1] if attempts else None
 
 
@@ -537,7 +672,10 @@ def advance_author(store: object, record: dict) -> dict:
     validate_evidence(record["evidence"])
     if state["status"] != "active":
         return record
+    from taskflow.execution_completion import reconcile_ended_attempt
+
     author, manifest = _author(store, definition)
+    author = reconcile_ended_attempt(store, author)
     if author["state"] in ("claimed", "starting", "running", "collecting"):
         return _wait(store, record, "source_author", author["state"])
     if author["state"] != "completed":
@@ -618,7 +756,7 @@ def advance_author(store: object, record: dict) -> dict:
         state.update(stage="public_result", public_work_id=work_id, current_work_id=work_id, waiting=None)
         return _save(store, record, state, "author_public_reconstruction_enqueued")
     if state["stage"] == "public_result":
-        attempt = _active_attempt(store, state["public_work_id"])
+        attempt = reconcile_ended_attempt(store, _active_attempt(store, state["public_work_id"]))
         if attempt is None or attempt["state"] in ACTIVE:
             if attempt is not None and attempt["state"] == "uncertain":
                 raise TaskflowError("public reconstruction launch uncertain; original retained")
@@ -653,7 +791,7 @@ def advance_author(store: object, record: dict) -> dict:
         _publish_once(Path(definition["directory"]) / "quality-definition.json", {"definition": definition_child, "evidence": refs})
         child = register_workflow(store, definition_child, refs)
     current = child["state"].get("current_work_id")
-    active = _active_attempt(store, current) if current else None
+    active = reconcile_ended_attempt(store, _active_attempt(store, current)) if current else None
     if active is None or active["state"] not in ACTIVE:
         child = advance_workflow(store, child_id)
         if child["state"]["status"] in ("accepted", "exception") and not child["state"].get("receipt"):
