@@ -1,0 +1,14 @@
+[project]
+name = "local-taskflow"
+version = "0.1.0"
+description = "Local task packages and evidence records"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.coverage.run]
+branch = true
+source = ["taskflow"]
+
+[tool.coverage.report]
+show_missing = true
+fail_under = 80

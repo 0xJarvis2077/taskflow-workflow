@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "policy_id": null,
+  "template_spec_ref": {
+    "path": null,
+    "sha256": null,
+    "location": "Fill with the actual local file and its verified byte hash."
+  },
+  "role_template_ref": {
+    "path": null,
+    "sha256": null,
+    "location": "Fill with the actual local file and its verified byte hash."
+  },
+  "research_root": null,
+  "lifecycle_root": null
+}

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "architecture_version": "high-value-task-v1",
+  "batch_id": null,
+  "project_label": null,
+  "task_ids": [],
+  "status": "awaiting_user_models",
+  "roles": {
+    "coordinator": {"enabled": true, "model": null},
+    "author": {"enabled": true, "model": null},
+    "public_rebuild": {"enabled": true, "model": null},
+    "quality": {"enabled": true, "model": null},
+    "repair": {"enabled": true, "model": null},
+    "recheck": {"enabled": true, "model": null},
+    "solver": {"enabled": true, "model": null},
+    "reviewer": {"enabled": true, "model": null},
+    "content_inspector": {"enabled": true, "model": null},
+    "engineer": {"enabled": true, "model": null},
+    "health_auditor": {"enabled": true, "model": null}
+  },
+  "user_model_confirmation": null,
+  "role_bindings": {},
+  "naming": {
+    "chat_pattern": "出题·<项目或批次>·<职责>",
+    "cli_display_pattern": "<批次>/<题号>/<版本>/<角色>/<尝试号>"
+  }
+}

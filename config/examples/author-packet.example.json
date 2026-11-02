@@ -1,0 +1,14 @@
+{
+  "controller": null,
+  "author_work": null,
+  "items": [
+    {
+      "task_id": null,
+      "intent_id": null,
+      "candidate_id": null,
+      "baseline_root": null,
+      "direction": null,
+      "most_relevant": []
+    }
+  ]
+}

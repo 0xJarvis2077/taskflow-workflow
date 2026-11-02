@@ -1,0 +1,11 @@
+{
+  "source": "/absolute/path/to/workflow",
+  "mirror": "/absolute/path/to/workflow/.github-sync/repository",
+  "repository": "OWNER/REPOSITORY",
+  "branch": "main",
+  "state_file": "/absolute/path/to/workflow/.github-sync/state.json",
+  "identity": {
+    "name": "YOUR_GITHUB_NAME",
+    "email": "YOUR_GITHUB_NOREPLY_EMAIL"
+  }
+}

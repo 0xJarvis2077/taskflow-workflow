@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "policy_id": null,
+  "repository": null,
+  "lifecycle_root": null,
+  "formal_runtime_root": null,
+  "publication_root": null,
+  "technical": {
+    "real_repository": null,
+    "formal_config_base": {
+      "adapter": {
+        "path": null,
+        "sha256": null,
+        "location": "Fill with the actual local file and its verified byte hash.",
+        "files": {}
+      },
+      "request": {
+        "path": null,
+        "sha256": null,
+        "location": "Fill with the actual local file and its verified byte hash."
+      },
+      "launcher_python": null,
+      "model": null,
+      "reasoning_selection": null,
+      "reasoning_effort": null,
+      "reasoning_context": null,
+      "timeout_seconds": null,
+      "deny_read_probes": []
+    },
+    "review_runner": null
+  }
+}
