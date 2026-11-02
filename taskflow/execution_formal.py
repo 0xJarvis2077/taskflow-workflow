@@ -141,7 +141,8 @@ def _projection_data(store: object, candidate: dict, source_refs: dict, protocol
     if protocol_map.get("native_signoff") is not None:
         expected = native_quality_handoff(store, candidate_id=candidate["candidate_id"],
                                           authorization=protocol_map["authorization"],
-                                          source_flow_id=protocol_map["native_signoff"]["source_flow_id"])
+                                          source_flow_id=protocol_map["native_signoff"]["source_flow_id"],
+                                          packet_transport=protocol_map["native_signoff"].get("packet_transport"))
         if source_refs != expected["source_refs"] or protocol_map != expected["protocol_map"]:
             raise TaskflowError("native quality projection differs from its exact signed handoff")
     accepted = store.quality_gate(candidate["candidate_id"])
@@ -742,7 +743,7 @@ def _native_normative(material: dict) -> list[dict]:
 
 @_handoff_errors
 def native_quality_handoff(store: object, *, candidate_id: str, authorization: dict,
-                           source_flow_id: str) -> dict:
+                           source_flow_id: str, packet_transport: dict | None = None) -> dict:
     """Read the same role's locked native signature; never select standards by prose."""
     candidate = store.get_candidate(candidate_id)
     selector = {"task_id": candidate["task_id"], "source_author_quality_flow": source_flow_id}
@@ -763,10 +764,17 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
             or any(source_author.get(key) != author_binding.get(key)
                    for key in ("task_id", "candidate_id", "intent_id", "work_id"))
             or source_author.get("state") != "completed" or source_author.get("cli_sid") != item["source_author_sid"]
-            or definition.get("authorization", {}).get("path") != item["source_business_packet"]
-            or definition.get("authorization", {}).get("sha256") != item["source_business_packet_sha256"]):
+            or (packet_transport is None and (
+                definition.get("authorization", {}).get("path") != item["source_business_packet"]
+                or definition.get("authorization", {}).get("sha256") != item["source_business_packet_sha256"]))):
         raise TaskflowError("native quality authority does not bind this actual accepted author parent")
     _checked_ref(definition["authorization"])
+    packet_witness = None
+    if packet_transport is not None:
+        from taskflow.execution_author_packet import validate_author_packet_transport
+
+        packet_witness = validate_author_packet_transport(packet_transport=packet_transport,
+            authorization=authorization, source_flow_id=source_flow_id, store=store, require_complete=True)
     child = store.get_flow(result["child_flow_id"])
     child_state = child["state"]
     receipt_path = Path(result["child_receipt"])
@@ -864,6 +872,8 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
                 "scope": {"source": "whole_adoption" if whole else "adoption",
                           "pointer": "/execution_routing/scope", "equals": "whole_package"},
                 "dimensions": dimensions}
+    if packet_witness is not None:
+        protocol["native_signoff"]["packet_transport"] = packet_transport
     if fresh.get("candidate_acceptance") is not None:
         protocol["candidate_acceptance"] = fresh["candidate_acceptance"]
     if repaired is not None:
@@ -871,6 +881,8 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
     certification = {"parent_flow_id": source_flow_id, "child_flow_id": child["flow_id"],
                      "child_receipt": _ref(receipt_path), "accepted_review_id": accepted["review_id"],
                      "fresh": fresh["certification"]}
+    if packet_witness is not None:
+        certification["author_packet_transport"] = packet_witness
     if whole:
         certification["whole"] = whole["certification"]
         certification["composite_quality_coverage"] = graph
@@ -967,7 +979,8 @@ def validate_normative_certification(*, candidate: dict, certification: dict,
         raise TaskflowError("normative certification lacks its complete native handoff")
     if store is not None:
         expected = native_quality_handoff(store, candidate_id=candidate["candidate_id"],
-                                          authorization=certification["authorization"], source_flow_id=flow_id)
+                                          authorization=certification["authorization"], source_flow_id=flow_id,
+                                          packet_transport=native.get("protocol_map", {}).get("native_signoff", {}).get("packet_transport"))
         if canonical(expected) != canonical(native):
             raise TaskflowError("normative certification differs from the current stored native handoff")
     protocol = native["protocol_map"]
@@ -978,6 +991,17 @@ def validate_normative_certification(*, candidate: dict, certification: dict,
             or native["certification"].get("parent_flow_id") != flow_id):
         raise TaskflowError("normative certification has a different authority or source-flow item")
     authority = _projection_authority(candidate, protocol)
+    packet_transport = protocol.get("native_signoff", {}).get("packet_transport")
+    if packet_transport is not None:
+        from taskflow.execution_author_packet import validate_author_packet_transport
+
+        witness = validate_author_packet_transport(packet_transport=packet_transport,
+            authorization=certification["authorization"], source_flow_id=flow_id,
+            store=store, require_complete=True)
+        if native["certification"].get("author_packet_transport") != witness:
+            raise TaskflowError("normative certification author packet transport differs from its actual source")
+    elif native["certification"].get("author_packet_transport") is not None:
+        raise TaskflowError("normative certification has no explicit author packet transport")
     fresh = native["certification"]["fresh"]
     manifest_path, _ = _checked_ref(fresh["manifest"])
     if manifest_path.name != "manifest.json":

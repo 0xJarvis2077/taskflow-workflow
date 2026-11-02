@@ -89,6 +89,7 @@ def _packet(record: dict) -> dict:
 def _author_source(store: object, record: dict, packet: dict, *, require_candidate: bool = False) -> dict:
     """Bind a completed author outcome to its actual, unique accepted quality child."""
     from taskflow.execution_author import _author, _handoff
+    from taskflow.execution_author_packet import author_packet_matches
 
     definition = record["definition"]
     author_flow = store.get_flow(definition["source_author_flow_id"])
@@ -101,8 +102,9 @@ def _author_source(store: object, record: dict, packet: dict, *, require_candida
     if (author_definition.get("kind") != "author_quality_v1"
             or any(author_definition.get(key) != definition[key] for key in ("task_id", "owner", "policy_id"))
             or author_definition.get("source_author_attempt") != packet["source_author_attempt"]
-            or original_authority["path"] != packet["source_business_packet"]
-            or original_authority["sha256"] != packet["source_business_packet_sha256"]):
+            or not author_packet_matches(store, parent=author_flow, packet=packet,
+                authorization=definition["authorization"],
+                packet_transport=record["state"].get("source_business_packet_transport"))):
         raise TaskflowError("authorized author flow differs from its exact task/owner/policy/original business packet")
     author, _ = _author(store, author_definition)
     if (author["intent_id"] != packet["source_author_intent"]
@@ -179,7 +181,8 @@ def _native_handoff(store: object, record: dict, candidate_id: str) -> dict:
 
     value = native_quality_handoff(store, candidate_id=candidate_id,
         authorization=record["definition"]["authorization"],
-        source_flow_id=record["definition"]["source_author_flow_id"])
+        source_flow_id=record["definition"]["source_author_flow_id"],
+        packet_transport=record["state"].get("source_business_packet_transport"))
     if (record["state"].get("native_quality_handoff") is not None
             and value != record["state"]["native_quality_handoff"]):
         raise TaskflowError("current native quality/normative certification differs from the bound original handoff")

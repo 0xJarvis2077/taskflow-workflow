@@ -44,6 +44,20 @@ python3 -m taskflow execution --db execution/batch-id.sqlite3 batch-experiment-s
 
 每题作者/返修自动取得修改者互斥；审查与作答使用捕获副本。公开件改变后，旧审查不能转移到新候选；新问题可重开同字节结论。缺陷修订需实际材料或私有依据变化，按缺陷对象及必要关联独立复检后才能关闭。保留原整包签发与当前受影响复检时，程序只可按真实改动、未变字节和已闭责任组合覆盖，不把受影响签发改称新整包审查。合法上游成果保留后的声明调整单独记载，不能冒称材料已移除或难度已提高。程序不判断证据的业务充分性。
 
+## 接收已接受版本上的新公开问题
+
+控制器已明确接收新的公开问题时，可在原作者质量链的自然结束点追加，不修改原独立角色的签发或原结果：
+
+```sh
+python3 -m taskflow execution --db execution/batch-id.sqlite3 controller-finding-reopen --record controls/controller-finding.json
+```
+
+记录参数为 `parent_flow_id`、`controller`、`finding_ref`、三条原 flow 的预期 revision、`expected_candidate_binding` 五字段和 `expected_review_id`。`finding_ref` 指向控制器已接收的原报告，必须带源 flow、候选、实验、明确处置与归属，且 `exact_public_findings` 逐项绑定当前公开件路径、SHA 和真实原句。程序只核来源、范围、字节和状态，不代控制器裁定业务。
+
+入口要求原 parent/child 已 accepted 且没有在途角色、实验仍处初始零派发边界、确切未来 solver 工作项已 pause；同时取得原生命周期与工作流消费者的现有非阻塞锁。一次 SQLite 事务登记带 `finding_origin` 的新 material defect，并以双 CAS 将原 parent/child 交回普通 repair→公开重建→整包复检。旧 accepted review 保留原义，新发现单独归控制器；旧 `result.json` 保留，后续结果追加 `result-<hash>.json`。精确同次重入幂等，旧 accepted 游标须匹配原 receipt、状态摘要和真实重开事件，不能覆盖当前流程。
+
+该操作不清实验异常、不解除 target pause、不启动模型。只做运输修复时仍须独立保留真实业务待修；消费者启动前须核原范围与唯一归属。历史负评只能以它自己的实际修订、独立闭合、原事件顺序和完整祖先副本重新核验；当前新 whole 或 affected 签发不能伪充旧修订，受影响覆盖也不能升为整包。正式作答仍等待实际修复、独立质量及控制 owner 的明确闭合。
+
 ## 命令
 
 在仓库根目录查看实际帮助、注册只对新工作生效的版本策略、生成当前看板：
@@ -199,6 +213,7 @@ experiment release 在 canonical kind producer 与严格 required-ID consumer �
 
 | action | 已有证据及边界 |
 | --- | --- |
+| `resume_author_packet_source_metadata_transport` | 仅接初始零 formal 实验的原题包路径绑定异常。`packet_transport: REF`须同时列入`evidence`，指向严格`author_packet_source_metadata_alias_v1`侧证：原作者定义、实际 work/attempt、原授权、锁定 manifest 中唯一`source_metadata`输入和源／暂存字节均须吻合。只显式采纳该原输入的路径，保留原正文、模型、SID、异常和用途；不按同 SHA 搜索别名，不创建第二实验。当前已接受的修订候选与初始候选均检查 solver/decision 足迹。在线、离线规范证书使用同一验证器；无侧证时沿用原路径精确匹配。 |
 | `resume_unclaimed_formal_preparation` | 仅处理`formal_prepare`原精确授权映射异常；尚无该solver work/attempt、runtime或准备意图。重新核原packet精确item、当前候选/质量、冻结发布及配置，不放宽模型、超时或baseline。 |
 | `resume_resolved_quality_dependency` | 子质量flow已显式解决原精确`repair defect_ids: list required`字段传递异常（原repair角色`covered_defect_ids`与assigned集合相同），或已用明确repair-record投影解决原精确技术异常，或已显式解决零派发`public_rebuild`的仓库内runtime错误后，核原作者、公开前驱、同一子flow/节点和原异常回执，恢复其传播到作者父flow或尚无solver工作的后继实验的依赖异常。不能跳过未解决的质量缺陷、失败/不明尝试或独立业务等待条件。 |
 | `resume_validated_evaluation_intake` | 处理 `evaluation_intake` 的原精确错误 `signed evidence path/location is missing`，或 `signed source has no unique same-byte native run artifact: <signed source>`。恢复JSON另给`receipt: REF`，指向该flow固定`evaluations/<run_id>/receipt.json`的已成功接收原件。前者保留原 typed-locator 验证；后者核原 `source_path_map` 的每项公开包路径、角色、首阶段输入、selector、唯一同名同字节run原件、全部引用投影与完整归档。均核同SID、当前候选四摘要、原封score/facts/规范与原生评价后仅恢复同stage。 |
@@ -215,6 +230,8 @@ experiment release 在 canonical kind producer 与严格 required-ID consumer �
 快照manifest的文件元数据按原声明与实际payload SHA/size完整重建，作JSON类型精确对账。声明自带sha256/size键不取代实际计算值，原task.json及其他元数据仍保留并绑定；不能先剥计算字段再与含同名键的原声明错配，也不能放过文件、角色、元数据或字节变化。原子发布失败且暂存已清理时，如实记录“尚无快照”；恢复是第一次成功提交，不伪称复用了未产生的冻结。
 
 上述操作均在生命周期锁内追加历史，保留原异常、回执、定义、尝试和原签分。validated intake恢复不重新导入或调用模型；正常消费者幂等接收同一evaluation，active状态或已消费恢复不能再次使用。
+
+历史负面结论的旧修订图可作为来源证据，但不能因此成为当前通过。接收器须重建该负面结论自己的实际返修、独立 affected 闭合及完整祖先别名，并用当前持久化图逐项验证之后的重叠负面结论确已被消费。默认调用仍拒绝失效旧图；上下文不放宽 whole/affected 范围，不修改原签或补充 covered IDs。初始实验收到`historical negative is outside the current repaired quality graph`时，也只能在上述当前图验证及原有零足迹、回执和业务 hold 检查通过后，使用`resume_validated_source_quality_transport`恢复。
 
 宿主准备恢复须先按明确授权核正确宿主权限，独占同run恢复标记并完整保留旧inner，原intent和reservation路径及字节不变；仅在原canonical路径执行批准准备程序的`--in-runtime`分支及全部原探针。不得再stage抢预约、跳过隔离检查、放宽目标profile或重抽失败/不明模型。恢复操作不自动重试；任何已有solver派发或证据漂移均停止。完成回执经只读验证后，既有生命周期仍须照常验证prepared plan，才可沿原授权唯一派发。
 

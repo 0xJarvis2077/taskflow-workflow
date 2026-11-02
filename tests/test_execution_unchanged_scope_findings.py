@@ -6,6 +6,7 @@ graph provenance remains covered by the adjacent real-worker/store suites.
 
 import copy
 from contextlib import ExitStack, contextmanager
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -265,12 +266,22 @@ class UnchangedScopeRecoveryTests(unittest.TestCase):
                     resume_path_transport(store, record["flow_id"], resolution)
             finally:
                 path.rmdir()
-        board = store.dashboard()
         for kind in ("work", "attempts"):
-            wrong = copy.deepcopy(board)
-            wrong[kind].append({"candidate_id": source.candidate["candidate_id"], "role": "solver", "state": "ready"})
-            with self.subTest(kind=kind), interfaces(), patch.object(store, "dashboard", return_value=wrong), self.assertRaisesRegex(TaskflowError, "existing formal"):
-                resume_path_transport(store, record["flow_id"], resolution)
+            identity = "foreign-solver-footprint-" + kind
+            row = {"candidate_id": source.candidate["candidate_id"], "role": "solver", "state": "ready"}
+            with store._db(True) as db:
+                if kind == "work":
+                    db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)",
+                               (identity, "neutral", row["candidate_id"], identity + "-intent", "ready", json.dumps(row)))
+                else:
+                    db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?)",
+                               (identity, identity + "-work", "neutral", "ready", 0, json.dumps(row)))
+            try:
+                with self.subTest(kind=kind), interfaces(), self.assertRaisesRegex(TaskflowError, "existing formal"):
+                    resume_path_transport(store, record["flow_id"], resolution)
+            finally:
+                with store._db(True) as db:
+                    db.execute("DELETE FROM " + kind + " WHERE id=?", (identity,))
         self.assertEqual(record, store.get_flow(record["flow_id"]))
 
     def test_wrong_receipt_missing_graph_stale_child_and_native_source_reject(self):

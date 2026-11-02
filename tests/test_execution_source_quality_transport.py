@@ -112,14 +112,20 @@ class SourceQualityTransportTests(unittest.TestCase):
                     resume_path_transport(store, record["flow_id"], resolution)
             finally:
                 path.rmdir()
-        board = store.dashboard()
+        import json
         for status in ("ready", "running", "uncertain", "failed"):
-            wrong_board = copy.deepcopy(board)
-            wrong_board["work"].append({"work_id": "some-solver", "role": "solver", "state": status,
-                                         "candidate_id": source.candidate["candidate_id"]})
-            with self.subTest(status=status), interfaces(), patch.object(store, "dashboard", return_value=wrong_board), \
-                 self.assertRaisesRegex(TaskflowError, "existing formal"):
-                resume_path_transport(store, record["flow_id"], resolution)
+            row = {"work_id": "some-solver", "role": "solver", "state": status,
+                   "candidate_id": source.candidate["candidate_id"]}
+            identity = "existing-solver-" + status
+            with store._db(True) as db:
+                db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)", (identity, "neutral", source.candidate["candidate_id"],
+                    identity + "-intent", status, json.dumps(row)))
+            try:
+                with self.subTest(status=status), interfaces(), self.assertRaisesRegex(TaskflowError, "existing formal"):
+                    resume_path_transport(store, record["flow_id"], resolution)
+            finally:
+                with store._db(True) as db:
+                    db.execute("DELETE FROM work WHERE id=?", (identity,))
         receipt = Path(record["state"]["receipt"])
         raw = receipt.read_bytes()
         changed = read_json(receipt)

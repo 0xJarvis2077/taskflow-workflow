@@ -28,6 +28,8 @@ def parser() -> argparse.ArgumentParser:
     apply = commands.add_parser("apply", help="validate and append a typed command record")
     apply.description = "Allowed record operations: " + ", ".join(sorted(OPERATIONS))
     apply.add_argument("--record", type=Path, required=True)
+    controller_finding = commands.add_parser("controller-finding-reopen", help="receive an authorized public finding at an accepted idle source; no model")
+    controller_finding.add_argument("--record", type=Path, required=True)
     enqueue = commands.add_parser("enqueue", help="lock runner request and enqueue one intent")
     enqueue.add_argument("--spec", type=Path, required=True)
     enqueue.add_argument("--runtime", type=Path, required=True)
@@ -566,6 +568,10 @@ def main(argv: list[str] | None = None) -> int:
                 store.register_policy(batch_policy["policy_id"], batch_policy["config"])
             if args.operation == "apply":
                 output = apply_record(store, read_json(args.record))
+            elif args.operation == "controller-finding-reopen":
+                from taskflow.execution_controller_finding import reopen_controller_public_finding
+
+                output = reopen_controller_public_finding(store, **read_json(args.record))
             elif args.operation == "enqueue":
                 output = enqueue_spec(store, read_json(args.spec), args.runtime)
             elif args.operation == "worker":

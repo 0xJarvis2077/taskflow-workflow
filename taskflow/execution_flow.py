@@ -977,6 +977,11 @@ def _consume_repair(store: ExecutionStore, record: dict, attempt: dict, archive:
 
 
 def _receipt(store: ExecutionStore, record: dict) -> dict:
+    from taskflow.execution_controller_finding import current_after_controller_reopen
+
+    current = current_after_controller_reopen(store, record)
+    if current is not None:
+        return current
     state = dict(record["state"])
     if state.get("receipt"):
         _read(Path(state["receipt"]))
@@ -993,7 +998,10 @@ def _receipt(store: ExecutionStore, record: dict) -> dict:
              "asset_use": record["definition"]["accepted_use"],
               "resolved_exceptions": state.get("resolved_exceptions", []),
              "formal_experiment": "not_dispatched", "difficulty": "not_inferred"}
-    name = "result.json" if state["status"] == "accepted" else "exception-" + sha256(canonical(value))[:16] + ".json"
+    if state["status"] == "accepted":
+        name = "result-" + sha256(canonical(value))[:16] + ".json" if state.get("prior_receipts") else "result.json"
+    else:
+        name = "exception-" + sha256(canonical(value))[:16] + ".json"
     target = Path(record["definition"]["directory"]) / name
     _publish_once(target, value)
     state.update(receipt=str(target), receipt_pending=False)

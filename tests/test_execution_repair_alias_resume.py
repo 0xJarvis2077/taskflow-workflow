@@ -187,13 +187,23 @@ class RepairAliasResumeTests(unittest.TestCase):
                     resume_path_transport(store, record["flow_id"], resolution)
             finally:
                 path.rmdir()
-        board = store.dashboard()
+        import json
         for kind in ("work", "attempts"):
-            wrong = copy.deepcopy(board)
-            wrong[kind].append({"intent_id": _node(record, "solver") + "-intent", "state": "failed"})
-            with self.subTest(kind=kind), self.native_interface(helper), patch.object(store, "dashboard", return_value=wrong), \
-                 self.assertRaisesRegex(TaskflowError, "existing formal"):
-                resume_path_transport(store, record["flow_id"], resolution)
+            row = {"intent_id": _node(record, "solver") + "-intent", "state": "failed"}
+            identity = "exact-intent-footprint-" + kind
+            with store._db(True) as db:
+                if kind == "work":
+                    db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)", (identity, "neutral", initial["candidate_id"],
+                        row["intent_id"], "failed", json.dumps(row)))
+                else:
+                    db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?)",
+                        (identity, identity + "-work", "neutral", "failed", 0, json.dumps(row)))
+            try:
+                with self.subTest(kind=kind), self.native_interface(helper), self.assertRaisesRegex(TaskflowError, "existing formal"):
+                    resume_path_transport(store, record["flow_id"], resolution)
+            finally:
+                with store._db(True) as db:
+                    db.execute("DELETE FROM " + kind + " WHERE id=?", (identity,))
         self.assertEqual(record, store.get_flow(record["flow_id"]))
 
 

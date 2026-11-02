@@ -13,6 +13,7 @@ from typing import Iterator
 
 from taskflow.contracts import TaskflowError, canonical, relative_path, sha256, validate_id
 from taskflow.execution_flow import _publish_once
+from taskflow.execution_author_packet import author_packet_matches
 from taskflow.execution_formal import _handoff_errors
 from taskflow.execution_store import ExecutionStore, validate_evidence
 
@@ -85,6 +86,11 @@ def _save(store: ExecutionStore, record: dict, state: dict, kind: str) -> dict:
 
 
 def _receive(store: ExecutionStore, record: dict) -> dict:
+    from taskflow.execution_controller_finding import current_after_controller_reopen
+
+    current = current_after_controller_reopen(store, record)
+    if current is not None:
+        return current
     state = dict(record["state"])
     if state.get("receipt"):
         return record
@@ -94,7 +100,10 @@ def _receive(store: ExecutionStore, record: dict) -> dict:
                "result": state.get("result"), "exception": state.get("exception"),
                "substantive_next_decision": "registered controller",
                "experiment_validity_inferred": False}
-    name = "result.json" if state["status"] == "accepted" else "exception-" + sha256(canonical(payload))[:16] + ".json"
+    if state["status"] == "accepted":
+        name = "result-" + sha256(canonical(payload))[:16] + ".json" if state.get("prior_receipts") else "result.json"
+    else:
+        name = "exception-" + sha256(canonical(payload))[:16] + ".json"
     target = Path(record["definition"]["directory"]) / name
     _publish_once(target, payload)
     state["receipt"] = str(target)
@@ -535,8 +544,8 @@ def _resume_quality_dependency(store: ExecutionStore, record: dict, resolution: 
         author, _ = _author(store, source_definition)
         authority = validate_evidence([source_definition["authorization"]])[0]
         if (author["attempt_id"] != packet["source_author_attempt"] or author["intent_id"] != packet["source_author_intent"]
-                or author["cli_sid"] != packet["source_author_sid"] or authority["path"] != packet["source_business_packet"]
-                or authority["sha256"] != packet["source_business_packet_sha256"]):
+                or author["cli_sid"] != packet["source_author_sid"] or not author_packet_matches(store, parent=parent, packet=packet,
+                    authorization=definition["authorization"], packet_transport=state.get("source_business_packet_transport"))):
             raise TaskflowError("experiment dependency source author/authority binding differs")
         dependency = _resolved_quality_dependency(store, parent, entries[-1]["previous_exception"], active_only=False)
         keys = [key for key in ("public_preparation_resolution", "repair_record_projection", "coverage_chain_resolution", "repair_defect_identity") if key in dependency]
@@ -584,6 +593,8 @@ def _resume_quality_dependency(store: ExecutionStore, record: dict, resolution: 
 
 def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolution: dict, refs: list[dict]) -> dict:
     """Consume a repaired source transport contract without creating acceptance."""
+    import json
+
     from taskflow.execution_experiment import _author_source, _native_handoff, _node, _packet, _run_id
     from taskflow.execution_runner import _read
     from taskflow.execution_store import evidence_ref
@@ -596,7 +607,11 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
                "Issue evidence is absent from current candidate or has wrong SHA",
                "defect was repaired only in a different/later revision",
                "later independent rejection/conflict covers the accepted scope; old acceptance is not current",
+               "historical negative lacks exact current whole repair coverage",
+               "historical negative is outside the current repaired quality graph",
                "Composition cannot silently inherit changed package/scoring metadata"}
+    historical_closed_ancestor = reason == "historical negative lacks exact current whole repair coverage"
+    historical_repaired_graph = reason == "historical negative is outside the current repaired quality graph"
     scoring_mirror = reason == "Composition cannot silently inherit changed package/scoring metadata"
     repair_alias = reason == "defect was repaired only in a different/later revision"
     historical_negative = reason == "later independent rejection/conflict covers the accepted scope; old acceptance is not current"
@@ -606,7 +621,7 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
             or state.get("exception") != {"stage": "experiment_v1", "reason": reason}
             or not isinstance(reason, str) or reason not in allowed
             or not definition.get("source_author_flow_id") or state.get("pending_business_scope")
-            or (scoring_mirror and state.get("pending_business_scope") is not None)
+            or ((scoring_mirror or historical_closed_ancestor or historical_repaired_graph) and state.get("pending_business_scope") is not None)
             or state.get("candidate_id") or state.get("accepted_review_id") or state.get("runs") or state.get("release")
             or state.get("run_index", 0) != 0):
         raise TaskflowError("source transport resume requires its exact received initial zero-launch exception")
@@ -615,7 +630,7 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
     if (received.get("flow_id") != record["flow_id"] or received.get("status") != "exception"
             or received.get("exception") != state["exception"]):
         raise TaskflowError("source transport original exception receipt differs")
-    if (repair_alias or historical_negative or limited_findings or scoring_mirror) and (received.get("controller") != definition["owner"]
+    if (repair_alias or historical_negative or limited_findings or scoring_mirror or historical_closed_ancestor or historical_repaired_graph) and (received.get("controller") != definition["owner"]
             or any(received.get(key) != state.get(key) for key in ("history", "archives", "result"))
             or Path(original["path"]).name != "exception-" + sha256(canonical(received))[:16] + ".json"):
         raise TaskflowError("repair alias transport differs from its original received history/hash")
@@ -629,7 +644,7 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
         raise TaskflowError("source transport cannot wait, alter or receive a different author outcome")
     child, initial = bound["source"], bound["initial"]
     if (historical_negative and any(flow["state"].get("pending_business_scope") for flow in (parent, child))
-            or scoring_mirror and any(flow["state"].get("pending_business_scope") is not None
+            or (scoring_mirror or historical_closed_ancestor or historical_repaired_graph) and any(flow["state"].get("pending_business_scope") is not None
                                       or flow["state"].get("exception") is not None for flow in (parent, child))):
         raise TaskflowError("source transport cannot clear a source business hold")
     candidate = store.get_candidate(child["state"]["candidate_id"])
@@ -646,25 +661,28 @@ def _resume_source_quality_transport(store: ExecutionStore, record: dict, resolu
     publication = Path(definition["technical"]["publication_root"])
     paths = (Path(definition["technical"]["formal_runtime_root"]), inner, outer, publication,
              inner.with_name(inner.name + ".formal-intent.json"), publication / "reports/runtime-reservations" / (run_id + ".json"))
-    board = store.dashboard()
+    with store._db() as db:
+        board = {table: [json.loads(row["data"]) for row in db.execute("SELECT data FROM " + table)]
+                 for table in ("work", "attempts", "decisions")}
     if (any(row.get("work_id") == work_id or row.get("intent_id") == work_id + "-intent"
             or row.get("runtime_path") in {str(inner), str(outer)}
             or (row.get("candidate_id") == candidate["candidate_id"] and row.get("role") == "solver")
             for row in [*board["work"], *board["attempts"]])
             or any(path.exists() or path.is_symlink() for path in paths)
-            or ((historical_negative or scoring_mirror) and any(row.get("decision_id") == _node(record, "experiment-decision")
+            or ((historical_negative or scoring_mirror or historical_closed_ancestor or historical_repaired_graph) and any(row.get("decision_id") == _node(record, "experiment-decision")
                 or (row.get("candidate_id") == candidate["candidate_id"] and row.get("action") == "experiment")
                 for row in board["decisions"]))):
         raise TaskflowError("source transport has an existing formal publication, preparation, work or attempt")
-    review = (store.quality_gate(candidate["candidate_id"], require_repair_alias=True) if repair_alias or historical_negative
+    review = (store.quality_gate(candidate["candidate_id"], require_repair_alias=True) if repair_alias or historical_negative or historical_closed_ancestor or historical_repaired_graph
               else store.quality_gate(candidate["candidate_id"]))
     store.assert_review_current(review["review_id"])
     graph = review.get("composite_quality_coverage")
     source_review = graph["recheck_id"] if graph else review["review_id"]
     if source_review != child["state"]["accepted_review_id"]:
         raise TaskflowError("source transport current quality differs from the accepted original child")
-    if repair_alias:
+    if repair_alias or historical_closed_ancestor:
         if (graph or review.get("whole_package") is not True or review.get("derived")
+                or (historical_closed_ancestor and review.get("snapshot_bound_acceptance"))
                 or review["candidate_id"] != candidate["candidate_id"]):
             raise TaskflowError("repair alias transport requires the original current independent whole acceptance")
     elif reason != "native quality dimension has no explicit scoped affirmation: calculation":
@@ -1533,7 +1551,8 @@ def _resume_declaration_dependency(store: ExecutionStore, record: dict, resoluti
     authority = validate_evidence([source_definition["authorization"]])[0]
     if (author["state"] != "completed" or author["attempt_id"] != packet["source_author_attempt"]
             or author["intent_id"] != packet["source_author_intent"] or author["cli_sid"] != packet["source_author_sid"]
-            or authority["path"] != packet["source_business_packet"] or authority["sha256"] != packet["source_business_packet_sha256"]):
+            or not author_packet_matches(store, parent=parent, packet=packet,
+                authorization=definition["authorization"], packet_transport=state.get("source_business_packet_transport"))):
         raise TaskflowError("declaration dependency source author/authority binding differs")
     archive = Path(source["author_archive"])
     handoff = _handoff(archive, source_definition, author)
@@ -1583,10 +1602,93 @@ def _resume_declaration_dependency(store: ExecutionStore, record: dict, resoluti
     return _save(store, record, state, "lifecycle_declaration_dependency_resumed")
 
 
+def _resume_author_packet_transport(store: ExecutionStore, record: dict, resolution: dict, refs: list[dict]) -> dict:
+    """Adopt one exact locked source-metadata alias before any formal work."""
+    import json
+
+    from taskflow.execution_author_packet import validate_author_packet_transport
+    from taskflow.execution_experiment import _author_source, _node, _packet, _run_id
+    from taskflow.execution_store import evidence_ref
+    from taskflow.execution_runner import _read
+
+    definition, state = record["definition"], dict(record["state"])
+    reason = "authorized author flow differs from its exact task/owner/policy/original business packet"
+    if (definition.get("kind") != "experiment_v1" or not definition.get("source_author_flow_id")
+            or state.get("status") != "exception" or state.get("stage") != "experiment_v1"
+            or state.get("exception") != {"stage": "experiment_v1", "reason": reason}
+            or state.get("pending_business_scope") is not None or state.get("current_work_id") is not None
+            or not state.get("receipt") or state.get("run_index", 0) != 0
+            or any(state.get(key) for key in ("candidate_id", "accepted_review_id", "release", "runs",
+                "formal_attempt", "formal_runtime", "formal_outer", "imported_run", "native_quality_handoff",
+                "source_business_packet_transport"))):
+        raise TaskflowError("author packet resume requires its exact received initial zero-formal exception")
+    original = evidence_ref(Path(state["receipt"]), "original author packet transport exception retained")
+    received = _read(Path(original["path"]))
+    if (received.get("flow_id") != record["flow_id"] or received.get("controller") != definition["owner"]
+            or received.get("status") != "exception" or received.get("exception") != state["exception"]
+            or any(received.get(key) != state.get(key) for key in ("history", "archives", "result"))
+            or Path(original["path"]).name != "exception-" + sha256(canonical(received))[:16] + ".json"):
+        raise TaskflowError("author packet resume differs from its original received exception")
+    packet = _packet(record)
+    parent = store.get_flow(definition["source_author_flow_id"])
+    if (parent["definition"].get("kind") != "author_quality_v1"
+            or any(parent["definition"].get(key) != definition[key] for key in ("task_id", "owner", "policy_id"))
+            or parent["state"].get("status") not in {"active", "accepted"}
+            or parent["state"].get("pending_business_scope") is not None
+            or parent["state"].get("exception") is not None):
+        raise TaskflowError("author packet resume cannot clear or replace its source business outcome")
+    transport = validate_evidence([resolution["packet_transport"]])[0]
+    if not any(row["path"] == transport["path"] and row["sha256"] == transport["sha256"] for row in refs):
+        raise TaskflowError("author packet transport must be in the explicit resolution evidence")
+    witness = validate_author_packet_transport(packet_transport=transport,
+        authorization=definition["authorization"], source_flow_id=parent["flow_id"], store=store)
+    work_id, run_id = _node(record, "solver"), _run_id(record, packet)
+    technical = definition["technical"]
+    inner = Path(technical["formal_runtime_root"]) / run_id
+    outer = Path(definition["directory"]) / "runtimes" / work_id
+    publication = Path(technical["publication_root"])
+    footprints = (Path(technical["formal_runtime_root"]), inner, outer, publication,
+                  inner.with_name(inner.name + ".formal-intent.json"),
+                  publication / "reports/runtime-reservations" / (run_id + ".json"))
+    if any(path.exists() or path.is_symlink() for path in footprints):
+        raise TaskflowError("author packet resume has an existing formal preparation/publication")
+    with store._db() as db:
+        # Metadata only: do not invoke unrelated candidates' quality projections.
+        # Keep all rows so an existing foreign-ID purpose cannot be filtered out.
+        work = [json.loads(row["data"]) for row in db.execute("SELECT data FROM work")]
+        attempts = [json.loads(row["data"]) for row in db.execute("SELECT data FROM attempts")]
+        decisions = [json.loads(row["data"]) for row in db.execute("SELECT data FROM decisions")]
+    source_candidates = {parent["state"]["candidate_id"]} if parent["state"].get("candidate_id") else set()
+    if (parent["state"].get("status") == "accepted"
+            and parent["state"].get("result", {}).get("outcome") == "candidate_quality_accepted"):
+        effective = {**record, "state": {**state, "source_business_packet_transport": transport}}
+        bound = _author_source(store, effective, packet, require_candidate=True)
+        child_state = bound["source"]["state"]
+        if child_state.get("pending_business_scope") is not None or child_state.get("exception") is not None:
+            raise TaskflowError("author packet resume cannot clear its accepted child business hold")
+        source_candidates.add(child_state["candidate_id"])
+    if (any(row.get("work_id") == work_id or row.get("intent_id") == work_id + "-intent"
+            or row.get("runtime_path") in {str(inner), str(outer)}
+            or (row.get("candidate_id") in source_candidates and row.get("role") == "solver")
+            for row in [*work, *attempts])
+            or any(row.get("decision_id") == _node(record, "experiment-decision")
+                   or (row.get("candidate_id") in source_candidates and row.get("action") == "experiment") for row in decisions)):
+        raise TaskflowError("author packet resume has an existing formal work/attempt/decision")
+    state["source_business_packet_transport"] = transport
+    state["history"] = [*state.get("history", []), {"kind": "author_packet_source_metadata_transport",
+        "resolution": resolution, "evidence": refs, "previous_exception": state["exception"],
+        "previous_receipt": original, "source_revision": parent["revision"],
+        "source_business_packet_transport": witness, "new_model_dispatched": False}]
+    state.update(status="active", waiting=None)
+    state.pop("exception", None)
+    state.pop("receipt", None)
+    return _save(store, record, state, "lifecycle_author_packet_transport_resumed")
+
+
 def resume_path_transport(store: ExecutionStore, identity: str, resolution: dict) -> dict:
     """Resume verified unclaimed author/formal preparation, never a model call."""
     action = resolution.get("action")
-    if (action not in {"accept_path_only_candidate_transport", "accept_unsigned_author_placeholders",
+    if (action not in {"resume_author_packet_source_metadata_transport", "accept_path_only_candidate_transport", "accept_unsigned_author_placeholders",
                        "resume_unclaimed_public_preparation", "resume_unclaimed_formal_preparation",
                        "resume_resolved_quality_dependency", "resume_validated_source_quality_transport", "resume_unpublished_release_metadata", "resume_validated_evaluation_intake",
                        "resume_unpublished_release_report_binding",
@@ -1598,6 +1700,8 @@ def resume_path_transport(store: ExecutionStore, identity: str, resolution: dict
     refs = validate_evidence(resolution.get("evidence"))
     with _lifecycle_lock(store, identity):
         record = store.get_flow(identity)
+        if action == "resume_author_packet_source_metadata_transport":
+            return _resume_author_packet_transport(store, record, resolution, refs)
         if action == "resume_unclaimed_formal_preparation":
             return _resume_unclaimed_formal(store, record, resolution, refs)
         if action == "resume_resolved_quality_dependency":

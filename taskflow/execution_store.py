@@ -1625,18 +1625,23 @@ class ExecutionStore:
                 return
         raise TaskflowError("different private standard requires the signed affected-scope before/after mapping, not only matching public bytes")
 
-    def open_defect(self, defect_id: str, candidate_id: str, review_id: str, *, responsibility: str, evidence: list[dict[str, Any]], kind: str = "material") -> dict[str, Any]:
+    def open_defect(self, defect_id: str, candidate_id: str, review_id: str, *, responsibility: str, evidence: list[dict[str, Any]], kind: str = "material", finding_origin: dict[str, Any] | None = None) -> dict[str, Any]:
         validate_id(defect_id, "defect_id")
         _required_text(responsibility, "responsibility")
         if kind not in ("material", "reference", "rubric", "claim", "environment"):
             raise TaskflowError("unknown defect kind")
         refs = validate_evidence(evidence)
+        if finding_origin is not None and (not isinstance(finding_origin, dict)
+                or finding_origin.get("kind") != "authorized_controller_finding"):
+            raise TaskflowError("typed controller finding origin required")
         with self._db(True) as db:
             candidate = self._load(db, "candidates", candidate_id)
             review = self._load(db, "reviews", review_id)
             if review["candidate_id"] != candidate_id:
                 raise TaskflowError("defect review candidate mismatch")
             value = {"defect_id": defect_id, "candidate_id": candidate_id, "task_id": candidate["task_id"], "review_id": review_id, "responsibility": responsibility, "kind": kind, "state": "open", "evidence": refs}
+            if finding_origin is not None:
+                value["finding_origin"] = json.loads(canonical(finding_origin))
             value["opened_seq"] = self._event(db, "defect_opened", value)
             db.execute("INSERT INTO defects VALUES(?,?,?,?)", (defect_id, candidate["task_id"], "open", canonical(value).decode()))
             return value
@@ -2085,18 +2090,25 @@ class ExecutionStore:
                     # that consumed this particular intermediate finding.
                     ExecutionStore._composition_review(db, review,
                         "whole_package" if review["whole_package"] else "affected")
-                    ExecutionStore._assert_consumed_quality_negative(db, later, current_acceptance)
+                    historical = ExecutionStore._historical_closed_quality_source(db, later, current_acceptance)
+                    if historical is None:
+                        historical = ExecutionStore._historical_repaired_quality_source(db, later, current_acceptance)
+                    if historical is None:
+                        ExecutionStore._assert_consumed_quality_negative(db, later, current_acceptance)
                     continue
                 raise TaskflowError("later independent rejection/conflict covers the accepted scope; old acceptance is not current")
 
     @staticmethod
-    def _review_acceptance_material(db: sqlite3.Connection, review_id: str) -> dict[str, Any]:
+    def _review_acceptance_material(db: sqlite3.Connection, review_id: str, *,
+                                    current_acceptance: dict | None = None) -> dict[str, Any]:
         """Validate acceptance identity and evidence separately from freshness."""
         review = ExecutionStore._load(db, "reviews", review_id)
         if review["verdict"] != "accepted":
             raise TaskflowError("current acceptance requires an accepted independent review")
         if review.get("composite_quality_coverage"):
-            ExecutionStore._validate_repaired_quality(db, review)
+            ExecutionStore._validate_repaired_quality(db, review, current_acceptance=current_acceptance)
+        elif current_acceptance is not None:
+            raise TaskflowError("Historical graph context requires its actual derived repaired source")
         candidate = ExecutionStore._load(db, "candidates", review["candidate_id"])
         if any(review.get(key) != candidate[key] for key in ("input_digest", "content_digest")) or (
             "evaluation_digest" in review and review["evaluation_digest"] != candidate["evaluation_digest"]
@@ -2385,7 +2397,8 @@ class ExecutionStore:
     @staticmethod
     def _repaired_quality_material(db: sqlite3.Connection, candidate_id: str, whole_review_id: str,
                                    recheck_id: str, closed_defect_ids: list[str], *,
-                                   supplement: dict[str, Any] | None = None) -> dict:
+                                   supplement: dict[str, Any] | None = None,
+                                   current_acceptance: dict | None = None) -> dict:
         from taskflow.execution_flow_contracts import _files, validate_repair
         from taskflow.execution_runner import _info, _read, _regular, _validate, _validated_collection
         from taskflow.packages import check_task
@@ -2399,6 +2412,19 @@ class ExecutionStore:
         candidate = ExecutionStore._load(db, "candidates", candidate_id)
         whole = ExecutionStore._load(db, "reviews", whole_review_id)
         recheck = ExecutionStore._load(db, "reviews", recheck_id)
+        if current_acceptance is not None:
+            # Every caller, including a direct material reader, must present a
+            # real later persisted graph which validates with default freshness.
+            if (not isinstance(current_acceptance, dict) or not current_acceptance.get("composite_quality_coverage")
+                    or current_acceptance.get("derived") is not True
+                    or current_acceptance.get("whole_package") is not False
+                    or current_acceptance.get("snapshot_bound_acceptance") is not True
+                    or type(current_acceptance.get("completed_seq")) is not int
+                    or recheck["created_seq"] >= current_acceptance["completed_seq"]):
+                raise TaskflowError("Historical graph requires a later actual current canonical acceptance")
+            actual = ExecutionStore._assert_review_current(db, current_acceptance["review_id"])
+            if actual != current_acceptance:
+                raise TaskflowError("Historical graph current context differs from its persisted acceptance")
         if (whole["verdict"] != "defects" or whole.get("whole_package") is not True
                 or recheck["verdict"] != "accepted" or recheck.get("whole_package") is not False
                 or recheck["candidate_id"] != candidate_id or candidate.get("parent_id") != whole["candidate_id"]
@@ -2681,8 +2707,18 @@ class ExecutionStore:
             order = (ExecutionStore._review_time(db, other), other.get("completed_seq", other["created_seq"]))
             if related and order > old_order:
                 validate_evidence(other["evidence"])
+                if current_acceptance is not None:
+                    # A historical source stays superseded. Every intervening
+                    # negative must instead be consumed by this actual current
+                    # graph under the original complete source/closure checks.
+                    ExecutionStore._assert_consumed_quality_negative(db, other, current_acceptance)
+                    continue
                 raise TaskflowError("Additional later independent negative/conflict prevents this bounded composition")
-        ExecutionStore._assert_review_current(db, recheck_id)
+        if current_acceptance is None:
+            ExecutionStore._assert_review_current(db, recheck_id)
+        else:
+            source = ExecutionStore._review_acceptance_material(db, recheck_id)
+            ExecutionStore._assert_no_newer_negative(db, source, current_acceptance=current_acceptance)
         limits = lambda source: {key: source[key] for key in
                                 ("limits", "limitations", "source_scope_limits", "accepted_use") if key in source}
         return {"whole_review_id": whole_review_id, "recheck_id": recheck_id,
@@ -2708,12 +2744,17 @@ class ExecutionStore:
                 "completed_seq": completed_seq, "source_completed_at": datetime.fromtimestamp(completed_at, timezone.utc).isoformat()}
 
     @staticmethod
-    def _validate_repaired_quality(db: sqlite3.Connection, review: dict[str, Any]) -> None:
+    def _validate_repaired_quality(db: sqlite3.Connection, review: dict[str, Any], *,
+                                   current_acceptance: dict | None = None) -> None:
         validate_evidence(review["evidence"])
+        if (isinstance(current_acceptance, dict) and type(current_acceptance.get("completed_seq")) is int
+                and review["created_seq"] >= current_acceptance["completed_seq"]):
+            raise TaskflowError("Historical graph requires a later actual current canonical acceptance")
         graph = review["composite_quality_coverage"]
         current = ExecutionStore._repaired_quality_material(db, review["candidate_id"], graph["whole_review_id"],
             graph["recheck_id"], graph["closed_defect_ids"],
-            supplement=graph.get("recheck_supplement", {}).get("definition"))
+            supplement=graph.get("recheck_supplement", {}).get("definition"),
+            current_acceptance=current_acceptance)
         if (current != graph or review.get("whole_package") is not False
                 or review.get("snapshot_bound_acceptance") is not True
                 or review.get("completed_seq") != graph["completed_seq"]
@@ -2760,6 +2801,8 @@ class ExecutionStore:
     def _assert_closed_quality_record(db: sqlite3.Connection, defect: dict) -> None:
         """A closed flag must retain its exact append-only repair/closure events."""
         base = ("defect_id", "candidate_id", "review_id", "repair_candidate_id", "author_attempt")
+        if "finding_origin" in defect:
+            base += ("finding_origin",)
         for sequence, kinds, fields in (
             (defect.get("repair_seq"), {"defect_repaired"},
              (*base, "disposition", "changed_files", "repair_evidence")),
@@ -2814,6 +2857,165 @@ class ExecutionStore:
         if remaining:
             raise TaskflowError("historical negative has uncovered actual findings")
         return sorted(ids)
+
+    @staticmethod
+    def _historical_closed_quality_source(db: sqlite3.Connection, negative: dict, current: dict) -> dict | None:
+        """Reuse a negative's own closure through an actual ancestor byte alias.
+
+        A new author/whole signature never becomes the historical repair. The
+        original closure is selected only by all of that negative's defect IDs,
+        then revalidated with the existing strict repair/source/event checker.
+        """
+        from taskflow.packages import check_task
+
+        if (negative.get("verdict") != "defects" or negative.get("whole_package") is not True
+                or current.get("verdict") != "accepted" or current.get("whole_package") is not True
+                or current.get("derived") or current.get("snapshot_bound_acceptance")
+                or not isinstance(current.get("attempt_id"), str) or not current["attempt_id"].strip()
+                or type(current.get("completed_seq")) is not int
+                or db.execute("SELECT id FROM attempts WHERE id=?", (current["attempt_id"],)).fetchone() is None):
+            return None
+        defects = [_data(row) for row in db.execute("SELECT data FROM defects")
+                   if _data(row)["review_id"] == negative["review_id"]]
+        if not defects or any(row.get("state") != "closed" for row in defects):
+            return None
+        identities = {row.get("closure_review_id") for row in defects}
+        if len(identities) != 1 or None in identities or current["review_id"] in identities:
+            return None
+        closure = ExecutionStore._load(db, "reviews", next(iter(identities)))
+        if (closure.get("verdict") != "accepted" or closure.get("whole_package") is not True
+                or closure.get("derived") or closure.get("snapshot_bound_acceptance")
+                or not isinstance(closure.get("attempt_id"), str) or not closure["attempt_id"].strip()
+                or type(closure.get("completed_seq")) is not int
+                or db.execute("SELECT id FROM attempts WHERE id=?", (closure["attempt_id"],)).fetchone() is None
+                or any(row.get("repair_candidate_id") != closure["candidate_id"] for row in defects)
+                or closure["created_seq"] >= current["completed_seq"]
+                or ExecutionStore._review_time(db, closure) >= ExecutionStore._review_time(db, current)):
+            return None
+        candidate = ExecutionStore._load(db, "candidates", current["candidate_id"])
+        repaired = ExecutionStore._load(db, "candidates", closure["candidate_id"])
+        if candidate["task_id"] != repaired["task_id"]:
+            return None
+        ancestors = ExecutionStore._ancestors(db, candidate["candidate_id"]) - {candidate["candidate_id"]}
+        keys = ("input_digest", "content_digest", "evaluation_digest")
+        aliases = [ExecutionStore._load(db, "candidates", identity) for identity in sorted(ancestors)
+                   if all(ExecutionStore._load(db, "candidates", identity)[key] == repaired[key] for key in keys)]
+        if not aliases:
+            return None
+        # Do not absorb a later or unrelated finding into this historical pair.
+        # Failure of either strict source validator propagates; it is no fallback.
+        ExecutionStore._assert_consumed_quality_negative(db, negative, closure)
+        source = ExecutionStore._composition_review(db, current, "whole_package")
+        expected_members = None
+        captures = []
+        for item in [repaired, *aliases]:
+            declarations = [row for row in item["evidence"] if row.get("location") == "explicit package declaration"]
+            if len(declarations) != 1 or not item.get("files"):
+                raise TaskflowError("historical closed source alias requires its actual captured declaration and members")
+            validate_evidence(declarations)
+            actual = check_task(Path(declarations[0]["path"]).parent, write_report=False)
+            if (actual["errors"] or item["task_id"] != repaired["task_id"]
+                    or any(actual[key] != item[key] for key in ("task_id", *keys))):
+                raise TaskflowError("historical closed source alias declaration differs from its captured task/digests")
+            files = validate_evidence(item["files"])
+            members = sorted((row["package_path"], row.get("id"), row["role"], row["sha256"], row.get("size"))
+                             for row in files)
+            if expected_members is None:
+                expected_members = members
+            elif members != expected_members:
+                raise TaskflowError("historical closed source alias members differ despite matching digests")
+            captures.append({"candidate_id": item["candidate_id"], "declaration": declarations[0],
+                             "member_count": len(members)})
+        return {"schema_version": 1, "kind": "verified_historical_closed_negative_ancestor",
+                "negative_review_id": negative["review_id"], "closure_review_id": closure["review_id"],
+                "defect_ids": sorted(row["defect_id"] for row in defects),
+                "repaired_candidate_id": repaired["candidate_id"],
+                "current_review_id": current["review_id"], "current_candidate_id": candidate["candidate_id"],
+                "ancestor_aliases": captures[1:], "original_repaired_capture": captures[0],
+                "current_source": {"report": source["report_ref"], "issues": source["issues_ref"]}}
+
+    @staticmethod
+    def _historical_repaired_quality_source(db: sqlite3.Connection, negative: dict, current: dict) -> dict | None:
+        """Authenticate an old own graph without declaring that graph current."""
+        from taskflow.packages import check_task
+
+        if (negative.get("verdict") != "defects" or negative.get("whole_package") is not True
+                or current.get("verdict") != "accepted" or current.get("derived") is not True
+                or current.get("whole_package") is not False or current.get("snapshot_bound_acceptance") is not True
+                or not isinstance(current.get("composite_quality_coverage"), dict)
+                or type(current.get("completed_seq")) is not int):
+            return None
+        current_graph = current["composite_quality_coverage"]
+        if current_graph.get("whole_review_id") == negative["review_id"]:
+            return None  # The existing exact-current-graph validator owns this case.
+        defects = [_data(row) for row in db.execute("SELECT data FROM defects")
+                   if _data(row)["review_id"] == negative["review_id"]]
+        if not defects or any(row.get("state") != "closed" for row in defects):
+            return None
+        closures = {row.get("closure_review_id") for row in defects}
+        if len(closures) != 1 or None in closures:
+            return None
+        closure_id = next(iter(closures))
+        identities = sorted(row["defect_id"] for row in defects)
+        matches = []
+        for row in db.execute("SELECT data FROM reviews"):
+            signed = _data(row)
+            graph = signed.get("composite_quality_coverage")
+            if (isinstance(graph, dict) and signed.get("derived") is True and signed.get("verdict") == "accepted"
+                    and signed.get("whole_package") is False and signed.get("snapshot_bound_acceptance") is True
+                    and graph.get("whole_review_id") == negative["review_id"] and graph.get("recheck_id") == closure_id
+                    and graph.get("closed_defect_ids") == identities):
+                matches.append(signed)
+        if len(matches) != 1:
+            return None
+        historical = matches[0]
+        candidate = ExecutionStore._load(db, "candidates", current["candidate_id"])
+        repaired = ExecutionStore._load(db, "candidates", historical["candidate_id"])
+        if (candidate["task_id"] != repaired["task_id"]
+                or any(row.get("repair_candidate_id") != repaired["candidate_id"] for row in defects)
+                or max(row.get("closed_seq", 0) for row in defects) >= historical["created_seq"]
+                or historical["created_seq"] >= current["completed_seq"]
+                or ExecutionStore._review_time(db, historical) >= ExecutionStore._review_time(db, current)):
+            return None
+        whole = ExecutionStore._load(db, "reviews", current_graph["whole_review_id"])
+        source_attempt = ExecutionStore._load(db, "attempts", whole["attempt_id"])
+        keys = ("input_digest", "content_digest", "evaluation_digest")
+        aliases = [ExecutionStore._load(db, "candidates", identity) for identity in
+                   sorted(ExecutionStore._ancestors(db, candidate["candidate_id"]) - {candidate["candidate_id"]})]
+        aliases = [item for item in aliases if all(item[key] == repaired[key] for key in keys)
+                   and historical["created_seq"] < item["created_seq"] < source_attempt["claimed_seq"]]
+        if not aliases:
+            return None
+        for defect in defects:
+            ExecutionStore._assert_closed_quality_record(db, defect)
+        # This rebuild checks all original reports, actor/SID independence, actual
+        # repair bytes, defect events and necessary associations. Its only later
+        # negatives are each proved consumed by the strictly current graph.
+        authenticated = ExecutionStore._review_acceptance_material(
+            db, historical["review_id"], current_acceptance=current)
+        captures, expected = [], None
+        for item in [repaired, *aliases]:
+            declarations = [row for row in item["evidence"] if row.get("location") == "explicit package declaration"]
+            if len(declarations) != 1 or not item.get("files"):
+                raise TaskflowError("Historical repaired graph alias requires its actual declaration and members")
+            validate_evidence(declarations)
+            actual = check_task(Path(declarations[0]["path"]).parent, write_report=False)
+            if (actual["errors"] or item["task_id"] != repaired["task_id"]
+                    or any(actual[key] != item[key] for key in ("task_id", *keys))):
+                raise TaskflowError("Historical repaired graph alias changed its captured declaration")
+            members = sorted((row["package_path"], row.get("id"), row["role"], row["sha256"], row.get("size"))
+                             for row in validate_evidence(item["files"]))
+            if expected is not None and members != expected:
+                raise TaskflowError("Historical repaired graph alias changed its complete members")
+            expected = members
+            captures.append({"candidate_id": item["candidate_id"], "declaration": declarations[0],
+                             "member_count": len(members)})
+        return {"schema_version": 1, "kind": "verified_historical_repaired_graph_ancestor",
+                "negative_review_id": negative["review_id"], "closure_review_id": closure_id,
+                "historical_review_id": authenticated["review_id"], "historical_currentness_claimed": False,
+                "historical_graph": authenticated["composite_quality_coverage"],
+                "current_review_id": current["review_id"], "current_graph": current_graph,
+                "defect_ids": identities, "original_repaired_capture": captures[0], "ancestor_aliases": captures[1:]}
 
     @staticmethod
     def _assert_consumed_quality_negative(db: sqlite3.Connection, negative: dict, current: dict) -> None:
