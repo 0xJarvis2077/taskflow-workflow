@@ -1688,7 +1688,8 @@ def _resume_author_packet_transport(store: ExecutionStore, record: dict, resolut
 def resume_path_transport(store: ExecutionStore, identity: str, resolution: dict) -> dict:
     """Resume verified unclaimed author/formal preparation, never a model call."""
     action = resolution.get("action")
-    if (action not in {"resume_author_packet_source_metadata_transport", "accept_path_only_candidate_transport", "accept_unsigned_author_placeholders",
+    if (action not in {"resume_failed_public_capacity_once", "resume_resolved_public_capacity_dependency",
+                       "resume_author_packet_source_metadata_transport", "accept_path_only_candidate_transport", "accept_unsigned_author_placeholders",
                        "resume_unclaimed_public_preparation", "resume_unclaimed_formal_preparation",
                        "resume_resolved_quality_dependency", "resume_validated_source_quality_transport", "resume_unpublished_release_metadata", "resume_validated_evaluation_intake",
                        "resume_unpublished_release_report_binding",
@@ -1700,6 +1701,16 @@ def resume_path_transport(store: ExecutionStore, identity: str, resolution: dict
     refs = validate_evidence(resolution.get("evidence"))
     with _lifecycle_lock(store, identity):
         record = store.get_flow(identity)
+        if action in {"resume_failed_public_capacity_once", "resume_resolved_public_capacity_dependency"}:
+            from taskflow.execution_public_continuation import resume_public_capacity_once, resume_public_capacity_dependency
+
+            if action == "resume_failed_public_capacity_once":
+                return resume_public_capacity_once(store, record, resolution, refs)
+            source_id = record["definition"].get("source_author_flow_id")
+            if not source_id:
+                raise TaskflowError("public capacity dependency requires its original author source")
+            with _lifecycle_lock(store, source_id):
+                return resume_public_capacity_dependency(store, record, resolution, refs)
         if action == "resume_author_packet_source_metadata_transport":
             return _resume_author_packet_transport(store, record, resolution, refs)
         if action == "resume_unclaimed_formal_preparation":

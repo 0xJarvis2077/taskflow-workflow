@@ -2413,18 +2413,32 @@ class ExecutionStore:
         whole = ExecutionStore._load(db, "reviews", whole_review_id)
         recheck = ExecutionStore._load(db, "reviews", recheck_id)
         if current_acceptance is not None:
-            # Every caller, including a direct material reader, must present a
-            # real later persisted graph which validates with default freshness.
-            if (not isinstance(current_acceptance, dict) or not current_acceptance.get("composite_quality_coverage")
-                    or current_acceptance.get("derived") is not True
-                    or current_acceptance.get("whole_package") is not False
-                    or current_acceptance.get("snapshot_bound_acceptance") is not True
-                    or type(current_acceptance.get("completed_seq")) is not int
+            # Authenticate a historical graph only against a real later current
+            # endpoint. A current original whole source is not the old repair;
+            # the caller still proves that repair's own graph and literal alias.
+            derived = (isinstance(current_acceptance, dict)
+                and isinstance(current_acceptance.get("composite_quality_coverage"), dict)
+                and bool(current_acceptance["composite_quality_coverage"])
+                and current_acceptance.get("derived") is True
+                and current_acceptance.get("whole_package") is False
+                and current_acceptance.get("snapshot_bound_acceptance") is True)
+            original = (isinstance(current_acceptance, dict)
+                and current_acceptance.get("verdict") == "accepted"
+                and current_acceptance.get("whole_package") is True
+                and not current_acceptance.get("derived")
+                and not current_acceptance.get("snapshot_bound_acceptance")
+                and not current_acceptance.get("composite_quality_coverage")
+                and isinstance(current_acceptance.get("attempt_id"), str)
+                and bool(current_acceptance["attempt_id"].strip())
+                and db.execute("SELECT id FROM attempts WHERE id=?", (current_acceptance["attempt_id"],)).fetchone() is not None)
+            if (not (derived or original) or type(current_acceptance.get("completed_seq")) is not int
                     or recheck["created_seq"] >= current_acceptance["completed_seq"]):
                 raise TaskflowError("Historical graph requires a later actual current canonical acceptance")
             actual = ExecutionStore._assert_review_current(db, current_acceptance["review_id"])
             if actual != current_acceptance:
                 raise TaskflowError("Historical graph current context differs from its persisted acceptance")
+            if original:
+                ExecutionStore._composition_review(db, actual, "whole_package")
         if (whole["verdict"] != "defects" or whole.get("whole_package") is not True
                 or recheck["verdict"] != "accepted" or recheck.get("whole_package") is not False
                 or recheck["candidate_id"] != candidate_id or candidate.get("parent_id") != whole["candidate_id"]
@@ -2710,7 +2724,7 @@ class ExecutionStore:
                 if current_acceptance is not None:
                     # A historical source stays superseded. Every intervening
                     # negative must instead be consumed by this actual current
-                    # graph under the original complete source/closure checks.
+                    # endpoint under the original complete source/closure checks.
                     ExecutionStore._assert_consumed_quality_negative(db, other, current_acceptance)
                     continue
                 raise TaskflowError("Additional later independent negative/conflict prevents this bounded composition")
@@ -2939,14 +2953,19 @@ class ExecutionStore:
         """Authenticate an old own graph without declaring that graph current."""
         from taskflow.packages import check_task
 
+        current_graph = current.get("composite_quality_coverage")
+        derived = (current.get("derived") is True and current.get("whole_package") is False
+                   and current.get("snapshot_bound_acceptance") is True
+                   and isinstance(current_graph, dict) and bool(current_graph))
+        original = (current.get("whole_package") is True and not current.get("derived")
+                    and not current.get("snapshot_bound_acceptance") and not current_graph
+                    and isinstance(current.get("attempt_id"), str) and bool(current["attempt_id"].strip())
+                    and db.execute("SELECT id FROM attempts WHERE id=?", (current["attempt_id"],)).fetchone() is not None)
         if (negative.get("verdict") != "defects" or negative.get("whole_package") is not True
-                or current.get("verdict") != "accepted" or current.get("derived") is not True
-                or current.get("whole_package") is not False or current.get("snapshot_bound_acceptance") is not True
-                or not isinstance(current.get("composite_quality_coverage"), dict)
+                or current.get("verdict") != "accepted" or not (derived or original)
                 or type(current.get("completed_seq")) is not int):
             return None
-        current_graph = current["composite_quality_coverage"]
-        if current_graph.get("whole_review_id") == negative["review_id"]:
+        if derived and current_graph.get("whole_review_id") == negative["review_id"]:
             return None  # The existing exact-current-graph validator owns this case.
         defects = [_data(row) for row in db.execute("SELECT data FROM defects")
                    if _data(row)["review_id"] == negative["review_id"]]
@@ -2977,7 +2996,7 @@ class ExecutionStore:
                 or historical["created_seq"] >= current["completed_seq"]
                 or ExecutionStore._review_time(db, historical) >= ExecutionStore._review_time(db, current)):
             return None
-        whole = ExecutionStore._load(db, "reviews", current_graph["whole_review_id"])
+        whole = ExecutionStore._load(db, "reviews", current_graph["whole_review_id"]) if derived else current
         source_attempt = ExecutionStore._load(db, "attempts", whole["attempt_id"])
         keys = ("input_digest", "content_digest", "evaluation_digest")
         aliases = [ExecutionStore._load(db, "candidates", identity) for identity in
@@ -2990,9 +3009,10 @@ class ExecutionStore:
             ExecutionStore._assert_closed_quality_record(db, defect)
         # This rebuild checks all original reports, actor/SID independence, actual
         # repair bytes, defect events and necessary associations. Its only later
-        # negatives are each proved consumed by the strictly current graph.
+        # negatives are each proved consumed by the strictly current endpoint.
         authenticated = ExecutionStore._review_acceptance_material(
             db, historical["review_id"], current_acceptance=current)
+        original_source = ExecutionStore._composition_review(db, current, "whole_package") if original else None
         captures, expected = [], None
         for item in [repaired, *aliases]:
             declarations = [row for row in item["evidence"] if row.get("location") == "explicit package declaration"]
@@ -3014,7 +3034,11 @@ class ExecutionStore:
                 "negative_review_id": negative["review_id"], "closure_review_id": closure_id,
                 "historical_review_id": authenticated["review_id"], "historical_currentness_claimed": False,
                 "historical_graph": authenticated["composite_quality_coverage"],
-                "current_review_id": current["review_id"], "current_graph": current_graph,
+                "current_review_id": current["review_id"],
+                **({"current_graph": current_graph} if derived else {
+                    "current_source": {"kind": "actual_independent_whole", "candidate_id": candidate["candidate_id"],
+                        "attempt_id": source_attempt["attempt_id"], "sid": source_attempt["cli_sid"],
+                        "report": original_source["report_ref"], "issues": original_source["issues_ref"]}}),
                 "defect_ids": identities, "original_repaired_capture": captures[0], "ancestor_aliases": captures[1:]}
 
     @staticmethod

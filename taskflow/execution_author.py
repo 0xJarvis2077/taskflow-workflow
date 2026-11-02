@@ -514,6 +514,13 @@ def _candidate_structure(root: Path, task_id: str) -> dict:
 def _public_root(record: dict) -> Path:
     """Use one stable external runtime without changing prior repository evidence."""
     identity = {"flow_id": record["flow_id"], "definition_digest": record["definition_digest"]}
+    if record.get("state", {}).get("public_capacity_continuation"):
+        proof = record["state"]["public_capacity_continuation"]
+        if (proof.get("kind") != "explained_public_capacity_continuation_v1" or type(proof.get("ordinal")) is not int or proof.get("ordinal") != 1
+                or proof.get("flow_id") != record["flow_id"]
+                or proof.get("definition_digest") != record["definition_digest"]):
+            raise TaskflowError("public continuation identity differs from its original source")
+        identity["continuation"] = 1
     return Path("/tmp").resolve() / ("tf-author-public-" + sha256(canonical(identity))[:24])
 
 
@@ -577,10 +584,16 @@ def advance_author(store: object, record: dict) -> dict:
     candidate = store.get_candidate(state["candidate_id"])
     if state["stage"] == "public_prepare":
         role = _roles(store, definition)["public_rebuild"]
+        continuation = state.get("public_capacity_continuation")
+        if continuation is not None and canonical(role) != canonical(continuation["public_role"]):
+            raise TaskflowError("public continuation configuration differs from its original approved role")
         root = _public_root(record)
         root.mkdir(parents=True, exist_ok=True)
         runtime = root / "runtime"
         node_id, work_id = _identity(record["flow_id"], "public"), _identity(record["flow_id"], "public-work")
+        if continuation is not None:
+            node_id = _identity(record["flow_id"], "public-capacity-once")
+            work_id = _identity(record["flow_id"], "public-capacity-work-once")
         context = {**_binding(candidate), "flow_id": record["flow_id"], "node_id": node_id, "intent_id": node_id,
                    "runtime": str(runtime), "work": str(root / "work"), "scratch": str(root / "scratch"),
                    "candidate_root": state["candidate_root"], "inputs_root": str(runtime / "inputs"),
@@ -612,6 +625,9 @@ def advance_author(store: object, record: dict) -> dict:
             return _wait(store, record, "public_reconstruction", attempt["state"] if attempt else "ready")
         if attempt["state"] != "completed" or not attempt.get("cli_sid") or attempt["cli_sid"] == author["cli_sid"]:
             raise TaskflowError("fresh public reconstruction failed or reused the author context")
+        if (state.get("public_capacity_continuation") is not None
+                and attempt["cli_sid"] == state["public_capacity_continuation"]["failed_sid"]):
+            raise TaskflowError("public continuation reused the original failed CLI context")
         archived = archive_full_attempt(Path(attempt["runtime_path"]), Path(definition["directory"]) / "archives" / attempt["attempt_id"])
         state.update(public_attempt_id=attempt["attempt_id"], public_archive=archived["path"],
                      stage="child_quality", current_work_id=None, waiting=None)

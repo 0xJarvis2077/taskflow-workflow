@@ -213,6 +213,8 @@ experiment release 在 canonical kind producer 与严格 required-ID consumer �
 
 | action | 已有证据及边界 |
 | --- | --- |
+| `resume_failed_public_capacity_once` | 仅接原作者完成后第一次严格公开重建的已采集容量失败。明确给出`failed_attempt_id`、`availability_attempt_id`与`evidence`，重验原收到的异常、实际 failed attempt／锁定公开来源／完整归档，以及失败之后同 CLI、模型、推理配置和策略的真实正常完成证据。外层 exit 0 不代替模型完成。保留旧失败，追加唯一接续身份与独立 runtime，恢复原父 flow 到`public_prepare`；动作不 prepare、不派模型，不重做作者。重复、未知尝试、业务 hold、已有 child/formal 或别的领取均拒。 |
+| `resume_resolved_public_capacity_dependency` | 只恢复上述原失败在原唯一实验收到的精确传播异常。父 flow 的一次接续证据绑定零个或唯一原实验的 ID、定义、授权、原异常与事件；多个用途不猜选，后加的其他实验不能借此恢复。按原作者／SID、持久化历史、失败／可用性及已有题包运输侧证重验；父 flow 必须仍在未准备新公共重建的`public_prepare`。先完成父 flow 和依赖的零模型恢复，再启动原正常消费者。保留原正式用途、原回执和控制，不新建实验、换模型或循环 retry。 |
 | `resume_author_packet_source_metadata_transport` | 仅接初始零 formal 实验的原题包路径绑定异常。`packet_transport: REF`须同时列入`evidence`，指向严格`author_packet_source_metadata_alias_v1`侧证：原作者定义、实际 work/attempt、原授权、锁定 manifest 中唯一`source_metadata`输入和源／暂存字节均须吻合。只显式采纳该原输入的路径，保留原正文、模型、SID、异常和用途；不按同 SHA 搜索别名，不创建第二实验。当前已接受的修订候选与初始候选均检查 solver/decision 足迹。在线、离线规范证书使用同一验证器；无侧证时沿用原路径精确匹配。 |
 | `resume_unclaimed_formal_preparation` | 仅处理`formal_prepare`原精确授权映射异常；尚无该solver work/attempt、runtime或准备意图。重新核原packet精确item、当前候选/质量、冻结发布及配置，不放宽模型、超时或baseline。 |
 | `resume_resolved_quality_dependency` | 子质量flow已显式解决原精确`repair defect_ids: list required`字段传递异常（原repair角色`covered_defect_ids`与assigned集合相同），或已用明确repair-record投影解决原精确技术异常，或已显式解决零派发`public_rebuild`的仓库内runtime错误后，核原作者、公开前驱、同一子flow/节点和原异常回执，恢复其传播到作者父flow或尚无solver工作的后继实验的依赖异常。不能跳过未解决的质量缺陷、失败/不明尝试或独立业务等待条件。 |
@@ -231,7 +233,7 @@ experiment release 在 canonical kind producer 与严格 required-ID consumer �
 
 上述操作均在生命周期锁内追加历史，保留原异常、回执、定义、尝试和原签分。validated intake恢复不重新导入或调用模型；正常消费者幂等接收同一evaluation，active状态或已消费恢复不能再次使用。
 
-历史负面结论的旧修订图可作为来源证据，但不能因此成为当前通过。接收器须重建该负面结论自己的实际返修、独立 affected 闭合及完整祖先别名，并用当前持久化图逐项验证之后的重叠负面结论确已被消费。默认调用仍拒绝失效旧图；上下文不放宽 whole/affected 范围，不修改原签或补充 covered IDs。初始实验收到`historical negative is outside the current repaired quality graph`时，也只能在上述当前图验证及原有零足迹、回执和业务 hold 检查通过后，使用`resume_validated_source_quality_transport`恢复。
+历史负面结论的旧修订图可作为来源证据，但不能因此成为当前通过。接收器须重建该负面结论自己的实际返修、独立 affected 闭合及完整祖先别名；当前独立整包签发或持久化派生图均须通过原始验证，再逐项证明后继重叠负面结论已闭合。空图和伪造摘要不能代替真实当前来源。默认调用仍拒绝失效旧图；上下文不放宽 whole/affected 范围，不修改原签或补充 covered IDs。初始实验收到`historical negative is outside the current repaired quality graph`时，也只能在上述当前图验证及原有零足迹、回执和业务 hold 检查通过后，使用`resume_validated_source_quality_transport`恢复。
 
 宿主准备恢复须先按明确授权核正确宿主权限，独占同run恢复标记并完整保留旧inner，原intent和reservation路径及字节不变；仅在原canonical路径执行批准准备程序的`--in-runtime`分支及全部原探针。不得再stage抢预约、跳过隔离检查、放宽目标profile或重抽失败/不明模型。恢复操作不自动重试；任何已有solver派发或证据漂移均停止。完成回执经只读验证后，既有生命周期仍须照常验证prepared plan，才可沿原授权唯一派发。
 
