@@ -68,17 +68,24 @@ class HistoricalClosedAncestorTests(unittest.TestCase):
                 db, negative or v["negative"], current or v["current"])
 
     @contextmanager
-    def changed_row(self, table, identity, change):
+    def changed_row(self, table, identity, change, *, capture_event=False):
         store = self.value["store"]
         with store._db(True) as db:
             original = db.execute("SELECT data FROM " + table + " WHERE id=?", (identity,)).fetchone()["data"]
             value = json.loads(original); change(value)
             db.execute("UPDATE " + table + " SET data=? WHERE id=?", (canonical(value).decode(), identity))
+            event = None
+            if capture_event:
+                event = db.execute("SELECT data FROM events WHERE seq=?", (value["created_seq"],)).fetchone()["data"]
+                db.execute("UPDATE events SET data=? WHERE seq=?", (canonical({key: item for key, item in value.items()
+                           if key != "created_seq"}).decode(), value["created_seq"]))
         try:
             yield
         finally:
             with store._db(True) as db:
                 db.execute("UPDATE " + table + " SET data=? WHERE id=?", (original, identity))
+                if event is not None:
+                    db.execute("UPDATE events SET data=? WHERE seq=?", (event, value["created_seq"]))
 
     def test_new_author_whole_reuses_only_the_negatives_actual_closed_ancestor(self):
         v, store = self.value, self.value["store"]
@@ -162,7 +169,8 @@ class HistoricalClosedAncestorTests(unittest.TestCase):
         # candidate's literal parent chain. It cannot be picked by a hash search.
         with self.changed_row("candidates", v["new_candidate"]["candidate_id"],
                               lambda row: row.update(parent_id=unrelated)):
-            self.assertIsNone(self.source())
+            with self.assertRaisesRegex(TaskflowError, "capture event"):
+                self.source()
         with self.changed_row("candidates", v["alias"]["candidate_id"],
                               lambda row: row.update(task_id="foreign-task")):
             # Task identity is part of a valid actual alias, not merely three digests.
@@ -172,10 +180,11 @@ class HistoricalClosedAncestorTests(unittest.TestCase):
     def test_alias_declaration_member_metadata_and_payload_bytes_are_rechecked(self):
         v = self.value
         alias_id = v["alias"]["candidate_id"]
-        with self.changed_row("candidates", alias_id, lambda row: row["files"][0].update(role="different-role")):
-            with self.assertRaisesRegex(TaskflowError, "members differ"):
+        with self.changed_row("candidates", alias_id, lambda row: row["files"][0].update(role="different-role"),
+                              capture_event=True):
+            with self.assertRaisesRegex(TaskflowError, "member path/id/role"):
                 self.source()
-        with self.changed_row("candidates", alias_id, lambda row: row.update(evidence=[])):
+        with self.changed_row("candidates", alias_id, lambda row: row.update(evidence=[]), capture_event=True):
             with self.assertRaisesRegex(TaskflowError, "captured declaration"):
                 self.source()
         for path in [Path(v["alias"]["files"][0]["path"]),

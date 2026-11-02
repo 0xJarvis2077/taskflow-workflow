@@ -19,7 +19,7 @@ from tests import test_execution_historical_closure_freshness as fixtures
 from tools.execution_simulation import perform
 
 
-def graph_descendant_fixture(owner, *, foreign=False):
+def graph_descendant_fixture(owner, *, foreign=False, with_older_alias=False):
     value = fixtures.closure_fixture(owner)
     store, case = value["store"], value["case"]
     historical = value["accepted"]
@@ -27,7 +27,17 @@ def graph_descendant_fixture(owner, *, foreign=False):
     declaration = next(row for row in repaired["evidence"] if row["location"] == "explicit package declaration")
     baseline = case.root / "new-graph-baseline"
     shutil.copytree(Path(declaration["path"]).parent, baseline)
-    alias = capture_candidate(store, baseline, "new-graph-baseline")
+    older_alias = None
+    if with_older_alias:
+        older_root = case.root / "older-graph-baseline"
+        shutil.copytree(baseline, older_root)
+        older_alias = capture_candidate(store, older_root, "older-graph-baseline")
+        unchanged = perform(store, case.root / "same-graph-author", older_alias["candidate_id"],
+                            "author", "same-graph-author", {"note.md": "No package changes."})
+        alias = capture_candidate(store, baseline, "new-graph-baseline", older_alias["candidate_id"],
+                                  unchanged["attempt_id"])
+    else:
+        alias = capture_candidate(store, baseline, "new-graph-baseline")
     author = perform(store, case.root / "graph-author-role", alias["candidate_id"], "author", "graph-new-author",
                      {"prompt.md": "A new complete neutral commission; retain capacity 3 and select 1 unit.\n"})
     owner.assertEqual("completed", author["state"])
@@ -59,9 +69,33 @@ def graph_descendant_fixture(owner, *, foreign=False):
     history = [row for row in flow["state"]["history"] if row["kind"] == "independent_review"]
     current = store.compose_repaired_quality(flow["state"]["candidate_id"], history[0]["review_id"],
         flow["state"]["accepted_review_id"], flow["state"]["repaired_defects"], evidence=case.refs)
-    return {**value, "historical": historical, "alias": alias, "author": author,
+    return {**value, "historical": historical, "alias": alias, "older_alias": older_alias, "author": author,
             "current": current, "new_flow": flow, "new_whole": store.get_review(history[0]["review_id"]),
             "negative": store.get_review(value["whole"]), "foreign": foreign_review}
+
+
+class CompetingGraphAncestorsTests(unittest.TestCase):
+    def setUp(self):
+        self.value = graph_descendant_fixture(self, with_older_alias=True)
+
+    def source(self):
+        v = self.value
+        with v["store"]._db() as db:
+            return ExecutionStore._historical_repaired_quality_source(db, v["negative"], v["current"])
+
+    def test_bad_older_ancestor_outside_selected_path_does_not_hide_near_alias(self):
+        v = self.value
+        path = Path(v["older_alias"]["files"][0]["path"])
+        path.write_bytes(path.read_bytes() + b"drift")
+        witness = self.source()
+        self.assertEqual([v["alias"]["candidate_id"]],
+                         [item["candidate_id"] for item in witness["ancestor_aliases"]])
+
+    def test_bad_selected_alias_still_rejects_even_with_an_older_match(self):
+        path = Path(self.value["alias"]["files"][0]["path"])
+        path.write_bytes(path.read_bytes() + b"drift")
+        with self.assertRaises(TaskflowError):
+            self.source()
 
 
 class HistoricalRepairedSourceTests(unittest.TestCase):
@@ -169,6 +203,12 @@ class HistoricalRepairedSourceTests(unittest.TestCase):
                     self.source()
             finally:
                 path.write_bytes(raw)
+
+    def test_literal_alias_capture_event_cannot_be_rewritten(self):
+        alias_id = self.value["alias"]["candidate_id"]
+        with self.changed("candidates", alias_id, lambda row: row.update(unrecorded_marker="foreign")):
+            with self.assertRaisesRegex(TaskflowError, "capture event"):
+                self.source()
 
     def test_old_graph_events_and_current_graph_cannot_be_replaced_by_stored_summaries(self):
         value = self.value

@@ -25,7 +25,9 @@ python3 -m taskflow execution --db execution/batch-id.sqlite3 batch-experiment-s
 - 每个启用角色保留稳定 key、`enabled` 和用户选择的 `model`。CLI 的 `runtime` 包含 `carrier=cli`、`provider`、绝对 `cli` 路径、`reasoning_selection`、`reasoning_effort`、可空 `reasoning_context`、正数 `timeout_seconds` 和 `support_evidence`。不支持 `auto/default` 或从旧模板填型号。
 - `user_model_confirmation` 包含 `origin=direct_user`、带 `path/sha256/size/location` 的真实人类消息来源，以及 `scope`、`expanded_model_map`、`model_mapping_digest`、`scope_digest`。`confirmation_digests(plan)` 生成需归因给人的展开映射和范围；模型、启用角色、runtime 或范围变化必须重新确认。程序仅核结构化归因及字节，启动者仍须核原话确由用户作出。
 - 主控、内容检查、工程、健康巡检的 `runtime` 使用 `carrier=chat` 和 `provider`。`role_bindings` 按角色保存真实 `thread_id/host/actual_model`、配置证据引用和 JSON pointer；证据须对应实际 ID、型号、服务和批次范围。缺证保持未知并阻止冻结；表内填值不代表聊天已切换。标题、展示名及命名模式不参与路由。
-- CLI 支持证据绑定同一可执行文件、实际目录查询 argv、退出码、原 JSON 输出引用，以及同一模型条目的型号／推理能力定位。真实批次要求原 CLI 观察；`test_fixture` 证据只供模拟，不能准备真实角色。模型目录支持不证明服务端实际型号，服务端未知继续保持未知。
+- CLI 支持证据绑定同一可执行文件、实际目录查询 argv、退出码、原 JSON 输出引用，以及同一模型条目的型号／推理能力定位。推理等级可为字符串数组，或目录原样返回的 `supported_reasoning_levels` 对象数组（读取各项 `effort`）。真实批次要求原 CLI 观察；`test_fixture` 证据只供模拟，不能准备真实角色。模型目录支持不证明服务端实际型号，服务端未知继续保持未知。
+- `verified_client_default` 的批次检查将同一模型目录条目的默认 effort 作为声明和预期，并锁定预期 context；目录不含 context 时无需伪造该字段。旧 `observation_kind` 字段可保留，但标签本身不能证明客户端解析。正式准备仍须对当前计划执行下文的固定响应解析核验，实际 model、effort、context 或请求不匹配即拒绝调用。`explicit` 模式的非空 context 仍须有同模型目录支持证据。
+- 已冻结 v1 快照回读时兼容原合同允许的其他默认字段定位，但须重验原标记、同模型条目、原字符串等级及 context 证据和全部封存字节；活动计划不能通过旧标记启用兼容分支。文件及哈希不能单独证明快照的历史真实性，仍须核原策略与来源。
 - 新批业务 packet 必须显式携带相同 `batch_id`，所有 `items[].task_id` 必须在确认范围。未发生的 CLI work、attempt 和 SID 保持空，不预造身份。
 
 基础设施文件为 `schema_version=1`，含新 `policy_id`、`policy` 的并发等参数，可按需要提供 `author_factory` 和 `experiment_factory`。两类工厂沿原字段提供工具、权限、模板引用和输出根；模板仍需真实可用，不提供模型默认。编译产生不可覆盖的确认快照、`policy-record.json` 和相应新工厂，模型与推理参数只来自本批确认。快照留存来源证据字节，后续原路径或模板变化不改已锁定请求；同 ID 的不同策略拒绝覆盖，同批相同策略可幂等复用。
@@ -130,9 +132,31 @@ native角色必须显式提供`native_permissions`，经`probe_native_attempt`�
 
 ## 恢复、暂停及回退
 
+### 经明确授权的返修容量重试
+
+当原独立返修确已启动并以已封存的单一容量错误终止、无完整交付时，主控可对原 child 精确登记有界重试。授权须另有可回读的人类原话证据和结构化文件，显式绑定 controller、child flow、原失败 attempt、候选四摘要、原 policy 及允许的额外次数；不得从其他角色、旧批次或默认值推断。数量是本次授权，不是全局默认。用户已授权重试时不另发模型调用来制造可用性证据。
+
+`flow-repair-capacity-prepare --parent-flow-id ID --flow-id ID --record FILE` 只复核和保存原失败完整归档、原 parent/child 接收及原实验授权，登记预算与第一新工作项的 future-claims pause，不派模型或改缺陷。record 必须是 `reason`、`authority`（path/SHA/location 引用）和 `failed_attempt_id`；authority 必须包含 `schema_version: 1`、`kind: bounded_repair_capacity_v1`、`owner`、`flow_id`、`failed_attempt_id`、`candidate_binding`、`policy_id`、`action: prepare_bounded_same_profile_repairs`、正整数 `maximum_additional_attempts` 和 `direct_user_evidence` 引用。该引用及模型确认仍需人工核实际来源，文件与哈希不是人类身份签名。
+
+原 parent 在整个 child 返修/复检期间保留其异常和原回执；任何关联原实验的授权和业务 hold 不自动恢复。确认原直接授权、未来领取控制及在途边界后，可通过 `apply` 中的 `set_control` 对 `work:<ID>` 精确 resume，ID 取返回的 `state.repair_capacity_continuation.new_work_id`；再用 `flow-run --flow-id CHILD_ID --allow-model` 运行该 child。只有首个新工作项预先暂停；放行后，在预算内遇到已验证的容量失败时，flow-run 会自动依序接续后续重试。每次新工作与尝试保持相同确认批次、模型、推理参数、输入和职责，仅更换节点/runtime 与新独立 SID；每次失败的原 trace、collection、完整归档、预算 ordinal 和事件逐项回读。只有当前一次确已终止且唯一真实容量失败时才可继续下一次；达到授权次数、非容量错误、超时、不完整证据或不明状态均停止，不覆盖原件、不猜测未启动。完整返修交付按原缺陷和版本契约验证，再交独立复检；完成后不再消耗该预算。上述流程不解除正式实验的业务 hold，也不新建实验或授权正式作答。
+
 `execution reconcile ATTEMPT_ID` 只核原进程/启动身份、监督进程回执、原trace、占位与成果，从不启动模型。启动前已占位、PID登记前中断或进程无法核验时保持uncertain；重新启动worker不会重派同一意图。已证明终止后按实际响应及成果分别收集，不以退出0计完成。采集与归档逐文件原子发布，保留中断意图；源文件漂移拒绝覆盖原件。
 
 正常作者、公开重建、质量及实验消费者也会检查原 ACTIVE 尝试的实际终止证据，并沿同一 `reconcile` 入口接收该尝试。没有终止证据仍等待原角色；不明启动不会变成新尝试。消费者在模型结束后、成果收集前中断时，恢复原消费者即可继续原件接收和后继独立检查。读取某工作项的尝试或归属使用窄状态查询；真正交接时的独立质量门仍照常验证，不因读取看板而重验所有无关候选。
+
+原模型已结束且成果封存后，`mark_collecting`／终态接收遇到 SQLite `BUSY`／`LOCKED` 时，消费者保留完成者互斥锁，只对同一 attempt 的元数据收件有限等待；不会再次领取、启动进程或调用模型。默认重试预算为90秒，每次数据库调用的忙等待不超过1秒及剩余预算，BEGIN 与 COMMIT 共用该次调用的预算；其他路径仍保留原15秒等待。原文件校验不跳过，也不被这个预算中断，因此这不是整个命令的90秒墙钟上界。已提交的终态先复读核对，部分 `collecting` 提交不会造成重复接收。
+
+持续锁耗尽后，运行目录追加 `receipt-write-pending-<id>.json`，绑定原 attempt／work／intent／role／SID 以及 manifest、manifest-lock、termination、collection、collection-lock 五件原件的确切路径和SHA。CLI以 `terminal_receipt_pending` 和该证据引用退出2；原 attempt 不被改成模型失败或自动重派。同一自动消费者及作者监督线程不会在下一tick重开等待预算；多flow消费者只停该工作，继续其他就绪flow，最终报告未收件状态。数据库可用后，明确执行 `python3 -m taskflow execution --db execution/state.sqlite3 reconcile ATTEMPT_ID` 重验原封存并接收同一 attempt，追加确定性的收口记录，不覆盖 pending 原件。收口记录落盘异常单独报告，不能把已经提交的原终态再写成 uncertain。这里的 pending 仅是技术诊断证据，调度当前状态仍以 SQLite 为准。
+
+未能证明未启动的异常类型仍保留 uncertain，CLI 报告 `original_result_uncertain`，不发布声称终态已接收的收口记录，也不重复记同一未决观察。标准库内建 `OSError` 子类仍须连同同一意图、启动阶段和无进程记录等原证据一起核验，才能证明未启动。
+
+出分后停止使用 `original_score_pause_v1` 控制生命周期，仍由既有 `lifecycle-register`／`lifecycle-run` 执行，不派模型。主控预登记它所跟随的确切 `source_flow_id`、`source_definition_digest` 和 `first_run_purpose`；授权文件须同 controller／task_id／policy_id／这三项，并明确 `action: pause_after_original_score`、`round_scope: this_round_original`、`first_run_only: true`。来源只能是该主控、题目、策略和用途一致的原实验；一个来源只能登记一个停止后继。没有授权的旧基线不会因分数高低被自动选入。
+
+消费者等待首卷真正完成独立事实封存、同一评阅SID评分和唯一原评价接收，验证原 run／冻结／签分及三段真实 attempt 的封存绑定后，原子写入 `task:<task_id>` 的 future-claims 暂停和该后继的 accepted 状态。原始实验即使处于旧确认等待，也只以首卷为依据，且不会改写原包、原分或终态；应在本轮首次派发前另行暂停确定性 solver-1，避免旧确认授权抢跑。暂停不终止已经在途的角色。停止后继完成后不会再次写控制，因此后来直接人类授权的 resume 不会被旧后继反复暂停。标准启动器对这个控制生命周期不传 `--allow-model`，其启动意图也保存 `allow_model: false`。
+
+未来的新实验 packet 可在顶层明确声明 `"original_score_pause": {"round_scope": "this_round_original", "first_run_only": true}`，可选 `authority_evidence` 为实际授权引用。`experiment-start` 只对这一严格类型的授权派生停点：先正常登记来源，再按来源实际 definition digest 和首卷用途生成不可变 `original-score-pause-authority.json`，引用原 packet，登记唯一停止后继。它不会读 `after_score` 文字、分数或目标阈值来推断授权，也不会把旧基线自动纳入本轮。
+
+生产者先在同一 SQLite 事务检查后继是否已接收或已准备确认控制，只首次暂停该来源确定性的 solver-1 并记录一次准备标记；首次准备时，如果该精确工作已被领取、已有尝试或不再处于待领取状态，则拒绝准备，不能把未来领取暂停说成已就绪。已有 pause 保留原字节，已完成或已准备的旧生产者重入不能覆盖后来的人类 resume。随后启动普通零模型停止消费者，即使实验入口只作 register-only，也会运行这个明确授权的控制消费者；正式实验消费者仍只在 `--allow-model` 下启动，并在控制消费者需要 attention 时保留登记等待。返回的 `original_pause.control_consumer` 与 `control_consumers_started` 分列控制进程，`consumers_started` 仍只计正式实验消费者。没有该显式字段的旧 packet、已登记 definition 和已锁请求完全沿原行为；若要为旧原卷增加停点，须另有精确控制授权并沿现有生命周期登记，不能回写旧 packet。
 
 新工作进程与接收入口共享每个 runtime 的成果收集互斥，覆盖实际运行直至成果封存和数据库接收。终止回执先于原工作进程收尾出现时，其他接收者只等待；原工作进程完成收尾或退出并释放互斥后才能接收同一尝试。升级前已在途的进程不会自动取得新锁或热加载新代码，须沿原消费者收尾，或在其确已退出的自然边界恢复。
 
@@ -195,6 +219,8 @@ isolated公开准备的inner须在仓库外，外层节点的current/spec/状态
 ## 业务packet与完整生命周期
 
 完整作者工厂使用本机通过 `--factory FILE` 明确提供的配置，锁定已验证原生作者模板、条件质量角色模板、策略、研究目录和生命周期目录。本机服务配置不随仓库提供。作者工厂用于已有结构完整 baseline 的研发：先按单题契约形成可解析且 task ID 一致的初稿，不能直接把 `init` 的空草稿当成已满足此前置条件。CLI一次接受一个确切业务item；packet给出controller、task/intent/candidate、实际baseline、最相关来源、作者工作、五份交付及`candidate_complete/research_ended/needs_business_decision`正常后继。
+
+新批作者在入队前的 native 零模型探针失败后，可在修复实际宿主条件并核对原始失败报告后，使用原 batch packet、factory 和数据库重入 `batch-author-start`，对每份原失败报告重复指定 `--retry-failed-native-probe-sha256 SHA256`。入口只接受精确的全部失败报告摘要，核原 manifest、同批绑定、工厂意图，拒绝已有 work、attempt 或成功 seal；不接 `--allow-model`。授权留在不可覆盖的私有回执，原失败报告和已锁请求保留。只有当前宿主的同一探针通过才入队；新失败须重新核证并显式包括新增报告。入队后仍用原批次入口正常接续；探针本身不证明正式模型或服务端身份。
 
 ```sh
 python3 -m taskflow execution author-start --packet PACKET.json --factory /path/to/author-factory.json --allow-model

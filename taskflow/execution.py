@@ -6,7 +6,11 @@ append-only evidence, and status documents are disposable projections.
 
 import argparse
 import json
+import math
+import sqlite3
 import sys
+import time
+import uuid
 from pathlib import Path
 
 from taskflow.contracts import PUBLIC_ROLES, TaskflowError, canonical, read_json, relative_path, sha256
@@ -59,6 +63,10 @@ def parser() -> argparse.ArgumentParser:
     resume.add_argument("--flow-id", action="append", required=True)
     resume.add_argument("--record", type=Path, required=True,
                         help="JSON object with reason and evidence references for this resolution")
+    repair_capacity = commands.add_parser("flow-repair-capacity-prepare", help="prepare a bounded, initially paused repair capacity continuation")
+    repair_capacity.add_argument("--parent-flow-id", required=True)
+    repair_capacity.add_argument("--flow-id", required=True)
+    repair_capacity.add_argument("--record", type=Path, required=True)
     lifecycle = commands.add_parser("lifecycle-register", help="register one explicitly authorized complete handoff")
     lifecycle.add_argument("--spec", type=Path, required=True)
     lifecycle_run = commands.add_parser("lifecycle-run", help="consume one exact registered complete handoff")
@@ -93,6 +101,9 @@ def parser() -> argparse.ArgumentParser:
         start.add_argument("--packet", type=Path, required=True)
         start.add_argument("--factory", type=Path, required=True)
         start.add_argument("--allow-model", action="store_true")
+        if name == "batch-author-start":
+            start.add_argument("--retry-failed-native-probe-sha256", action="append", metavar="SHA256",
+                               help="authorize one zero-model retry for the exact set of failed native reports")
     reconcile = commands.add_parser("reconcile", help="collect evidence; never relaunch a model")
     reconcile.add_argument("attempt_id")
     status = commands.add_parser("status", help="derive dashboard from database evidence")
@@ -340,7 +351,8 @@ def release_candidate(store: object, task: Path, candidate_id: str, version: str
             "evaluator": export_snapshot(snapshot, "evaluator")}
 
 
-def _record_result(store: object, attempt: dict, result: dict) -> dict:
+def _record_result(store: object, attempt: dict, result: dict, *,
+                   busy_timeout_seconds: float | None = None) -> dict:
     """Receive technical evidence without turning it into a business verdict."""
     from taskflow.execution_store import evidence_ref
 
@@ -349,6 +361,7 @@ def _record_result(store: object, attempt: dict, result: dict) -> dict:
     if not receipt.is_file():
         receipt = runtime / "collection.json"
     evidence = [evidence_ref(receipt, "technical result")] if receipt.is_file() else []
+    options = {} if busy_timeout_seconds is None else {"busy_timeout_seconds": busy_timeout_seconds}
     return store.finish_attempt(
         attempt["attempt_id"],
         process_exit=result.get("termination", {}).get("returncode"),
@@ -356,16 +369,215 @@ def _record_result(store: object, attempt: dict, result: dict) -> dict:
         artifacts_complete=bool(result.get("delivery_complete")),
         technical_accepted=bool(result.get("technical_accepted")),
         process_state=result.get("process_state", "unknown"),
-        evidence=evidence, cli_sid=result.get("cli_sid", result.get("sid")),
+        evidence=evidence, cli_sid=result.get("cli_sid", result.get("sid")), **options,
     )
+
+
+class ReceiptWritePending(RuntimeError):
+    """A sealed result still needs its database receipt; no model retry."""
+
+    def __init__(self, receipt: dict):
+        self.receipt = receipt
+        super().__init__("terminal receipt database wait exhausted; retained " + receipt["path"])
+
+class ReceiptEvidenceError(RuntimeError):
+    """Report diagnostic I/O without changing a terminal attempt to uncertain."""
+
+    def __init__(self, path: Path, error: Exception, *, terminal_received: bool):
+        self.path = str(path)
+        self.terminal_received = terminal_received
+        super().__init__("terminal receipt diagnostic could not be published: " + str(path) + ": " + str(error))
+
+class ReceiptResultUncertain(RuntimeError):
+    """The sealed observation does not establish a terminal attempt."""
+
+    def __init__(self, attempt_id: str):
+        self.attempt_id = attempt_id
+        super().__init__("original result remains uncertain: " + attempt_id)
+
+def _receipt_busy(error: sqlite3.OperationalError) -> bool:
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 255) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+    # Python3.10 does not expose sqlite_errorcode on exceptions.
+    return str(error).lower().split(":", 1)[0] in {
+        "database is locked", "database table is locked", "database schema is locked",
+    }
+
+def _receipt_reference(path: Path, location: str) -> dict:
+    from taskflow.execution_runner import _info
+
+    return {"path": str(path), **_info(path), "location": location}
+
+def _same_terminal_result(attempt: dict, original: dict, result: dict) -> None:
+    for key in ("attempt_id", "work_id", "intent_id", "runtime_path", "request_digest", "policy_id", "role"):
+        if attempt.get(key) != original.get(key):
+            raise TaskflowError("terminal receipt attempt identity changed: " + key)
+    expected = {"process_exit": result.get("termination", {}).get("returncode"),
+                "response_complete": bool(result.get("model_completed")),
+                "artifacts_complete": bool(result.get("delivery_complete")),
+                "technical_accepted": bool(result.get("technical_accepted"))}
+    sid = result.get("cli_sid", result.get("sid"))
+    if sid:
+        expected["cli_sid"] = sid
+    if any(attempt.get(key) != value for key, value in expected.items()):
+        raise TaskflowError("terminal attempt does not match its original sealed result")
+
+def _pending_receipt_refs(runtime: Path, attempt: dict, result: dict) -> list[dict]:
+    from taskflow.execution_runner import _regular
+    from taskflow.execution_store import validate_evidence
+
+    references = []
+    for path in sorted(runtime.glob("receipt-write-pending-*.json")):
+        note = json.loads(_regular(path))
+        if (not isinstance(note, dict) or note.get("schema_version") != 1
+                or note.get("kind") != "terminal_receipt_write_pending"
+                or any(note.get(key) != attempt.get(key) for key in
+                       ("attempt_id", "work_id", "intent_id", "runtime_path", "request_digest", "role"))
+                or note.get("cli_sid") != result.get("cli_sid", result.get("sid"))):
+            raise TaskflowError("pending terminal receipt belongs to another original attempt")
+        bindings = note.get("bindings")
+        names = {"manifest.json", "manifest-lock.json", "termination.json", "collection.json", "collection-lock.json"}
+        if not isinstance(bindings, dict) or set(bindings) != names:
+            raise TaskflowError("pending terminal receipt lacks original byte bindings")
+        if any(not isinstance(value, dict) or value.get("path") != str(runtime / name)
+               for name, value in bindings.items()):
+            raise TaskflowError("pending terminal receipt points outside its original runtime")
+        validate_evidence(list(bindings.values()))
+        references.append(_receipt_reference(path, "previous bounded terminal receipt wait"))
+    return references
+
+def _receive_ended_result(store: object, attempt: dict, result: dict, *,
+                          mark_collecting: bool = False, wait_seconds: float = 90,
+                          resume_pending: bool = True) -> dict:
+    """Receive one ended original under its caller's completion-owner mutex.
+
+    Only SQLite BUSY/LOCKED is retried. Each database call waits at most one
+    second and at most the remaining budget; original file validation is never
+    skipped or interrupted. No claim, process launch or model call occurs here.
+    """
+    from taskflow.execution_runner import _publish
+    from taskflow.execution_store import TERMINAL
+
+    if (isinstance(wait_seconds, bool) or not isinstance(wait_seconds, (int, float))
+            or not math.isfinite(wait_seconds) or wait_seconds < 0):
+        raise TaskflowError("terminal receipt wait must be finite and nonnegative")
+    if not result.get("process_ended") or result.get("intent_id", attempt["intent_id"]) != attempt["intent_id"]:
+        raise TaskflowError("terminal receipt requires this original proved termination")
+    runtime = Path(attempt["runtime_path"])
+    pending = _pending_receipt_refs(runtime, attempt, result)
+    started = time.monotonic()
+    deadline = started + wait_seconds
+    errors = []
+
+    def timeout() -> float:
+        return max(0, min(1, deadline - time.monotonic()))
+
+    def received(current: dict) -> dict:
+        if current["state"] not in TERMINAL:
+            raise ReceiptResultUncertain(attempt["attempt_id"])
+        if pending:
+            note = {"schema_version": 1, "kind": "pending_terminal_receipt_received",
+                    "attempt_id": attempt["attempt_id"], "intent_id": attempt["intent_id"],
+                    "pending_receipts": pending, "terminal_attempt": current,
+                    "automatic_retry": False, "new_model_calls": 0}
+            path = runtime / ("receipt-write-received-" + sha256(canonical(note)) + ".json")
+            try:
+                from taskflow.execution_runner import _regular
+
+                try:
+                    _publish(path, note)
+                except FileExistsError:
+                    if json.loads(_regular(path)) != note:
+                        raise TaskflowError("terminal receipt resolution bytes changed")
+            except (OSError, TaskflowError, ValueError) as error:
+                raise ReceiptEvidenceError(path, error, terminal_received=True) from error
+        return current
+
+    if pending and not resume_pending:
+        # A supervising author/lifecycle may observe a worker's just-exhausted
+        # budget. It must stop too, not start another budget in its polling loop.
+        try:
+            current = store.get_attempt(attempt["attempt_id"], busy_timeout_seconds=0)
+        except sqlite3.OperationalError as error:
+            if not _receipt_busy(error):
+                raise
+        else:
+            if current["state"] in TERMINAL:
+                _same_terminal_result(current, attempt, result)
+                return received(current)
+        raise ReceiptWritePending(pending[-1])
+
+    while True:
+        stage = "read_original_attempt"
+        try:
+            current = store.get_attempt(attempt["attempt_id"], busy_timeout_seconds=timeout())
+            for key in ("attempt_id", "work_id", "intent_id", "runtime_path", "request_digest", "policy_id", "role"):
+                if current.get(key) != attempt.get(key):
+                    raise TaskflowError("original attempt changed during terminal receipt wait: " + key)
+            if current["state"] in TERMINAL:
+                _same_terminal_result(current, attempt, result)
+                return received(current)
+            # A startup-recording interruption may leave starting/claimed. The
+            # canonical finisher accepts their proved original termination too.
+            if mark_collecting and current["state"] in ("running", "uncertain"):
+                stage = "mark_collecting"
+                store.mark_collecting(attempt["attempt_id"], busy_timeout_seconds=timeout())
+            stage = "finish_attempt"
+            return received(_record_result(store, attempt, result, busy_timeout_seconds=timeout()))
+        except sqlite3.OperationalError as error:
+            if not _receipt_busy(error):
+                raise
+            errors.append({"stage": stage, "message": str(error),
+                           "sqlite_errorcode": getattr(error, "sqlite_errorcode", None),
+                           "elapsed_seconds": time.monotonic() - started})
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # A commit followed by an error must not be received twice.
+                try:
+                    current = store.get_attempt(attempt["attempt_id"], busy_timeout_seconds=0)
+                except sqlite3.OperationalError as final_error:
+                    if not _receipt_busy(final_error):
+                        raise
+                else:
+                    if current["state"] in TERMINAL:
+                        _same_terminal_result(current, attempt, result)
+                        return received(current)
+                break
+            time.sleep(min(0.05, remaining))
+
+    path = runtime / ("receipt-write-pending-" + uuid.uuid4().hex + ".json")
+    try:
+        bindings = {name: _receipt_reference(runtime / name, "original terminal receipt bytes")
+                    for name in ("manifest.json", "manifest-lock.json", "termination.json", "collection.json", "collection-lock.json")}
+        _publish(path, {"schema_version": 1, "kind": "terminal_receipt_write_pending",
+                       **{key: attempt.get(key) for key in
+                          ("attempt_id", "work_id", "intent_id", "runtime_path", "request_digest", "role")},
+                       "cli_sid": result.get("cli_sid", result.get("sid")), "bindings": bindings,
+                       "lock_budget_seconds": wait_seconds, "elapsed_seconds": time.monotonic() - started,
+                       "busy_errors": errors, "automatic_retry": False, "new_model_calls": 0,
+                       "next_action": "Revalidate and reconcile this same original attempt; never redraw the model."})
+    except (OSError, TaskflowError, ValueError) as error:
+        raise ReceiptEvidenceError(path, error, terminal_received=False) from error
+    raise ReceiptWritePending(_receipt_reference(path, "original terminal result pending database receipt"))
 
 
 def run_worker(store: object, worker_id: str, allow_model: bool = False,
                work_ids: list[str] | None = None) -> dict:
+    from taskflow.execution_repair_capacity import RetryCapacityBusy, retry_claim_guard
+
+    try:
+        with retry_claim_guard(store, worker_id, work_ids) as (attempt, capacity):
+            return _run_worker_claimed(store, attempt, allow_model, capacity)
+    except RetryCapacityBusy:
+        return {"state": "waiting", "reason": "capacity source lifecycle is busy; no claim occurred"}
+
+
+def _run_worker_claimed(store: object, attempt: dict | None, allow_model: bool,
+                        capacity: dict | None) -> dict:
     from taskflow.execution_runner import run_attempt
     from taskflow.execution_completion import completion_owner
 
-    attempt = store.claim(worker_id, work_ids=work_ids)
     if attempt is None:
         return {"state": "waiting", "reason": "no eligible ready work"}
     # Claim is a durable attempt. Failure here preserves it; it is never silently
@@ -405,6 +617,15 @@ def run_worker(store: object, worker_id: str, allow_model: bool = False,
                 baseline = str(Path(manifest["isolated"]["runtime"]) / "baseline-plan.json")
                 if manifest["dependencies"].get(baseline, {}).get("sha256") != setting["formal_baseline_sha256"]:
                     raise TaskflowError("formal baseline differs from the claimed versioned policy")
+            if capacity is not None:
+                from taskflow.execution_repair_capacity import validate_repair_capacity_before_dispatch
+
+                if attempt.get("repair_capacity_binding") != capacity["binding"]:
+                    raise TaskflowError("claimed retry lost its immutable issuing-event binding")
+                current_flow = store.get_flow(capacity["flow_id"])
+                validate_repair_capacity_before_dispatch(store, current_flow, manifest)
+            elif attempt.get("repair_capacity_binding") is not None:
+                raise TaskflowError("retry cannot dispatch without its protected pre-claim locks")
             store.mark_starting(attempt["attempt_id"])
             def on_process(identity: dict) -> None:
                 if identity.get("start_identity"):
@@ -415,32 +636,30 @@ def run_worker(store: object, worker_id: str, allow_model: bool = False,
             result = run_attempt(runtime, on_process=on_process)
             if not result.get("process_ended"):
                 return store.mark_uncertain(attempt["attempt_id"], "runner has no proved termination")
-            current = store.get_attempt(attempt["attempt_id"])
-            if current["state"] == "starting":
-                store.mark_uncertain(attempt["attempt_id"], "terminated before process identity was collected")
-            store.mark_collecting(attempt["attempt_id"])
-            return _record_result(store, attempt, result)
+            return _receive_ended_result(store, attempt, result, mark_collecting=True, resume_pending=False)
         except (OSError, TaskflowError, ValueError) as exc:
             store.mark_uncertain(attempt["attempt_id"], str(exc))
             raise
 
 
-def reconcile(store: object, attempt_id: str) -> dict:
+def reconcile(store: object, attempt_id: str, *, resume_pending: bool = True) -> dict:
     from taskflow.execution_runner import reconcile_attempt
     from taskflow.execution_completion import completion_owner
 
     attempt = store.get_attempt(attempt_id)
-    if attempt["state"] in ("completed", "failed", "cancelled"):
+    runtime_path = attempt.get("runtime_path")
+    pending = bool(runtime_path) and any(Path(runtime_path).glob("receipt-write-pending-*.json"))
+    if attempt["state"] in ("completed", "failed", "cancelled") and not pending:
         return attempt
     with completion_owner(Path(attempt["runtime_path"])) as owned:
         if not owned:
             return store.get_attempt(attempt_id)
         attempt = store.get_attempt(attempt_id)
-        if attempt["state"] in ("completed", "failed", "cancelled"):
+        if attempt["state"] in ("completed", "failed", "cancelled") and not pending:
             return attempt
         result = reconcile_attempt(Path(attempt["runtime_path"]))
         if result.get("process_ended"):
-            return _record_result(store, attempt, result)
+            return _receive_ended_result(store, attempt, result, resume_pending=resume_pending)
         return store.mark_uncertain(attempt_id, result.get("reason", "process or result unproved"))
 
 
@@ -612,6 +831,10 @@ def main(argv: list[str] | None = None) -> int:
                 document = read_json(args.record)
                 output = {"flows": [resume_workflow(store, identity, **document)
                                     for identity in args.flow_id]}
+            elif args.operation == "flow-repair-capacity-prepare":
+                from taskflow.execution_repair_capacity import prepare_repair_capacity_budget
+
+                output = prepare_repair_capacity_budget(store, args.parent_flow_id, args.flow_id, read_json(args.record))
             elif args.operation == "lifecycle-register":
                 from taskflow.execution_lifecycle import register_lifecycle
 
@@ -645,7 +868,8 @@ def main(argv: list[str] | None = None) -> int:
                     packet_ref=evidence_ref(args.packet.resolve(), "once-only substantive author direction and normal successors"),
                     template_spec_ref=factory["template_spec_ref"],
                     directory=Path(factory["research_root"]) / packet["items"][0]["intent_id"],
-                    allow_model=args.allow_model, factory_config=factory)
+                    allow_model=args.allow_model, factory_config=factory,
+                    retry_failed_probes=getattr(args, "retry_failed_native_probe_sha256", None))
             elif args.operation == "teacher-successor-start":
                 from taskflow.execution_teacher_successor import start_teacher_successors_from_packet
                 from taskflow.execution_store import evidence_ref
@@ -676,6 +900,19 @@ def main(argv: list[str] | None = None) -> int:
                     )
         print(output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, indent=2, allow_nan=False))
         return 2 if args.operation == "batch-check" and not output["ready"] else 0
+    except ReceiptWritePending as exc:
+        print(json.dumps({"error": str(exc), "state": "terminal_receipt_pending",
+                          "receipt": exc.receipt, "automatic_retry": False}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    except ReceiptEvidenceError as exc:
+        print(json.dumps({"error": str(exc), "state": "terminal_receipt_evidence_error",
+                          "path": exc.path, "terminal_received": exc.terminal_received,
+                          "automatic_retry": False}, ensure_ascii=False), file=sys.stderr)
+        return 2
+    except ReceiptResultUncertain as exc:
+        print(json.dumps({"error": str(exc), "state": "original_result_uncertain",
+                          "attempt_id": exc.attempt_id, "automatic_retry": False}, ensure_ascii=False), file=sys.stderr)
+        return 2
     except (OSError, TaskflowError, KeyError, TypeError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False), file=sys.stderr)
         return 2

@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from taskflow import execution_author
-from taskflow.contracts import TaskflowError, read_json, write_json
+from taskflow.contracts import TaskflowError, canonical, read_json, sha256, write_json
 from taskflow.execution_author import _roles, start_author_from_packet
 from taskflow.execution_batch import (
     CHAT_ROLES, CLI_ROLES, ROLE_KEYS, confirmation_digests, freeze_batch_plan,
@@ -103,6 +103,152 @@ class BatchAuthorTests(unittest.TestCase):
             start_author_from_packet(case.store, **{**case.kwargs(), "factory_config": None})
         self.assertFalse(case.directory.exists())
         self.assertEqual(before, case.store.dashboard())
+
+    def failed_author_probe(self):
+        """Prepare a neutral locked runtime; probe and native environment are doubles."""
+        case = self.author()
+        runtime = case.directory / "runtime"
+        calls = []
+
+        def prepare(root, runner):
+            root.mkdir(parents=True)
+            manifest = {"mode": "native_role", "preparation_config_digest": sha256(canonical(runner)),
+                        "request": {"sha256": "a" * 64}}
+            write_json(root / "manifest.json", manifest)
+            (root / "original-manifest.sha256").write_text(sha256((root / "manifest.json").read_bytes()))
+            return manifest
+
+        def validate(root, **kwargs):
+            if sha256((root / "manifest.json").read_bytes()) != (root / "original-manifest.sha256").read_text():
+                raise TaskflowError("fixture locked manifest changed")
+            if kwargs.get("before_run") and not (root / "native-probe-ready.json").exists():
+                raise TaskflowError("fixture native seal missing")
+            return read_json(root / "manifest.json")
+
+        def probe(root):
+            calls.append(root)
+            passed = len(calls) > 1
+            report = {"passed": passed, "model_calls": 0,
+                      "manifest": execution_author._info(root / "manifest.json")}
+            write_json(root / ("native-probe-success.json" if passed else "native-probe-first.json"), report)
+            if passed:
+                write_json(root / "native-probe-ready.json", {"passed": True})
+            return report
+
+        for target, value in (("taskflow.execution_runner.prepare_attempt", prepare),
+                              ("taskflow.execution_runner._validate", validate),
+                              ("taskflow.execution_runner.probe_native_attempt", probe)):
+            active = patch(target, side_effect=value); active.start(); self.addCleanup(active.stop)
+        for target in ("taskflow.execution._check_work_binding", "taskflow.execution_batch_binding.validate_batch_runner"):
+            active = patch(target); active.start(); self.addCleanup(active.stop)
+        active = patch("taskflow.execution_author.run_worker", side_effect=AssertionError("no model dispatch"))
+        active.start(); self.addCleanup(active.stop)
+        with self.assertRaisesRegex(TaskflowError, "current native probe failed"):
+            start_author_from_packet(case.store, **case.kwargs())
+        self.assertEqual([], case.store.dashboard()["attempts"])
+        failure = runtime / "native-probe-first.json"
+        return case, runtime, calls, failure
+
+    def test_author_probe_retry_requires_exact_failure_and_preserves_originals(self):
+        case, runtime, calls, failure = self.failed_author_probe()
+        original = {path: path.read_bytes() for path in (failure, runtime / "manifest.json", case.directory / "spec.json")}
+        digest = sha256(failure.read_bytes())
+        with self.assertRaisesRegex(TaskflowError, "previous native probe"):
+            start_author_from_packet(case.store, **case.kwargs())
+        for grant in (["0" * 64], [], [digest, digest]):
+            with self.subTest(grant=grant), self.assertRaises(TaskflowError):
+                start_author_from_packet(case.store, **case.kwargs(), retry_failed_probes=grant)
+        with self.assertRaisesRegex(TaskflowError, "must not dispatch"):
+            start_author_from_packet(case.store, **case.kwargs(True), retry_failed_probes=[digest])
+        self.assertEqual(1, len(calls))
+        result = start_author_from_packet(case.store, **case.kwargs(), retry_failed_probes=[digest])
+        self.assertEqual("ready", result["state"])
+        self.assertEqual(2, len(calls))
+        self.assertEqual([], case.store.dashboard()["attempts"])
+        self.assertEqual(original, {path: path.read_bytes() for path in original})
+        records = list((case.directory / "probe-retry-authorizations").glob("*.json"))
+        self.assertEqual(1, len(records))
+        self.assertEqual(digest, read_json(records[0])["reports"][0]["sha256"])
+        with self.assertRaisesRegex(TaskflowError, "unqueued"):
+            start_author_from_packet(case.store, **case.kwargs(), retry_failed_probes=[digest])
+
+    def test_author_probe_retry_rejects_new_or_missing_reports_and_manifest_drift(self):
+        for change in ("missing", "added", "manifest", "factory", "batch", "attempt", "ready", "not-failed"):
+            with self.subTest(change=change):
+                case, runtime, calls, failure = self.failed_author_probe()
+                digest = sha256(failure.read_bytes())
+                kwargs = case.kwargs()
+                if change == "missing":
+                    failure.unlink()
+                elif change == "added":
+                    write_json(runtime / "native-probe-added.json", read_json(failure))
+                elif change == "manifest":
+                    (runtime / "manifest.json").write_text("{}")
+                elif change == "factory":
+                    kwargs["factory_config"] = {**case.config, "research_root": str(case.root / "other")}
+                elif change == "batch":
+                    case.packet_data["batch_id"] = "different-batch"
+                    write_json(case.packet, case.packet_data)
+                    kwargs["packet_ref"] = evidence_ref(case.packet, "changed neutral packet")
+                elif change == "attempt":
+                    active = patch.object(case.store, "list_attempts", return_value=[{"state": "uncertain"}])
+                    active.start(); self.addCleanup(active.stop)
+                elif change == "ready":
+                    write_json(runtime / "native-probe-ready.json", {"passed": True})
+                else:
+                    report = read_json(failure); report["passed"] = True
+                    write_json(failure, report)
+                    digest = sha256(failure.read_bytes())
+                with self.assertRaises(TaskflowError):
+                    start_author_from_packet(case.store, **kwargs, retry_failed_probes=[digest])
+                self.assertEqual(1, len(calls))
+                self.assertEqual([], case.store.dashboard()["attempts"])
+                self.assertEqual([], case.store.dashboard()["work"])
+
+    def test_new_failed_probe_requires_new_explicit_complete_sha_set(self):
+        case, runtime, calls, failure = self.failed_author_probe()
+        digest = sha256(failure.read_bytes())
+        def fail_again(root):
+            calls.append(root)
+            report = {"passed": False, "model_calls": 0,
+                      "manifest": execution_author._info(root / "manifest.json")}
+            write_json(root / "native-probe-second.json", report)
+            return report
+        with patch("taskflow.execution_runner.probe_native_attempt", side_effect=fail_again):
+            with self.assertRaisesRegex(TaskflowError, "current native probe failed"):
+                start_author_from_packet(case.store, **case.kwargs(), retry_failed_probes=[digest])
+            with self.assertRaisesRegex(TaskflowError, "match all"):
+                start_author_from_packet(case.store, **case.kwargs(), retry_failed_probes=[digest])
+        self.assertEqual(2, len(calls))
+        self.assertEqual([], case.store.dashboard()["attempts"])
+        self.assertEqual([], case.store.dashboard()["work"])
+
+    def test_author_preparation_lock_excludes_same_intent_only(self):
+        case, runtime, calls, failure = self.failed_author_probe()
+        digest = sha256(failure.read_bytes())
+        other = case.root / "different-intent"
+        other.mkdir()
+        with execution_author._author_prepare_lock(case.directory):
+            with execution_author._author_prepare_lock(other):
+                pass
+            for grant in (None, [digest]):
+                with self.subTest(grant=grant), self.assertRaisesRegex(TaskflowError, "already active"):
+                    start_author_from_packet(case.store, **case.kwargs(), retry_failed_probes=grant)
+        self.assertEqual(1, len(calls))
+        self.assertEqual([], case.store.dashboard()["work"])
+        self.assertEqual([], case.store.dashboard()["attempts"])
+        self.assertFalse((case.directory / "probe-retry-authorizations").exists())
+
+    def test_interrupted_probe_cannot_reuse_consumed_authorization(self):
+        case, runtime, calls, failure = self.failed_author_probe()
+        digest = sha256(failure.read_bytes())
+        with patch("taskflow.execution_runner.probe_native_attempt", side_effect=PermissionError("fixture interruption")):
+            with self.assertRaises(PermissionError):
+                start_author_from_packet(case.store, **case.kwargs(), retry_failed_probes=[digest])
+            with self.assertRaisesRegex(TaskflowError, "already consumed"):
+                start_author_from_packet(case.store, **case.kwargs(), retry_failed_probes=[digest])
+        self.assertEqual([], case.store.dashboard()["work"])
+        self.assertEqual([], case.store.dashboard()["attempts"])
 
     def test_batch_factory_policy_packet_and_task_scope_fail_before_any_intent(self):
         for variant in ("snapshot", "policy_record", "missing_batch", "wrong_batch", "task"):

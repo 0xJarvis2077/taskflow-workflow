@@ -73,8 +73,9 @@ def _exclusive_intent(path: Path, value: dict) -> None:
 
 
 def _consumer_argv(store: object, record: dict) -> list[str]:
-    return [str(Path(sys.executable).resolve()), "-m", "taskflow", "execution", "--db", str(store.path),
-            "lifecycle-run", "--flow-id", record["flow_id"], "--allow-model"]
+    argv = [str(Path(sys.executable).resolve()), "-m", "taskflow", "execution", "--db", str(store.path),
+            "lifecycle-run", "--flow-id", record["flow_id"]]
+    return argv if record["definition"].get("kind") == "original_score_pause_v1" else [*argv, "--allow-model"]
 
 
 def _consumer_definition(record: dict) -> dict:
@@ -104,7 +105,7 @@ def _consumer_launch_chain(directory: Path, current: dict, store: object, reposi
         if (not isinstance(intent, dict) or intent.get("flow_id") != current["flow_id"]
                 or intent.get("definition_digest") != current["definition_digest"]
                 or intent.get("database") != str(store.path) or intent.get("cwd") != str(repository)
-                or intent.get("allow_model") is not True or intent.get("argv") != argv
+                or intent.get("allow_model") is not ("--allow-model" in argv) or intent.get("argv") != argv
                 or intent.get("stdout") != str(intent_path.parent / "consumer.stdout.log")
                 or intent.get("stderr") != str(intent_path.parent / "consumer.stderr.log")):
             raise TaskflowError("original consumer launch intent binding differs")
@@ -260,7 +261,7 @@ def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
         stdout_path, stderr_path = launch_directory / "consumer.stdout.log", launch_directory / "consumer.stderr.log"
         argv = _consumer_argv(store, current)
         intent = {"schema_version": 1, "flow_id": current["flow_id"], "definition_digest": current["definition_digest"],
-                  "database": str(store.path), "argv": argv, "cwd": str(repository), "allow_model": True,
+                  "database": str(store.path), "argv": argv, "cwd": str(repository), "allow_model": "--allow-model" in argv,
                   "created_at": datetime.now(timezone.utc).isoformat(), "launcher_pid": os.getpid(),
                   "stdout": str(stdout_path), "stderr": str(stderr_path), "evidence": refs,
                   "source_refs": _source_refs(repository)}
@@ -310,6 +311,9 @@ def start_experiments_from_packet(store: object, *, packet_ref: dict, factory_co
         raise TaskflowError("allow_model must be an explicit boolean")
     packet_ref, config_ref = validate_evidence([packet_ref, factory_config_ref])
     packet, config = _read(Path(packet_ref["path"])), _read(Path(config_ref["path"]))
+    from taskflow.execution_original_pause import original_pause_grant, prepare_original_pause
+
+    pause_grant = original_pause_grant(packet)
     if type(config.get("schema_version")) is not int or config["schema_version"] != 1:
         raise TaskflowError("unsupported experiment factory configuration")
     policy = validate_id(config.get("policy_id"), "policy_id")
@@ -376,16 +380,26 @@ def start_experiments_from_packet(store: object, *, packet_ref: dict, factory_co
     for definition in definitions:
         try:
             record = register_lifecycle(store, definition, [packet_ref, config_ref])
+            pause = prepare_original_pause(store, record, paths["repository"]) if pause_grant is not None else None
+            if pause is not None and pause["control_consumer"]["status"] == "attention":
+                results.append({"task_id": definition["task_id"], "flow_id": record["flow_id"],
+                    "status": "attention", "consumer_spawned": False,
+                    "reason": "explicit original-pause consumer needs attention before a model consumer starts",
+                    "original_pause": pause})
+                continue
             if allow_model:
                 result = launch_lifecycle_consumer(store, record, paths["repository"], evidence=[config_ref])
             else:
                 result = {"flow_id": record["flow_id"], "revision": record["revision"],
                           "status": "registered", "consumer_spawned": False}
-            results.append({"task_id": definition["task_id"], **result})
+            results.append({"task_id": definition["task_id"], **result,
+                            **({"original_pause": pause} if pause is not None else {})})
         except (TaskflowError, OSError, ValueError, KeyError, TypeError) as exc:
             results.append({"task_id": definition["task_id"], "flow_id": definition["flow_id"],
                             "status": "attention", "consumer_spawned": False, "reason": str(exc)})
     return {"schema_version": 1, "packet_ref": packet_ref, "factory_config_ref": config_ref,
             "allow_model": allow_model, "items": results,
             "consumers_started": sum(row["consumer_spawned"] for row in results),
-            "attention": any(row["status"] == "attention" for row in results)}
+            "attention": any(row["status"] == "attention" for row in results),
+            **({"control_consumers_started": sum(row.get("original_pause", {}).get("control_consumer", {}).get("consumer_spawned", False)
+                                                for row in results)} if pause_grant is not None else {})}

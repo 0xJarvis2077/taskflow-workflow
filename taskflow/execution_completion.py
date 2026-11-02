@@ -51,4 +51,4 @@ def reconcile_ended_attempt(store: object, attempt: dict | None) -> dict | None:
         raise TaskflowError("original termination evidence must be an ordinary file")
     from taskflow.execution import reconcile
 
-    return reconcile(store, attempt["attempt_id"])
+    return reconcile(store, attempt["attempt_id"], resume_pending=False)

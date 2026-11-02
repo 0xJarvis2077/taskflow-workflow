@@ -10,7 +10,7 @@ from unittest.mock import patch
 from taskflow.contracts import TaskflowError, canonical, sha256
 from taskflow.execution_batch import (
     CHAT_ROLES, CLI_ROLES, ROLE_KEYS, check_batch_plan, confirmation_digests,
-    freeze_batch_plan, load_batch_snapshot, policy_setting, role_config,
+    _check, freeze_batch_plan, load_batch_snapshot, policy_setting, role_config,
     validate_batch_policy,
 )
 
@@ -33,7 +33,8 @@ def make_confirmed_plan(root, *, mode="test_fixture", disabled=()):
     models = {key: "other-provider/" + key for key in ROLE_KEYS}
     catalog = root / "original-catalog.json"
     write_json(catalog, {"models": [{"id": models[key], "efforts": ["minimal", "deep"],
-                                    "contexts": ["all_turns"], "default_effort": "minimal"}
+                                    "contexts": ["all_turns"], "default_effort": "minimal",
+                                    "default_reasoning_level": "minimal", "description": "minimal"}
                                    for key in ROLE_KEYS if key in CLI_ROLES]})
     plan = {"schema_version": 1, "architecture_version": "high-value-task-v1",
             "batch_id": "neutral-batch", "task_ids": ["neutral-task"],
@@ -219,17 +220,139 @@ class BatchPlanTests(unittest.TestCase):
         plan["execution_mode"] = "real_cli"
         self.assertFalse(self.check(plan, path)["ready"])
 
-    def test_verified_client_default_requires_actual_default_locator(self):
+    def test_verified_client_default_catalog_is_only_a_declared_expectation(self):
         plan, path = self.plan()
         runtime = plan["roles"]["author"]["runtime"]
         runtime.update(reasoning_selection="verified_client_default", reasoning_effort="minimal")
         plan["user_model_confirmation"].update(confirmation_digests(plan))
         self.assertFalse(self.check(plan, path)["ready"])
         support_path = self.root / "author-support.json"; support = json.loads(support_path.read_bytes())
-        support.update(observation_kind="same_argv_no_inference", default_effort_pointer="/models/0/default_effort")
+        support.pop("contexts_pointer")
+        support["default_effort_pointer"] = "/models/0/default_reasoning_level"
         write_json(support_path, support); runtime["support_evidence"] = file_ref(support_path)
         plan["user_model_confirmation"].update(confirmation_digests(plan))
         self.assertTrue(self.check(plan, path)["ready"])
+        # Old evidence remains readable, without treating its label as actual parsing proof.
+        support["observation_kind"] = "same_argv_no_inference"
+        support["default_effort_pointer"] = "/models/0/default_effort"
+        write_json(support_path, support); runtime["support_evidence"] = file_ref(support_path)
+        plan["user_model_confirmation"].update(confirmation_digests(plan))
+        self.assertTrue(self.check(plan, path)["ready"])
+        for pointer in ("/models/1/default_effort", "/models/0/efforts", "/models/0/missing",
+                        "/models/0/description"):
+            with self.subTest(pointer=pointer):
+                support["default_effort_pointer"] = pointer
+                write_json(support_path, support); runtime["support_evidence"] = file_ref(support_path)
+                plan["user_model_confirmation"].update(confirmation_digests(plan))
+                self.assertFalse(self.check(plan, path)["ready"])
+
+    def test_explicit_nonempty_context_still_requires_catalog_support(self):
+        plan, path = self.plan()
+        support_path = self.root / "author-support.json"
+        support = json.loads(support_path.read_bytes())
+        support.pop("contexts_pointer")
+        write_json(support_path, support)
+        plan["roles"]["author"]["runtime"]["support_evidence"] = file_ref(support_path)
+        plan["user_model_confirmation"].update(confirmation_digests(plan))
+        self.assertFalse(self.check(plan, path)["ready"])
+
+    def test_legacy_snapshot_uses_original_evidence_rules_but_live_plan_cannot_opt_in(self):
+        plan, path = self.plan()
+        runtime = plan["roles"]["author"]["runtime"]
+        runtime.update(reasoning_selection="verified_client_default", reasoning_effort="minimal")
+        support_path = self.root / "author-support.json"
+        support = json.loads(support_path.read_bytes())
+        support.update(observation_kind="same_argv_no_inference", default_effort_pointer="/models/0/description")
+        write_json(support_path, support)
+        runtime["support_evidence"] = file_ref(support_path)
+        plan["user_model_confirmation"].update(confirmation_digests(plan))
+        # Neither labels nor fabricated snapshot fields select compatibility for a live plan.
+        plan["legacy"] = True
+        plan["evidence_copies"] = [{"relative_path": "evidence/pretend-old"}]
+        self.assertFalse(self.check(plan, path)["ready"])
+
+        sources = [p for p in self.root.iterdir() if p.is_file()]
+        captured = {(str(p), sha256(p.read_bytes())): p.read_bytes() for p in sources}
+        normalized = _check(plan, captured)
+        destination = self.root / "legacy-snapshot"
+        (destination / "evidence").mkdir(parents=True)
+        copies = []
+        for index, ref in enumerate(normalized["evidence"]):
+            relative = "evidence/" + str(index).zfill(4) + "-" + ref["sha256"]
+            (destination / relative).write_bytes(captured[(ref["path"], ref["sha256"])])
+            copies.append({"original": ref, "relative_path": relative})
+        snapshot_path = destination / "batch-snapshot.json"
+        write_json(snapshot_path, {**normalized, "evidence_copies": copies})
+        reference = file_ref(snapshot_path)
+        self.assertEqual("neutral-batch", load_batch_snapshot(reference)["batch_id"])
+
+        # Historical support required the old marker, string levels, and same-entry context.
+        for changed_support in ({**support, "observation_kind": "not-original"},
+                                {**support, "contexts_pointer": "/models/1/contexts"},
+                                {key: value for key, value in support.items() if key != "contexts_pointer"}):
+            with self.subTest(support=changed_support):
+                write_json(support_path, changed_support)
+                changed_plan = copy.deepcopy(plan)
+                changed_plan["roles"]["author"]["runtime"]["support_evidence"] = file_ref(support_path)
+                changed_plan["user_model_confirmation"].update(confirmation_digests(changed_plan))
+                changed_sources = [p for p in self.root.iterdir() if p.is_file()]
+                altered = {(str(p), sha256(p.read_bytes())): p.read_bytes() for p in changed_sources}
+                with self.assertRaisesRegex(TaskflowError, "frozen legacy"):
+                    _check(changed_plan, altered)
+        object_catalog = json.loads((self.root / "original-catalog.json").read_bytes())
+        object_catalog["models"][0]["efforts"] = [{"effort": "minimal"}]
+        object_path = self.root / "legacy-objects.json"
+        write_json(object_path, object_catalog)
+        write_json(support_path, {**support, "output": file_ref(object_path)})
+        changed_plan = copy.deepcopy(plan)
+        changed_plan["roles"]["author"]["runtime"]["support_evidence"] = file_ref(support_path)
+        changed_plan["user_model_confirmation"].update(confirmation_digests(changed_plan))
+        changed_sources = [p for p in self.root.iterdir() if p.is_file()]
+        altered = {(str(p), sha256(p.read_bytes())): p.read_bytes() for p in changed_sources}
+        with self.assertRaisesRegex(TaskflowError, "frozen legacy"):
+            _check(changed_plan, altered)
+        evidence_path = destination / copies[0]["relative_path"]
+        evidence_path.write_bytes(evidence_path.read_bytes() + b"tampered")
+        with self.assertRaisesRegex(TaskflowError, "frozen evidence copy changed"):
+            load_batch_snapshot(reference)
+
+    def test_cli_support_accepts_catalog_reasoning_objects_without_weakening_binding(self):
+        plan, path = self.plan()
+        catalog_path = self.root / "original-catalog.json"
+        catalog = json.loads(catalog_path.read_bytes())
+        model = catalog["models"][0]
+        model["slug"] = model.pop("id")
+        model["supported_reasoning_levels"] = [
+            {"effort": "minimal", "description": "Fast"},
+            {"effort": "deep", "description": "Thorough"},
+        ]
+        write_json(catalog_path, catalog)
+        for key in CLI_ROLES:
+            support_path = self.root / (key + "-support.json")
+            support = json.loads(support_path.read_bytes())
+            support["output"] = file_ref(catalog_path)
+            if key == "author":
+                support["model_pointer"] = "/models/0/slug"
+                support["efforts_pointer"] = "/models/0/supported_reasoning_levels"
+            write_json(support_path, support)
+            plan["roles"][key]["runtime"]["support_evidence"] = file_ref(support_path)
+        plan["user_model_confirmation"].update(confirmation_digests(plan))
+        self.assertTrue(self.check(plan, path)["ready"])
+
+        for levels in ([{"effort": "minimal"}], [{"description": "deep"}], [{"effort": ["deep"]}]):
+            with self.subTest(levels=levels):
+                catalog["models"][0]["supported_reasoning_levels"] = levels
+                write_json(catalog_path, catalog)
+                for key in CLI_ROLES:
+                    support_path = self.root / (key + "-support.json")
+                    support = json.loads(support_path.read_bytes())
+                    support["output"] = file_ref(catalog_path)
+                    write_json(support_path, support)
+                    plan["roles"][key]["runtime"]["support_evidence"] = file_ref(support_path)
+                plan["user_model_confirmation"].update(confirmation_digests(plan))
+                result = self.check(plan, path)
+                self.assertFalse(result["ready"])
+                self.assertIn("reasoning effort unsupported", result["errors"][0])
 
     def test_capability_locators_cannot_borrow_a_different_model_entry(self):
         plan, path = self.plan()

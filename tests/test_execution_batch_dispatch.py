@@ -166,6 +166,11 @@ class BatchDispatchTests(unittest.TestCase):
         self.assertEqual(2, code)
         self.assertIn("batch_id", error)
         self.assertFalse((self.root / "never.sqlite3").exists())
+        code, _, error = self.call("batch-author-start", "--factory", str(factory), "--packet", str(packet),
+                                   "--retry-failed-native-probe-sha256", "a" * 64)
+        self.assertEqual(2, code)
+        self.assertIn("batch_id", error)
+        self.assertFalse((self.root / "never.sqlite3").exists())
         write_json(packet, {"batch_id": "neutral-batch", "items": [{"task_id": "foreign-task"}]})
         with self.assertRaisesRegex(TaskflowError, "scope"):
             checked_batch_factory(factory, packet)
@@ -191,6 +196,23 @@ class BatchDispatchTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskflowError, "different original"):
             store.register_policy("neutral-batch-v1", changed)
         self.assertEqual(original, store.get_policy("neutral-batch-v1"))
+
+    def test_probe_retry_flag_is_exclusive_to_batch_author_and_is_forwarded(self):
+        self.factory_infrastructure()
+        result = compile_batch_configuration(self.plan_path, self.infra, self.root / "configuration")
+        factory, packet = Path(result["author_factory"]["path"]), self.root / "packet.json"
+        write_json(packet, {"batch_id": "neutral-batch", "items": [{"task_id": "neutral-task", "intent_id": "first"}]})
+        with patch("taskflow.execution_author.start_author_from_packet", return_value={"state": "ready"}) as prepare:
+            code, _, error = self.call("batch-author-start", "--factory", str(factory), "--packet", str(packet),
+                                       "--retry-failed-native-probe-sha256", "a" * 64,
+                                       "--retry-failed-native-probe-sha256", "b" * 64)
+            self.assertEqual(0, code, error)
+            self.assertEqual(["a" * 64, "b" * 64], prepare.call_args.kwargs["retry_failed_probes"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            for operation in ("author-start", "batch-experiment-start"):
+                with self.subTest(operation=operation), self.assertRaises(SystemExit):
+                    execution.parser().parse_args([operation, "--factory", str(factory), "--packet", str(packet),
+                                                   "--retry-failed-native-probe-sha256", "a" * 64])
 
     def test_invalid_infrastructure_fails_before_freezing(self):
         base = read_json(self.infra)

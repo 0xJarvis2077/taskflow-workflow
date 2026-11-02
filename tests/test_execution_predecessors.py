@@ -1,6 +1,7 @@
 """Real local workers retain completion ownership while successors wait."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event
 import unittest
@@ -23,16 +24,20 @@ class PredecessorConcurrencyTests(unittest.TestCase):
 
     def paused_original_worker(self, attempt, reached, release):
         """Continue the already claimed fixture using the actual worker/runner."""
-        original_claim = self.store.claim
+        from taskflow.execution_repair_capacity import retry_claim_guard
+
         original_record = execution._record_result
 
-        def claim(worker_id, work_ids=None):
+        @contextmanager
+        def claim_guard(store, worker_id, work_ids=None):
             if worker_id == "external-fixture":
                 self.assertEqual([attempt["work_id"]], work_ids)
-                return attempt
-            return original_claim(worker_id, work_ids=work_ids)
+                yield attempt, None
+            else:
+                with retry_claim_guard(store, worker_id, work_ids) as selection:
+                    yield selection
 
-        def record(store, current, result):
+        def record(store, current, result, **kwargs):
             if current["attempt_id"] == attempt["attempt_id"]:
                 runtime = Path(current["runtime_path"])
                 self.assertTrue((runtime / "termination.json").is_file())
@@ -41,11 +46,11 @@ class PredecessorConcurrencyTests(unittest.TestCase):
                 reached.set()
                 if not release.wait(10):
                     raise AssertionError("test did not release original worker")
-            return original_record(store, current, result)
+            return original_record(store, current, result, **kwargs)
 
         # The fixture helper already performed the durable claim. Only hand that
         # existing claim back to its owner; process launch and collection are real.
-        return patch.object(self.store, "claim", side_effect=claim), patch(
+        return patch("taskflow.execution_repair_capacity.retry_claim_guard", side_effect=claim_guard), patch(
             "taskflow.execution._record_result", side_effect=record
         )
 

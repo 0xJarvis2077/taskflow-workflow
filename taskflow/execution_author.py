@@ -6,17 +6,21 @@ recovers an original worker that still owns its completion window.
 
 import copy
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import fcntl
 import json
 from pathlib import Path
 import time
 
 from taskflow.contracts import PUBLIC_ROLES, TaskflowError, canonical, parse_json, relative_path, sha256, validate_id
-from taskflow.execution import capture_candidate, enqueue_spec, run_worker
+from taskflow.execution import (
+    ReceiptEvidenceError, ReceiptResultUncertain, ReceiptWritePending, capture_candidate, enqueue_spec, run_worker,
+)
 from taskflow.execution_flow import (
     _binding, _get_or_none, _identity, _public_prepare, _publish_once, _render,
     advance_workflow, register_workflow,
 )
-from taskflow.execution_runner import _info, _read, _regular, _validated_collection, archive_full_attempt
+from taskflow.execution_runner import _info, _publish, _read, _regular, _validated_collection, archive_full_attempt
 from taskflow.execution_store import ACTIVE, evidence_ref, validate_evidence
 from taskflow.packages import check_task
 
@@ -80,7 +84,8 @@ def _factory_owner(store: object, task_id: str, owner: str, refs: list[dict]) ->
 
 def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_ref: dict,
                              directory: Path, allow_model: bool,
-                             factory_config: dict | None = None) -> dict:
+                             factory_config: dict | None = None,
+                             retry_failed_probes: list[str] | None = None) -> dict:
     """Prepare one authorized author and consume its registered normal outcomes.
 
     A ready-only call never claims work. A later identical call can consume that
@@ -91,6 +96,8 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
 
     if type(allow_model) is not bool:
         raise TaskflowError("author factory allow_model must be an explicit boolean")
+    if retry_failed_probes is not None and allow_model:
+        raise TaskflowError("native probe recovery must not dispatch a model")
     directory = Path(directory).absolute()
     if factory_config is None:
         intent_path = directory / "factory-intent.json"
@@ -121,6 +128,8 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
         validate_id(value, "author factory identity")
     policy = store.get_policy(factory_config["policy_id"])["config"]
     snapshot = validate_batch_policy(policy)
+    if retry_failed_probes is not None and snapshot is None:
+        raise TaskflowError("author probe recovery requires a confirmed batch policy")
     if snapshot is not None:
         if canonical(factory_config.get("batch_snapshot")) != canonical(policy["batch_snapshot"]):
             raise TaskflowError("author factory differs from the registered confirmed batch snapshot")
@@ -244,13 +253,17 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
         # The factory identity above already locks the packet, template and
         # configuration. A prompt-code update cannot replace their old request.
         spec = previous
-    _publish_once(directory / "spec.json", spec)
-    _factory_owner(store, task_id, owner, refs)
-    queued = _get_or_none(store.get_work, work_id)
-    if queued is None:
-        queued = enqueue_spec(store, spec, runtime, resume_prepared=True, probe_native=True)["work"]
-    else:
-        _validated_prepared_author(store, spec, runtime)
+    with _author_prepare_lock(directory):
+        _publish_once(directory / "spec.json", spec)
+        _factory_owner(store, task_id, owner, refs)
+        queued = _get_or_none(store.get_work, work_id)
+        if retry_failed_probes is not None:
+            _authorize_failed_author_probe(store, directory, runtime, work_id, retry_failed_probes, queued)
+        if queued is None:
+            options = {"retry_failed_probes": sorted(retry_failed_probes)} if retry_failed_probes is not None else {}
+            queued = enqueue_spec(store, spec, runtime, resume_prepared=True, probe_native=True, **options)["work"]
+        else:
+            _validated_prepared_author(store, spec, runtime)
     result = {"work_id": work_id, "candidate_id": candidate_id, "runtime": str(runtime), "spec": str(directory / "spec.json"),
               "factory_intent": str(directory / "factory-intent.json"), "model_calls_by_factory_preparation": 0}
     if not allow_model:
@@ -260,6 +273,8 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
         def initial_worker() -> dict:
             try:
                 return run_worker(store, "author-factory", True, [work_id])
+            except (ReceiptWritePending, ReceiptEvidenceError, ReceiptResultUncertain):
+                raise
             except Exception as error:
                 original = _active_attempt(store, work_id)
                 if original is not None and original["state"] in ACTIVE:
@@ -289,11 +304,64 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
         if future is not None:
             try:
                 future.result()
+            except (ReceiptWritePending, ReceiptEvidenceError, ReceiptResultUncertain):
+                raise
             except Exception:
                 if received["state"]["status"] != "exception":
                     raise
         return {**result, "state": received["state"]["status"], "attempt_id": attempt["attempt_id"],
                 "lifecycle_id": lifecycle_id, "lifecycle": received}
+
+
+@contextmanager
+def _author_prepare_lock(directory: Path):
+    """Exclude only another preparation of this same author intent."""
+    with (directory / ".author-prepare.lock").open("a+b") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise TaskflowError("this author preparation is already active") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _authorize_failed_author_probe(store: object, directory: Path, runtime: Path, work_id: str,
+                                   supplied: list[str], queued: dict | None) -> None:
+    """Bind one explicit zero-model retry to all original failed reports."""
+    from taskflow.execution_runner import _validate
+
+    if (not isinstance(supplied, list) or not supplied
+            or any(not isinstance(value, str) or len(value) != 64
+                   or any(char not in "0123456789abcdef" for char in value) for value in supplied)
+            or len(set(supplied)) != len(supplied)):
+        raise TaskflowError("native probe retry requires unique lowercase SHA256 values")
+    if queued is not None or store.list_attempts(work_id) or (runtime / "native-probe-ready.json").exists():
+        raise TaskflowError("native probe retry requires an unqueued author without attempts or a ready seal")
+    manifest = _validate(runtime)
+    if manifest.get("mode") != "native_role":
+        raise TaskflowError("native probe retry requires the original native runtime")
+    reports = []
+    for path in sorted(runtime.glob("native-probe-*.json")):
+        raw = _regular(path)
+        value = parse_json(raw, "original native probe report")
+        if (not isinstance(value, dict) or value.get("passed") is not False or value.get("model_calls") != 0
+                or value.get("manifest") != _info(runtime / "manifest.json")):
+            raise TaskflowError("native probe retry requires original failed zero-model reports for this manifest")
+        reports.append({"path": str(path), "sha256": sha256(raw), "size": len(raw)})
+    if sorted(item["sha256"] for item in reports) != sorted(supplied):
+        raise TaskflowError("native probe retry SHA256 values must match all original failed reports")
+    authorization = {"schema_version": 1, "kind": "explicit_author_failed_native_probe_retry",
+                     "work_id": work_id, "runtime": str(runtime), "reports": reports,
+                     "manifest": _info(runtime / "manifest.json"),
+                     "factory_intent": _info(directory / "factory-intent.json"),
+                     "spec": _info(directory / "spec.json"), "model_calls_authorized": 0}
+    path = directory / "probe-retry-authorizations" / (sha256(canonical(authorization)) + ".json")
+    try:
+        _publish(path, authorization)
+    except FileExistsError as exc:
+        raise TaskflowError("this native probe retry authorization was already consumed") from exc
 
 
 def _validated_prepared_author(store: object, spec: dict, runtime: Path) -> tuple[dict, dict, dict]:

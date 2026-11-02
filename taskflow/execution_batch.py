@@ -174,7 +174,8 @@ def _support(role: str, row: dict, mode: str, refs: list[dict], captured: dict |
     output_ref, output_raw = _reference(proof.get("output"), captured)
     output = parse_json(output_raw, role + " original CLI output")
     parent_pointer = _text(proof.get("model_pointer"), role + ".model_pointer").rsplit("/", 1)[0]
-    fields = ["efforts_pointer"] + (["contexts_pointer"] if runtime["reasoning_context"] is not None else [])
+    explicit_context = runtime["reasoning_selection"] == "explicit" and runtime["reasoning_context"] is not None
+    fields = ["efforts_pointer"] + (["contexts_pointer"] if explicit_context else [])
     if runtime["reasoning_selection"] == "verified_client_default":
         fields.append("default_effort_pointer")
     if any(not isinstance(proof.get(key), str) or proof[key].rsplit("/", 1)[0] != parent_pointer
@@ -183,16 +184,32 @@ def _support(role: str, row: dict, mode: str, refs: list[dict], captured: dict |
     if _pointer(output, proof.get("model_pointer")) != row["model"]:
         raise TaskflowError(role + ": model absent from original CLI output locator")
     efforts = _pointer(output, proof.get("efforts_pointer"))
-    if not isinstance(efforts, list) or runtime["reasoning_effort"] not in efforts:
+    if not isinstance(efforts, list) or not any(
+        (item.get("effort") if isinstance(item, dict) else item) == runtime["reasoning_effort"]
+        for item in efforts
+    ):
         raise TaskflowError(role + ": reasoning effort unsupported by original CLI output")
-    if runtime["reasoning_context"] is not None:
+    if explicit_context:
         contexts = _pointer(output, proof.get("contexts_pointer"))
         if not isinstance(contexts, list) or runtime["reasoning_context"] not in contexts:
             raise TaskflowError(role + ": reasoning context unsupported by original CLI output")
     if runtime["reasoning_selection"] == "verified_client_default":
-        if (proof.get("observation_kind") != "same_argv_no_inference"
-                or _pointer(output, proof.get("default_effort_pointer")) != runtime["reasoning_effort"]):
-            raise TaskflowError(role + ": client default requires same-argv no-inference evidence")
+        default_pointer = proof.get("default_effort_pointer")
+        legacy = default_pointer.rsplit("/", 1)[-1] not in {"default_reasoning_level", "default_effort"}
+        if legacy:
+            # Only captured snapshots can use the previous v1 support contract.
+            # A marker in a live plan must never select historical validation.
+            context_pointer = proof.get("contexts_pointer")
+            if (captured is None or proof.get("observation_kind") != "same_argv_no_inference"
+                    or runtime["reasoning_effort"] not in efforts
+                    or (runtime["reasoning_context"] is not None and (
+                        not isinstance(context_pointer, str)
+                        or context_pointer.rsplit("/", 1)[0] != parent_pointer
+                        or not isinstance(_pointer(output, context_pointer), list)
+                        or runtime["reasoning_context"] not in _pointer(output, context_pointer)))):
+                raise TaskflowError(role + ": frozen legacy client default evidence differs")
+        if _pointer(output, default_pointer) != runtime["reasoning_effort"]:
+            raise TaskflowError(role + ": catalog default effort differs from the expected client default")
     refs.extend([reference, cli_ref, output_ref])
 
 

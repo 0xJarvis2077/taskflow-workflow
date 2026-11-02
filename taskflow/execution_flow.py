@@ -261,7 +261,7 @@ def resume_workflow(store: ExecutionStore, flow_id: str, *, reason: str, evidenc
                 defect_ids=[item["defect_id"] for item in state["defects"]])
         for attempt in attempts:
             if attempt["state"] in ACTIVE:
-                reconcile(store, attempt["attempt_id"])
+                reconcile(store, attempt["attempt_id"], resume_pending=False)
                 attempt = store.get_attempt(attempt["attempt_id"])
             adopted_repair = (state["stage"] == "repair" and attempt["state"] == "failed"
                               and (attempt.get("delivery_resolution") or {}).get("status") == "accepted_auxiliary_omission")
@@ -621,6 +621,21 @@ def _review_input_protocol(store: ExecutionStore, candidate: dict, root: Path,
 
 
 def _prepare_node(store: ExecutionStore, record: dict) -> dict:
+    proof = record["state"].get("repair_capacity_continuation")
+    if (proof is not None and record["state"].get("stage") == "repair"
+            and record["state"].get("step") == proof["initial_step"] + record["state"].get("repair_capacity_attempt_ordinal", 0)):
+        from taskflow.execution_repair_capacity import capacity_lifecycle_locks, validate_repair_capacity_before_dispatch
+
+        with capacity_lifecycle_locks(store, proof):
+            current = store.get_flow(record["flow_id"])
+            if current != record:
+                raise TaskflowError("repair continuation changed before preparation")
+            validate_repair_capacity_before_dispatch(store, record)
+            return _prepare_node_checked(store, record)
+    return _prepare_node_checked(store, record)
+
+
+def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
     from taskflow.execution import enqueue_spec
     from taskflow.execution_batch import policy_setting, validate_batch_policy
     from taskflow.execution_flow_contracts import public_first_instructions, repair_instructions, review_instructions
@@ -643,12 +658,25 @@ def _prepare_node(store: ExecutionStore, record: dict) -> dict:
     node_id = _identity(record["flow_id"], label)
     work_id = definition.get("first_work_id") if number == 0 else None
     work_id = work_id or node_id
+    with store._db() as db:
+        capacity_binding = store._capacity_binding_for_work(db, work_id)
+    if capacity_binding is not None:
+        proof = state.get("repair_capacity_continuation")
+        if (stage != "repair" or not isinstance(proof, dict)
+                or sha256(canonical(proof)) != capacity_binding["proof_digest"]
+                or state.get("repair_capacity_attempt_ordinal") != capacity_binding["ordinal"]
+                or record["flow_id"] != capacity_binding["flow_id"]):
+            raise TaskflowError("repair retry lost its current issuing proof")
+    if state.get("repair_capacity_continuation") is not None and stage == "repair" and number == state["repair_capacity_continuation"]["initial_step"] + state["repair_capacity_attempt_ordinal"]:
+        if capacity_binding is None:
+            raise TaskflowError("repair continuation lacks its immutable issuing event")
     root = Path(definition["directory"]) / "nodes" / label
     runtime, work, scratch = root / "runtime", root / "work", root / "scratch"
     existing = _get_or_none(store.get_work, work_id)
     if existing is not None:
         if (existing["intent_id"] != node_id or existing["candidate_id"] != candidate["candidate_id"]
-                or existing["runtime_path"] != str(runtime) or existing.get("model_slot") != slot):
+                or existing["runtime_path"] != str(runtime) or existing.get("model_slot") != slot
+                or existing.get("repair_capacity_binding") != capacity_binding):
             raise TaskflowError("workflow node already exists with different launch identity")
         state.update(current_work_id=work_id, current_runtime=str(runtime), current_node_id=node_id)
         return _save(store, record, state, "workflow_existing_node_recovered")
@@ -660,6 +688,8 @@ def _prepare_node(store: ExecutionStore, record: dict) -> dict:
                     "intent_id": node_id, "dispatch_owner": definition["owner"]}
         if snapshot is not None:
             expected["model_slot"] = slot
+        if capacity_binding is not None:
+            expected["repair_capacity_binding"] = capacity_binding
         if any(specification.get("work", {}).get(key) != value for key, value in expected.items()):
             raise TaskflowError("prepared workflow specification has a different launch identity")
         enqueue_spec(store, specification, runtime, resume_prepared=True, probe_native=True,
@@ -745,6 +775,8 @@ def _prepare_node(store: ExecutionStore, record: dict) -> dict:
                      "evidence": record["evidence"]}, "runner": runner}
     if snapshot is not None:
         specification["work"]["model_slot"] = slot
+    if capacity_binding is not None:
+        specification["work"]["repair_capacity_binding"] = capacity_binding
     _publish_once(root / "spec.json", specification)
     enqueue_spec(store, specification, runtime, resume_prepared=True, probe_native=True,
                  retry_failed_probes=state.get("probe_retry_authorizations", {}).get(str(runtime)))
@@ -918,8 +950,10 @@ def _consume_review(store: ExecutionStore, record: dict, attempt: dict, archive:
 def _consume_repair(store: ExecutionStore, record: dict, attempt: dict, archive: dict) -> dict:
     from taskflow.execution import capture_candidate
     from taskflow.execution_flow_contracts import resolve_repair_record_projection, validate_repair
+    from taskflow.execution_repair_capacity import validate_repair_capacity_result
 
     definition, state = record["definition"], dict(record["state"])
+    validate_repair_capacity_result(store, record, attempt)
     role = definition["roles"]["repair"]
     if state.get("pending_business_scope"):
         raise TaskflowError("repair consumption cannot clear a business hold")
@@ -1013,6 +1047,7 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
     """Consume at most one durable node transition, without launching a model."""
     from taskflow.execution import reconcile
     from taskflow.execution_runner import archive_full_attempt
+    from taskflow.execution_repair_capacity import RetryCapacityBusy
 
     record = store.get_flow(flow_id)
     state = dict(record["state"])
@@ -1031,9 +1066,9 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
         if attempt["state"] in ACTIVE:
             root = Path(attempt["runtime_path"])
             if (root / "termination.json").exists():
-                reconcile(store, attempt["attempt_id"])
+                reconcile(store, attempt["attempt_id"], resume_pending=False)
             elif attempt["state"] == "uncertain":
-                from taskflow.execution import _record_result
+                from taskflow.execution import _receive_ended_result
                 from taskflow.execution_completion import completion_owner
                 from taskflow.execution_runner import reconcile_attempt
 
@@ -1045,7 +1080,7 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
                         return record
                     observed = reconcile_attempt(root)
                     if observed.get("process_ended"):
-                        _record_result(store, current, observed)
+                        _receive_ended_result(store, current, observed, resume_pending=False)
                     elif observed.get("status") != "running":
                         raise TaskflowError("launch remains uncertain after original-process reconciliation")
             return record
@@ -1054,6 +1089,10 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
         if adopted_repair:
             store._validated_delivery_resolution(attempt)
         if attempt["state"] != "completed" and not adopted_repair:
+            if state["stage"] == "repair" and state.get("repair_capacity_continuation") and attempt["state"] == "failed":
+                from taskflow.execution_repair_capacity import advance_failed_capacity_retry
+
+                return advance_failed_capacity_retry(store, record, attempt)
             raise TaskflowError("role technical failure/uncertainty retained: " + attempt["attempt_id"])
         destination = Path(record["definition"]["directory"]) / "archives" / attempt["attempt_id"]
         archive = archive_full_attempt(Path(attempt["runtime_path"]), destination)
@@ -1070,6 +1109,8 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
                                 "cli_sid": attempt["cli_sid"], "archive": archive["path"], "business_verdict": "not_inferred"}]
             return _save(store, record, state, "workflow_public_reconstruction_received")
         return _consume_review(store, record, attempt, archive)
+    except RetryCapacityBusy:
+        return store.get_flow(flow_id)
     except (TaskflowError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         latest = store.get_flow(flow_id)
         failed = dict(latest["state"])
@@ -1083,7 +1124,7 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
 def run_workflows(store: ExecutionStore, flow_ids: list[str] | None = None,
                   *, allow_model: bool = False, poll_seconds: float = 1) -> dict:
     """One invocation advances all selected loops and their existing workers."""
-    from taskflow.execution import run_worker
+    from taskflow.execution import ReceiptEvidenceError, ReceiptResultUncertain, ReceiptWritePending, run_worker
 
     identities = flow_ids or [item["flow_id"] for item in store.list_flows()
                               if not item["definition"].get("kind")]
@@ -1095,11 +1136,21 @@ def run_workflows(store: ExecutionStore, flow_ids: list[str] | None = None,
     workers = min(limits) if limits else 1
     with _consumer_lock(store), ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {}
+        pending = {}
+        stalled_ready = set()
         while True:
+            newly_stalled = set()
+            made_progress = False
             for future, work_id in list(futures.items()):
                 if future.done():
                     try:
-                        future.result()
+                        result = future.result()
+                        if result.get("state") == "waiting":
+                            newly_stalled.add(work_id)
+                        else:
+                            made_progress = True
+                    except (ReceiptWritePending, ReceiptEvidenceError, ReceiptResultUncertain) as exc:
+                        pending[work_id] = exc
                     except Exception as exc:
                         # Worker boundaries retain their attempt; only its own
                         # authorized continuation stops. No model is retried.
@@ -1110,20 +1161,39 @@ def run_workflows(store: ExecutionStore, flow_ids: list[str] | None = None,
                                 failed.update(status="exception", exception={"reason": str(exc), "work_id": work_id})
                                 _save(store, current, failed, "workflow_worker_exception")
                     del futures[future]
+            if made_progress:
+                stalled_ready.clear()
+            stalled_ready.update(newly_stalled)
             for identity in identities:
                 current = store.get_flow(identity)
                 # The current one-shot worker owns its launch/collection
                 # window. Recovery logic is for a worker no longer managed by
                 # this invocation, never a reason to race its normal result.
-                if current["state"].get("current_work_id") not in futures.values():
-                    advance_workflow(store, identity)
+                work_id = current["state"].get("current_work_id")
+                if work_id not in futures.values() and work_id not in pending:
+                    try:
+                        advance_workflow(store, identity)
+                    except (ReceiptWritePending, ReceiptEvidenceError, ReceiptResultUncertain) as exc:
+                        pending[work_id] = exc
             records = [store.get_flow(identity) for identity in identities]
+            if pending and all(item["state"].get("current_work_id") in pending
+                               or item["state"]["status"] in ("accepted", "exception") and item["state"].get("receipt")
+                               for item in records):
+                raise next(iter(pending.values()))
             if all(item["state"]["status"] in ("accepted", "exception") and item["state"].get("receipt") for item in records):
                 return {"flows": records, "normal_nodes_require_manual_dispatch": False}
             ready = [item["state"]["current_work_id"] for item in records
                      if item["state"]["status"] == "active" and item["state"].get("current_work_id")
+                     and item["state"]["current_work_id"] not in pending
+                     and (not pending or item["state"]["current_work_id"] not in stalled_ready)
                      and store.get_work(item["state"]["current_work_id"])["state"] == "ready"]
+            # Continue runnable work, but surface a pending receipt when the
+            # remaining flows are external or workers could not claim them.
+            if pending and not futures and not ready:
+                raise next(iter(pending.values()))
             if not allow_model and ready:
+                if pending:
+                    raise next(iter(pending.values()))
                 return {"flows": records, "state": "ready_requires_explicit_model_authorization"}
             for work_id in ready:
                 if work_id in futures.values():

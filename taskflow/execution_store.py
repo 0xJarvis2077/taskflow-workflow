@@ -5,6 +5,7 @@ filesystem; JSON returned here is a view, never a second editable state store.
 Business verdicts are attributed inputs, not conclusions made by this module.
 """
 
+import builtins
 import json
 import math
 import sqlite3
@@ -23,6 +24,10 @@ from taskflow.contracts import (
 ACTIVE = ("claimed", "starting", "running", "collecting", "uncertain")
 TERMINAL = ("completed", "failed", "cancelled")
 DECISIONS = ("research", "repair", "reconstruct", "experiment", "retain", "environment")
+
+
+class WorkClaimDataError(TaskflowError):
+    """One ready work item's policy or dependency cannot be evaluated."""
 
 
 def _required_text(value: Any, label: str) -> str:
@@ -190,21 +195,33 @@ class ExecutionStore:
                     definition_digest TEXT NOT NULL, state TEXT NOT NULL,
                     revision INTEGER NOT NULL, event_seq INTEGER NOT NULL,
                     evidence TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS repair_capacity_issuance (
+                    work_id TEXT PRIMARY KEY, data TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT,
                     at REAL NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL);
             """)
 
     @contextmanager
-    def _db(self, write: bool = False) -> Iterator[sqlite3.Connection]:
-        db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
+    def _db(self, write: bool = False, *, busy_timeout_seconds: float | None = None) -> Iterator[sqlite3.Connection]:
+        if busy_timeout_seconds is not None and (isinstance(busy_timeout_seconds, bool)
+                or not isinstance(busy_timeout_seconds, (int, float))
+                or not math.isfinite(busy_timeout_seconds) or not 0 <= busy_timeout_seconds <= 15):
+            raise TaskflowError("SQLite busy timeout must be finite and between zero and 15 seconds")
+        timeout = 15 if busy_timeout_seconds is None else busy_timeout_seconds
+        deadline = None if busy_timeout_seconds is None else time.monotonic() + timeout
+        db = sqlite3.connect(self.path, timeout=timeout, isolation_level=None)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA busy_timeout=15000")
+        db.execute("PRAGMA busy_timeout=" + str(int(timeout * 1000)))
         try:
             if write:
                 db.execute("BEGIN IMMEDIATE")
             yield db
             if write:
+                if deadline is not None:
+                    # A reader may delay COMMIT after BEGIN succeeded. The
+                    # receipt's per-call budget covers both waits, not each.
+                    db.execute("PRAGMA busy_timeout=" + str(max(0, int((deadline - time.monotonic()) * 1000))))
                 db.commit()
         except sqlite3.IntegrityError as exc:
             if write:
@@ -349,6 +366,43 @@ class ExecutionStore:
         if set(prior) - set(current) and not declaration_changed:
             raise TaskflowError("removed candidate files require the author's changed package declaration")
 
+    @staticmethod
+    def _capacity_binding_for_work(db: sqlite3.Connection, work_id: str) -> dict[str, Any] | None:
+        """Resolve one work ID through its durable index and issuing event."""
+        from taskflow.execution_flow import _identity
+
+        indexed = db.execute("SELECT data FROM repair_capacity_issuance WHERE work_id=?", (work_id,)).fetchone()
+        marker = '"issued_work_id":' + json.dumps(work_id, ensure_ascii=False, separators=(",", ":"))
+        issued = db.execute("SELECT seq,data FROM events WHERE kind='flow_updated' AND instr(data,?)>0", (marker,)).fetchall()
+        if indexed is None:
+            if issued:
+                raise TaskflowError("repair retry issuing index is missing")
+            return None
+        if len(issued) != 1:
+            raise TaskflowError("repair retry issuing event is missing or ambiguous")
+        try:
+            saved = json.loads(indexed["data"])
+            event = json.loads(issued[0]["data"])
+            transition, state = event["transition"], event["state"]
+            proof, ordinal = state["repair_capacity_continuation"], state["repair_capacity_attempt_ordinal"]
+            candidate = proof["candidate_binding"]
+            if (transition["kind"] not in {"workflow_repair_capacity_continuation_prepared", "workflow_repair_capacity_failure_retained"}
+                    or transition["issued_work_id"] != work_id or state["status"] != "active"
+                    or type(ordinal) is not int or type(proof["initial_step"]) is not int
+                    or type(proof["maximum_additional_attempts"]) is not int
+                    or not 1 <= ordinal <= proof["maximum_additional_attempts"]
+                    or not candidate.get("task_id") or not candidate.get("candidate_id")
+                    or _identity(event["flow_id"], f"{proof['initial_step'] + ordinal}-repair") != work_id):
+                raise ValueError("invalid event binding")
+            expected = {"flow_id": event["flow_id"], "proof_digest": sha256(canonical(proof)),
+                        "ordinal": ordinal, "issued_event_seq": issued[0]["seq"],
+                        "task_id": candidate["task_id"], "candidate_id": candidate["candidate_id"], "role": "repair"}
+        except (KeyError, TypeError, ValueError) as error:
+            raise TaskflowError("repair retry issuing evidence is malformed") from error
+        if saved != expected:
+            raise TaskflowError("repair retry issuance index differs from its event")
+        return expected
+
     def enqueue(
         self, work_id: str, task_id: str, candidate_id: str, role: str,
         policy_id: str, *, intent_id: str, purpose: str, request_digest: str,
@@ -357,6 +411,7 @@ class ExecutionStore:
         evidence: list[dict[str, Any]] | None = None,
         dispatch_owner: str | None = None,
         model_slot: str | None = None,
+        repair_capacity_binding: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         for key, value in (("work_id", work_id), ("intent_id", intent_id), ("role", role)):
             validate_id(value, key)
@@ -375,6 +430,12 @@ class ExecutionStore:
         if not isinstance(dependencies, list):
             raise TaskflowError("dependencies: list required")
         with self._db(True) as db:
+            expected_capacity = self._capacity_binding_for_work(db, work_id)
+            if expected_capacity != repair_capacity_binding:
+                raise TaskflowError("repair retry work requires its exact immutable issuing-event binding")
+            if expected_capacity is not None and (role != expected_capacity["role"] or task_id != expected_capacity["task_id"]
+                    or candidate_id != expected_capacity["candidate_id"] or intent_id != work_id):
+                raise TaskflowError("repair retry work role, task, candidate or intent differs from its issuing event")
             candidate = self._load(db, "candidates", candidate_id)
             policy = self._load(db, "policies", policy_id)
             ownership = self._dispatch_ownership(db, task_id, work_id)
@@ -406,6 +467,8 @@ class ExecutionStore:
             }
             if batch is not None:
                 value["model_slot"] = batch["model_slot"]
+            if repair_capacity_binding is not None:
+                value["repair_capacity_binding"] = repair_capacity_binding
             db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)", (work_id, task_id, candidate_id, intent_id, "ready", canonical(value).decode()))
             self._event(db, "dispatch_intent", value)
         return value
@@ -430,10 +493,15 @@ class ExecutionStore:
     @staticmethod
     def _blocked(db: sqlite3.Connection, work: dict[str, Any]) -> bool:
         scopes = ("all", f"task:{work['task_id']}", f"work:{work['work_id']}")
-        return any(
-            json.loads(row["data"])["action"] != "resume"
-            for row in db.execute("SELECT data FROM controls WHERE scope IN (?,?,?)", scopes)
-        )
+        blocked = False
+        for row in db.execute("SELECT scope,data FROM controls WHERE scope IN (?,?,?)", scopes):
+            try:
+                blocked |= json.loads(row["data"])["action"] != "resume"
+            except (ValueError, KeyError, TypeError) as error:
+                if row["scope"] == "all":
+                    raise TaskflowError("global claim control is malformed") from error
+                raise WorkClaimDataError("scoped claim control is malformed") from error
+        return blocked
 
     @staticmethod
     def _dispatch_ownership(db: sqlite3.Connection, task_id: str, work_id: str) -> dict[str, Any] | None:
@@ -467,26 +535,36 @@ class ExecutionStore:
                 return None
         with self._db(True) as db:
             active = [_data(row) for row in db.execute("SELECT data FROM attempts WHERE state IN ('claimed','starting','running','collecting','uncertain')")]
-            for row in db.execute("SELECT data FROM work WHERE state='ready' ORDER BY rowid").fetchall():
-                work = _data(row)
-                if eligible is not None and work["work_id"] not in eligible:
+            for row in db.execute("SELECT id,data FROM work WHERE state='ready' ORDER BY rowid").fetchall():
+                if eligible is not None and row["id"] not in eligible:
                     continue
+                work = _data(row)
+                if work.get("work_id") != row["id"]:
+                    raise TaskflowError("ready work identity differs from its storage key")
                 if self._blocked(db, work):
                     continue
                 try:
                     self._check_work_ownership(db, work)
                 except TaskflowError:
                     continue
-                policy = self._load(db, "policies", work["policy_id"])
+                try:
+                    policy = self._load(db, "policies", work["policy_id"])
+                    limit = policy["config"]["concurrency"]
+                    dependencies = work["dependencies"]
+                    if type(limit) is not int or limit < 1 or not isinstance(dependencies, list):
+                        raise ValueError("invalid concurrency or dependency list")
+                    dependency_states = [self._load(db, "work", dep)["state"] for dep in dependencies]
+                except (TaskflowError, ValueError, KeyError, TypeError) as error:
+                    raise WorkClaimDataError("ready work policy or dependency is invalid: " + str(error)) from error
                 # The most restrictive active policy remains effective; updating a
                 # policy does not silently expand old in-flight concurrency.
-                limits = [policy["config"]["concurrency"]]
+                limits = [limit]
                 limits.extend(self._load(db, "policies", item["policy_id"])["config"]["concurrency"] for item in active)
                 if len(active) >= min(limits):
                     continue
                 if work["modifies"] and any(item["task_id"] == work["task_id"] and item["modifies"] for item in active):
                     continue
-                if any(self._load(db, "work", dep)["state"] != "completed" for dep in work["dependencies"]):
+                if any(state != "completed" for state in dependency_states):
                     continue
                 if work["role"] == "solver":
                     try:
@@ -537,8 +615,9 @@ class ExecutionStore:
             self._update_attempt(db, attempt, "process_recorded")
             return attempt
 
-    def mark_collecting(self, attempt_id: str) -> dict[str, Any]:
-        with self._db(True) as db:
+    def mark_collecting(self, attempt_id: str, *, busy_timeout_seconds: float | None = None) -> dict[str, Any]:
+        options = {} if busy_timeout_seconds is None else {"busy_timeout_seconds": busy_timeout_seconds}
+        with self._db(True, **options) as db:
             attempt = self._load(db, "attempts", attempt_id)
             if attempt["state"] not in ("running", "uncertain"):
                 raise TaskflowError("collecting requires running/uncertain attempt")
@@ -546,7 +625,7 @@ class ExecutionStore:
             self._update_attempt(db, attempt, "collecting")
             return attempt
 
-    def finish_attempt(self, attempt_id: str, *, process_exit: int | None, response_complete: bool, artifacts_complete: bool, technical_accepted: bool, evidence: list[dict[str, Any]], cli_sid: str | None = None, process_state: str = "unknown") -> dict[str, Any]:
+    def finish_attempt(self, attempt_id: str, *, process_exit: int | None, response_complete: bool, artifacts_complete: bool, technical_accepted: bool, evidence: list[dict[str, Any]], cli_sid: str | None = None, process_state: str = "unknown", busy_timeout_seconds: float | None = None) -> dict[str, Any]:
         refs = validate_evidence(evidence)
         if process_exit is not None and (isinstance(process_exit, bool) or not isinstance(process_exit, int)):
             raise TaskflowError("process_exit: integer or unknown required")
@@ -556,7 +635,8 @@ class ExecutionStore:
             _required_text(cli_sid, "cli_sid")
         if process_state not in ("unknown", "not_started"):
             raise TaskflowError("process_state: unknown/not_started required")
-        with self._db(True) as db:
+        options = {} if busy_timeout_seconds is None else {"busy_timeout_seconds": busy_timeout_seconds}
+        with self._db(True, **options) as db:
             attempt = self._load(db, "attempts", attempt_id)
             if attempt["state"] not in ACTIVE:
                 raise TaskflowError("terminal attempts are immutable; append another intent")
@@ -577,6 +657,9 @@ class ExecutionStore:
                     except (OSError, ValueError, UnicodeError):
                         continue
                     termination = receipt.get("termination", receipt) if isinstance(receipt, dict) else {}
+                    exception = termination.get("exception")
+                    error_name = exception.get("type") if isinstance(exception, dict) else None
+                    error_type = getattr(builtins, error_name, None) if isinstance(error_name, str) else None
                     if (dispatch.get("intent_id") == attempt["intent_id"]
                             and dispatch.get("manifest", {}).get("sha256") == sha256(manifest_raw)
                             and manifest.get("intent_id") == attempt["intent_id"]
@@ -585,11 +668,18 @@ class ExecutionStore:
                             and termination.get("intent_id") == attempt["intent_id"]
                             and termination.get("spawn_state") == "not_started"
                             and termination.get("spawn_failure_origin") in ("cli_popen", "supervisor_popen")
-                            and isinstance(termination.get("exception"), dict)
-                            and termination["exception"].get("type") in ("OSError", "PermissionError", "FileNotFoundError", "NotADirectoryError", "IsADirectoryError")
+                            and isinstance(error_type, type) and issubclass(error_type, OSError)
                             and termination.get("returncode") is None
                             and not (source_path.parent / "process.json").exists()):
                         proven_not_started = True
+            if (not proven_not_started and attempt["state"] == "uncertain" and process_exit is None
+                    and attempt.get("process_exit") is None and attempt.get("evidence") == refs
+                    and attempt.get("response_complete") == response_complete
+                    and attempt.get("artifacts_complete") == artifacts_complete
+                    and attempt.get("technical_accepted") == technical_accepted
+                    and (cli_sid is None or attempt.get("cli_sid") == cli_sid)
+                    and attempt.get("process_state") == "unknown"):
+                return attempt
             attempt.update(
                 state="failed" if proven_not_started else "uncertain" if process_exit is None else "completed" if complete else "failed", process_exit=process_exit,
                 response_complete=response_complete, artifacts_complete=artifacts_complete,
@@ -2873,6 +2963,119 @@ class ExecutionStore:
         return sorted(ids)
 
     @staticmethod
+    def _closed_quality_alias_route(db: sqlite3.Connection, candidate: dict, repaired: dict,
+                                    before_seq: int, after_seq: int, *, parents_only: bool = False) -> dict | None:
+        """Prove a backwards parent/byte-alias route, without reusing verdicts."""
+        from collections import deque
+        from taskflow.packages import _check_capture
+
+        keys = ("input_digest", "content_digest", "evaluation_digest")
+        rows = {}
+        for row in db.execute("SELECT id,data FROM candidates WHERE task_id=?", (candidate["task_id"],)):
+            try:
+                item = _data(row)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(item, dict) and item.get("candidate_id") == row["id"]:
+                rows[row["id"]] = item
+        def capture(identity):
+            item = rows[identity]
+            event = db.execute("SELECT kind,data FROM events WHERE seq=?", (item["created_seq"],)).fetchone()
+            if (event is None or event["kind"] != "candidate_registered"
+                    or json.loads(event["data"]) != {key: value for key, value in item.items() if key != "created_seq"}):
+                raise TaskflowError("historical closed route differs from its actual candidate capture event")
+            declarations = [entry for entry in item["evidence"]
+                            if entry.get("location") == "explicit package declaration"]
+            if len(declarations) != 1 or not item.get("files"):
+                raise TaskflowError("historical closed route requires each captured declaration and complete members")
+            declaration = validate_evidence(declarations)[0]
+            root = Path(declaration["path"]).parent
+            actual, task, raw, captured, _ = _check_capture(root)
+            if (actual["errors"] or sha256(raw) != declaration["sha256"]
+                    or any(actual[key] != item[key] for key in ("task_id", *keys))):
+                raise TaskflowError("historical closed route declaration differs from its captured task/digests")
+            files = validate_evidence(item["files"])
+            by_path = {entry["package_path"]: entry for entry in files}
+            if len(by_path) != len(files) or set(by_path) != set(captured):
+                raise TaskflowError("historical closed route has different complete captured members")
+            members = []
+            for entry in task["files"]:
+                path = entry["path"]
+                source, data = by_path[path], captured[path]
+                if (source["path"] != str(_evidence_path(root / path)) or source["role"] != entry["role"]
+                        or source["sha256"] != sha256(data)
+                        or ("id" in source and source["id"] != entry["id"])
+                        or ("size" in source and source["size"] != len(data))):
+                    raise TaskflowError("historical closed route member path/id/role/hash/size differs from its declaration")
+                members.append({"path": path, "id": entry["id"], "role": entry["role"],
+                                "sha256": sha256(data), "size": len(data)})
+            members = sorted(members, key=lambda entry: entry["path"])
+            return {"candidate_id": identity, "created_seq": item["created_seq"],
+                             "declaration": {**declaration, "size": len(raw)},
+                             "members": members,
+                             **{key: item[key] for key in ("task_id", *keys)}}
+
+        # Validate mandatory endpoints before exploring optional aliases.  An
+        # invalid optional branch is skipped only if a fully valid route exists.
+        start_id, end_id = candidate["candidate_id"], repaired["candidate_id"]
+        if start_id not in rows or end_id not in rows:
+            raise TaskflowError("historical closed route endpoint capture is missing or malformed")
+        captures = {start_id: capture(start_id)}
+        if end_id != start_id:
+            captures[end_id] = capture(end_id)
+        pending = deque([start_id])
+        previous = {start_id: None}
+        edges = {}
+        invalid = {}
+        first_error = None
+        while pending and end_id not in previous:
+            identity = pending.popleft()
+            item = rows[identity]
+            neighbors = []
+            if item.get("parent_id") in rows:
+                neighbors.append((item["parent_id"], "parent"))
+            fingerprint = tuple(item.get(key) for key in keys)
+            if not parents_only and identity != start_id:
+                neighbors.extend((other, "same_byte_alias") for other in sorted(rows)
+                                 if other != identity and tuple(rows[other].get(key) for key in keys) == fingerprint)
+            for other, kind in neighbors:
+                if (other in previous or other in invalid or type(rows[other].get("created_seq")) is not int
+                        or type(item.get("created_seq")) is not int
+                        or not rows[other]["created_seq"] < item["created_seq"] < before_seq
+                        or (other == end_id and item["created_seq"] <= after_seq)):
+                    continue
+                if other not in captures:
+                    try:
+                        captures[other] = capture(other)
+                    except (TaskflowError, OSError, ValueError, KeyError, TypeError) as exc:
+                        invalid[other] = exc
+                        if first_error is None:
+                            first_error = (exc if isinstance(exc, TaskflowError) else
+                                           TaskflowError("historical closed route has an inaccessible or malformed optional capture"))
+                        continue
+                if kind == "same_byte_alias" and captures[identity]["members"] != captures[other]["members"]:
+                    if first_error is None:
+                        first_error = TaskflowError("historical closed route byte-alias members differ")
+                    continue
+                previous[other] = identity
+                edges[other] = kind
+                pending.append(other)
+        if end_id not in previous:
+            if first_error is not None:
+                raise first_error
+            return None
+        identities = [end_id]
+        while previous[identities[-1]] is not None:
+            identities.append(previous[identities[-1]])
+        identities.reverse()
+        route = [{"from": left, "to": right, "kind": edges[right]}
+                 for left, right in zip(identities, identities[1:])]
+        captures = [captures[identity] for identity in identities]
+        return {"schema_version": 1, "kind": "captured_parent_and_byte_alias_route",
+                "nodes": captures, "edges": route}
+
+
+    @staticmethod
     def _historical_closed_quality_source(db: sqlite3.Connection, negative: dict, current: dict) -> dict | None:
         """Reuse a negative's own closure through an actual ancestor byte alias.
 
@@ -2908,14 +3111,20 @@ class ExecutionStore:
             return None
         candidate = ExecutionStore._load(db, "candidates", current["candidate_id"])
         repaired = ExecutionStore._load(db, "candidates", closure["candidate_id"])
-        if candidate["task_id"] != repaired["task_id"]:
+        if candidate["task_id"] != repaired["task_id"] or candidate["candidate_id"] == repaired["candidate_id"]:
             return None
-        ancestors = ExecutionStore._ancestors(db, candidate["candidate_id"]) - {candidate["candidate_id"]}
         keys = ("input_digest", "content_digest", "evaluation_digest")
-        aliases = [ExecutionStore._load(db, "candidates", identity) for identity in sorted(ancestors)
-                   if all(ExecutionStore._load(db, "candidates", identity)[key] == repaired[key] for key in keys)]
-        if not aliases:
+        attempt = ExecutionStore._load(db, "attempts", current["attempt_id"])
+        route = ExecutionStore._closed_quality_alias_route(
+            db, candidate, repaired, attempt["claimed_seq"], max(row["closed_seq"] for row in defects))
+        if route is None:
             return None
+        # Keep the legacy witness shape for the direct ancestor case, but
+        # authenticate every node on that route just like transitive routes.
+        alias_ids = [edge["from"] for edge in route["edges"]
+                     if edge["kind"] == "same_byte_alias" and edge["to"] == repaired["candidate_id"]]
+        aliases = [ExecutionStore._load(db, "candidates", identity) for identity in alias_ids]
+        direct = bool(alias_ids and all(edge["kind"] == "parent" for edge in route["edges"][:-1]))
         # Do not absorb a later or unrelated finding into this historical pair.
         # Failure of either strict source validator propagates; it is no fallback.
         ExecutionStore._assert_consumed_quality_negative(db, negative, closure)
@@ -2946,7 +3155,8 @@ class ExecutionStore:
                 "repaired_candidate_id": repaired["candidate_id"],
                 "current_review_id": current["review_id"], "current_candidate_id": candidate["candidate_id"],
                 "ancestor_aliases": captures[1:], "original_repaired_capture": captures[0],
-                "current_source": {"report": source["report_ref"], "issues": source["issues_ref"]}}
+                "current_source": {"report": source["report_ref"], "issues": source["issues_ref"]},
+                **({} if direct else {"transitive_route": route})}
 
     @staticmethod
     def _historical_repaired_quality_source(db: sqlite3.Connection, negative: dict, current: dict) -> dict | None:
@@ -2999,10 +3209,21 @@ class ExecutionStore:
         whole = ExecutionStore._load(db, "reviews", current_graph["whole_review_id"]) if derived else current
         source_attempt = ExecutionStore._load(db, "attempts", whole["attempt_id"])
         keys = ("input_digest", "content_digest", "evaluation_digest")
-        aliases = [ExecutionStore._load(db, "candidates", identity) for identity in
-                   sorted(ExecutionStore._ancestors(db, candidate["candidate_id"]) - {candidate["candidate_id"]})]
-        aliases = [item for item in aliases if all(item[key] == repaired[key] for key in keys)
-                   and historical["created_seq"] < item["created_seq"] < source_attempt["claimed_seq"]]
+        # Only the nearest eligible literal ancestor is needed. Earlier
+        # ancestors lie beyond that selected path and must not invalidate it.
+        aliases = []
+        seen = {candidate["candidate_id"]}
+        identity = candidate.get("parent_id")
+        while identity:
+            if identity in seen:
+                raise TaskflowError("candidate lineage cycle")
+            seen.add(identity)
+            item = ExecutionStore._load(db, "candidates", identity)
+            if (all(item[key] == repaired[key] for key in keys)
+                    and historical["created_seq"] < item["created_seq"] < source_attempt["claimed_seq"]):
+                aliases.append(item)
+                break
+            identity = item.get("parent_id")
         if not aliases:
             return None
         for defect in defects:
@@ -3030,6 +3251,16 @@ class ExecutionStore:
             expected = members
             captures.append({"candidate_id": item["candidate_id"], "declaration": declarations[0],
                              "member_count": len(members)})
+        # This historical graph only accepts literal ancestors. Authenticate the
+        # complete selected parent paths and the repaired endpoint, including
+        # their original capture events, declarations and member bytes.
+        if ExecutionStore._closed_quality_alias_route(
+                db, repaired, repaired, current["completed_seq"], 0, parents_only=True) is None:
+            raise TaskflowError("Historical repaired graph endpoint capture is invalid")
+        for alias in aliases:
+            if ExecutionStore._closed_quality_alias_route(
+                    db, candidate, alias, current["completed_seq"], 0, parents_only=True) is None:
+                raise TaskflowError("Historical repaired graph alias has no ordered captured parent path")
         return {"schema_version": 1, "kind": "verified_historical_repaired_graph_ancestor",
                 "negative_review_id": negative["review_id"], "closure_review_id": closure_id,
                 "historical_review_id": authenticated["review_id"], "historical_currentness_claimed": False,
@@ -3212,8 +3443,9 @@ class ExecutionStore:
             db.execute("INSERT INTO decisions VALUES(?,?,?)", (decision_id, task_id, canonical(value).decode()))
             return value
 
-    def get_attempt(self, attempt_id: str) -> dict[str, Any]:
-        with self._db() as db:
+    def get_attempt(self, attempt_id: str, *, busy_timeout_seconds: float | None = None) -> dict[str, Any]:
+        options = {} if busy_timeout_seconds is None else {"busy_timeout_seconds": busy_timeout_seconds}
+        with self._db(**options) as db:
             return self._load(db, "attempts", attempt_id)
 
     def list_attempts(self, work_id: str) -> list[dict[str, Any]]:
@@ -3282,6 +3514,12 @@ class ExecutionStore:
             for policy_id in policy_ids:
                 validate_id(policy_id, "flow policy reference")
                 self._load(db, "policies", policy_id)
+            if definition.get("kind") == "original_score_pause_v1":
+                source_id = validate_id(definition.get("source_flow_id"), "original pause source")
+                if db.execute("SELECT 1 FROM execution_flows WHERE json_extract(definition,'$.kind')=? "
+                              "AND json_extract(definition,'$.source_flow_id')=? LIMIT 1",
+                              ("original_score_pause_v1", source_id)).fetchone():
+                    raise TaskflowError("this original experiment already has its unique pause successor")
             event_seq = self._event(db, "flow_registered", {
                 "flow_id": flow_id, "definition_digest": digest,
                 "revision": 0, "state": initial_state, "evidence": refs,
@@ -3300,6 +3538,142 @@ class ExecutionStore:
     def list_flows(self) -> list[dict[str, Any]]:
         with self._db() as db:
             return [self._flow_value(row) for row in db.execute("SELECT * FROM execution_flows ORDER BY rowid")]
+
+    def prepare_original_pause_control(self, flow_id: str, definition_digest: str,
+                                       scope: str, reason: str) -> dict:
+        """Prepare a follower's one confirmation guard atomically, once only."""
+        from taskflow.execution_experiment import _node
+
+        validate_id(flow_id, "original pause flow_id")
+        _required_text(reason, "original pause guard reason")
+        with self._db(True) as db:
+            current = self._flow_value(db.execute(
+                "SELECT * FROM execution_flows WHERE flow_id=?", (flow_id,)).fetchone())
+            definition, state = current["definition"], current["state"]
+            if (definition.get("kind") != "original_score_pause_v1"
+                    or current["definition_digest"] != definition_digest
+                    or sha256(canonical(definition)) != definition_digest):
+                raise TaskflowError("original pause confirmation guard definition differs")
+            source_id = definition["source_flow_id"]
+            expected_scope = "work:" + _node({"flow_id": source_id, "state": {"run_index": 1}}, "solver")
+            if scope != expected_scope:
+                raise TaskflowError("original pause guard must target only its source second solver")
+            prepared = state.get("confirmation_control_prepared")
+            if prepared and (not isinstance(prepared, dict) or prepared.get("scope") != scope
+                             or prepared.get("source_flow_id") != source_id):
+                raise TaskflowError("original pause confirmation preparation differs")
+            if state.get("status") == "accepted" or prepared:
+                return current
+            if state.get("status") != "active" or state.get("current_work_id"):
+                raise TaskflowError("original pause follower is not awaiting its first original")
+            source = self._flow_value(db.execute(
+                "SELECT * FROM execution_flows WHERE flow_id=?", (source_id,)).fetchone())
+            if (source["definition_digest"] != definition["source_definition_digest"]
+                    or source["definition"].get("kind") != "experiment_v1"
+                    or any(source["definition"].get(key) != definition[key] for key in ("task_id", "owner", "policy_id"))):
+                raise TaskflowError("original pause guard source differs")
+            work_id = scope.removeprefix("work:")
+            work = db.execute("SELECT state FROM work WHERE id=?", (work_id,)).fetchone()
+            attempted = db.execute("SELECT 1 FROM attempts WHERE work_id=? LIMIT 1", (work_id,)).fetchone()
+            if attempted is not None or (work is not None and work["state"] != "ready"):
+                raise TaskflowError("original pause guard is too late: second solver was already claimed or attempted")
+            row = db.execute("SELECT data FROM controls WHERE scope=?", (scope,)).fetchone()
+            control = _data(row) if row is not None else None
+            control_seq = None
+            if not control or control.get("action") != "pause":
+                control = {"scope": scope, "action": "pause", "reason": reason, "applies_to": "future_claims"}
+                db.execute("INSERT INTO controls VALUES(?,?) ON CONFLICT(scope) DO UPDATE SET data=excluded.data",
+                           (scope, canonical(control).decode()))
+                control_seq = self._event(db, "control", control)
+            state = {**state, "confirmation_control_prepared": {
+                "scope": scope, "source_flow_id": source_id, "control_event_seq": control_seq,
+                "existing_pause_preserved": control_seq is None}}
+            revision = current["revision"] + 1
+            sequence = self._event(db, "flow_updated", {"flow_id": flow_id,
+                "previous_revision": current["revision"], "revision": revision, "state": state,
+                "transition": {"kind": "original_pause_confirmation_guard_prepared"}})
+            cursor = db.execute("UPDATE execution_flows SET state=?,revision=?,event_seq=? WHERE flow_id=? AND revision=?",
+                (canonical(state).decode(), revision, sequence, flow_id, current["revision"]))
+            if cursor.rowcount != 1:
+                raise TaskflowError("original pause confirmation guard CAS conflict")
+            return self._flow_value(db.execute(
+                "SELECT * FROM execution_flows WHERE flow_id=?", (flow_id,)).fetchone())
+
+    def accept_original_score_pause(self, flow_id: str, expected_revision: int, *,
+                                    source_revision: int, source_state_digest: str,
+                                    first_result_digest: str, original: dict) -> dict:
+        """CAS a verified first intake, its task pause and successor atomically.
+
+        All source files have been validated outside this transaction by the
+        original_score_pause_v1 handler. Only immutable identifiers and stored
+        row fingerprints are compared while holding the writer lock.
+        """
+        validate_id(flow_id, "original pause flow_id")
+        with self._db(True) as db:
+            current = self._flow_value(db.execute(
+                "SELECT * FROM execution_flows WHERE flow_id=?", (flow_id,)).fetchone())
+            definition, state = current["definition"], current["state"]
+            if (definition.get("kind") != "original_score_pause_v1"
+                    or sha256(canonical(definition)) != current["definition_digest"]):
+                raise TaskflowError("original pause definition differs")
+            # A completed followup never writes control again, including after
+            # a later explicit human resume, and concurrent identical consumers.
+            if state.get("status") == "accepted":
+                if (state.get("result", {}).get("original", {}).get("first_result_digest") != first_result_digest
+                        or state["result"]["original"].get("source_flow_id") != definition["source_flow_id"]):
+                    raise TaskflowError("original pause was consumed by a different first intake")
+                return current
+            if (current["revision"] != expected_revision or state.get("status") != "active"
+                    or state.get("stage") != "original_score_pause_v1" or state.get("current_work_id")):
+                raise TaskflowError("original pause follower CAS/state differs")
+            source = self._flow_value(db.execute(
+                "SELECT * FROM execution_flows WHERE flow_id=?", (definition["source_flow_id"],)).fetchone())
+            source_definition, source_state = source["definition"], source["state"]
+            if (source["definition_digest"] != definition["source_definition_digest"]
+                    or sha256(canonical(source_definition)) != source["definition_digest"]
+                    or source_definition.get("kind") != "experiment_v1"
+                    or any(source_definition.get(key) != definition[key] for key in ("task_id", "owner", "policy_id"))):
+                raise TaskflowError("original pause source immutable binding differs")
+            # A source may advance during heavy read-only evidence validation.
+            # Return unchanged so the normal next tick validates a fresh view.
+            if (source["revision"] != source_revision
+                    or sha256(canonical(source_state)) != source_state_digest):
+                return current
+            rows = source_state.get("runs", [])
+            if (not rows or rows[0].get("accepted") is not True
+                    or sha256(canonical(rows[0])) != first_result_digest
+                    or original.get("first_result_digest") != first_result_digest
+                    or original.get("source_state_digest") != source_state_digest
+                    or original.get("source_revision") != source_revision
+                    or original.get("source_flow_id") != source["flow_id"]
+                    or original.get("source_definition_digest") != source["definition_digest"]):
+                raise TaskflowError("original pause first intake or verified proof differs")
+            if db.execute("SELECT 1 FROM execution_flows WHERE flow_id<>? "
+                          "AND json_extract(definition,'$.kind')=? "
+                          "AND json_extract(definition,'$.source_flow_id')=? LIMIT 1",
+                          (flow_id, "original_score_pause_v1", source["flow_id"])).fetchone():
+                raise TaskflowError("original source has duplicate pause successors")
+            control = {"scope": "task:" + definition["task_id"], "action": "pause",
+                       "reason": "Explicit controller round completed its one original score intake; " + flow_id,
+                       "applies_to": "future_claims"}
+            db.execute("INSERT INTO controls VALUES(?,?) ON CONFLICT(scope) DO UPDATE SET data=excluded.data",
+                       (control["scope"], canonical(control).decode()))
+            control_seq = self._event(db, "control", control)
+            result = {"outcome": "first_original_received_task_paused", "original": original,
+                      "task_control": {**control, "event_seq": control_seq}, "new_model_dispatched": False}
+            state = {**state, "status": "accepted", "waiting": None, "result": result,
+                     "history": [*state.get("history", []), {"kind": "original_score_received_task_paused",
+                         "source_flow_id": source["flow_id"], "first_result_digest": first_result_digest,
+                         "control_event_seq": control_seq, "new_model_dispatched": False}]}
+            sequence = self._event(db, "flow_updated", {"flow_id": flow_id,
+                "previous_revision": expected_revision, "revision": expected_revision + 1,
+                "state": state, "transition": {"kind": "original_score_pause_atomically_received"}})
+            cursor = db.execute("UPDATE execution_flows SET state=?,revision=?,event_seq=? WHERE flow_id=? AND revision=?",
+                (canonical(state).decode(), expected_revision + 1, sequence, flow_id, expected_revision))
+            if cursor.rowcount != 1:
+                raise TaskflowError("original pause CAS conflict")
+            return self._flow_value(db.execute(
+                "SELECT * FROM execution_flows WHERE flow_id=?", (flow_id,)).fetchone())
 
     def update_flow(self, flow_id: str, expected_revision: int, state: dict[str, Any],
                     event: dict[str, Any]) -> dict[str, Any]:

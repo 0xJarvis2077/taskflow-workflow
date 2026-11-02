@@ -18,7 +18,7 @@ from taskflow.execution_formal import _handoff_errors
 from taskflow.execution_store import ExecutionStore, validate_evidence
 
 
-KINDS = {"evaluation_tail_v1", "experiment_v1", "author_quality_v1", "teacher_successor_v1"}
+KINDS = {"evaluation_tail_v1", "experiment_v1", "author_quality_v1", "teacher_successor_v1", "original_score_pause_v1"}
 
 
 def register_lifecycle(store: ExecutionStore, definition: dict, evidence: list[dict]) -> dict:
@@ -43,6 +43,10 @@ def register_lifecycle(store: ExecutionStore, definition: dict, evidence: list[d
     if packet.get("task_id") and packet["task_id"] != definition["task_id"]:
         raise TaskflowError("lifecycle task differs from business authority")
     store.get_policy(definition["policy_id"])
+    if definition["kind"] == "original_score_pause_v1":
+        from taskflow.execution_original_pause import validate_original_pause_definition
+
+        validate_original_pause_definition(store, definition)
     if definition["kind"] == "teacher_successor_v1":
         from taskflow.execution_teacher_successor import validate_teacher_successor_definition
 
@@ -2034,6 +2038,10 @@ def advance_lifecycle(store: ExecutionStore, identity: str) -> dict:
         if state["status"] in ("accepted", "exception"):
             return _receive(store, record)
         kind = record["definition"]["kind"]
+        if kind == "original_score_pause_v1":
+            from taskflow.execution_original_pause import advance_original_score_pause
+
+            return advance_original_score_pause(store, record)
         if kind == "teacher_successor_v1":
             from taskflow.execution_teacher_successor import advance_teacher_successor
 
