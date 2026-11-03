@@ -154,6 +154,18 @@ def confirmation_digests(plan: dict) -> dict:
             "model_mapping_digest": sha256(canonical(roles)), "scope_digest": sha256(canonical(scope))}
 
 
+def _catalog_effort(item: Any) -> str | None:
+    """Read supported CLI catalog spellings without accepting conflicting aliases."""
+    if isinstance(item, str):
+        return item
+    if not isinstance(item, dict):
+        return None
+    values = [item[key] for key in ("effort", "reasoningEffort") if key in item]
+    if not values or any(not isinstance(value, str) or value != values[0] for value in values):
+        return None
+    return values[0]
+
+
 def _support(role: str, row: dict, mode: str, refs: list[dict], captured: dict | None) -> None:
     runtime = row["runtime"]
     reference, raw = _reference(runtime["support_evidence"], captured)
@@ -185,7 +197,7 @@ def _support(role: str, row: dict, mode: str, refs: list[dict], captured: dict |
         raise TaskflowError(role + ": model absent from original CLI output locator")
     efforts = _pointer(output, proof.get("efforts_pointer"))
     if not isinstance(efforts, list) or not any(
-        (item.get("effort") if isinstance(item, dict) else item) == runtime["reasoning_effort"]
+        _catalog_effort(item) == runtime["reasoning_effort"]
         for item in efforts
     ):
         raise TaskflowError(role + ": reasoning effort unsupported by original CLI output")
@@ -195,7 +207,9 @@ def _support(role: str, row: dict, mode: str, refs: list[dict], captured: dict |
             raise TaskflowError(role + ": reasoning context unsupported by original CLI output")
     if runtime["reasoning_selection"] == "verified_client_default":
         default_pointer = proof.get("default_effort_pointer")
-        legacy = default_pointer.rsplit("/", 1)[-1] not in {"default_reasoning_level", "default_effort"}
+        legacy = default_pointer.rsplit("/", 1)[-1] not in {
+            "default_reasoning_level", "default_effort", "defaultReasoningEffort"
+        }
         if legacy:
             # Only captured snapshots can use the previous v1 support contract.
             # A marker in a live plan must never select historical validation.
