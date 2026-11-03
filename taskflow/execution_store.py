@@ -501,6 +501,17 @@ class ExecutionStore:
                 if row["scope"] == "all":
                     raise TaskflowError("global claim control is malformed") from error
                 raise WorkClaimDataError("scoped claim control is malformed") from error
+        reservation = db.execute("SELECT 1 FROM events WHERE kind='bounded_round_work_reserved' "
+                                 "AND CASE WHEN json_valid(data) THEN json_extract(data,'$.work_id')=? ELSE 0 END",
+                                 (work["work_id"],)).fetchone()
+        round_table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bounded_round_work'").fetchone()
+        if reservation or round_table:
+            from taskflow.execution_rounds import round_claim_blocked
+
+            try:
+                blocked |= round_claim_blocked(db, work)
+            except (TaskflowError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+                raise WorkClaimDataError("bounded round claim context is invalid: " + str(error)) from error
         return blocked
 
     @staticmethod

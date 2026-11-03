@@ -348,3 +348,29 @@ repair、同一节点/author/父子候选、当前源、实际完整payload差�
 不创建repair、solver或评分尝试。parent/experiment只能承接同一显式解决记录；
 新业务hold、未知reason、当前失败/不明工作以及已存在的publication/formal runtime/intent/work/attempt拒绝。
 后续仍须实际新独立affected或完整必要范围复检及原有store/closure门；实验恢复仅返回可继续等待的active状态。
+# 有界原分轮次
+
+`bounded_original_rounds_v1` 是既有 experiment 生命周期之上的计数和受控接续协议，由 `taskflow.execution_rounds` 负责。它不替换作者、独立质量检查、正式作答或读卷流程，也不放宽已有来源守卫。授权的目标轮数是固定正整数；五轮计划将 `target_rounds` 固定为 5。
+
+定义通过既有 `lifecycle-register` 注册。必须提供 `flow_id`、`task_id`、`owner`、`policy_id`、`policy_digest`、`root_intent`、`batch_id`、`target_rounds`、`simulation_only`、`adopt_existing_first`、`first_experiment_id`、`first_experiment_digest`、绝对 `directory` 和 `authorization` 证据引用。授权 JSON 为 `bounded_original_rounds_authority_v1`，schema_version=1，重复绑定上述范围字段；`controller` 对应 owner，`automatic_successors=true`、`count_rule="accepted_first_originals"`、`preserve_first_inputs=true`，并包含有原始证据引用的 `user_authorization`。真实计划 origin 必须为 direct_user，模拟为 test_fixture。真实计划还必须引用已确认、任务和批次相符的 real_cli policy；模型配置沿用该批次，不从其他批次推断。
+
+首个 experiment 仅被观察，原 definition、请求、运行和评分均不改写。已存在原卷需要 `adopt_existing_first=true` 的明确授权。只有该原生命周期终态已接收，且其第一个原卷、完整事实、同 SID 评分、封存和质量证明全部有效，才计数一次。若首轮原授权含条件确认，则保留并等待原流程自然完成；计划不会取消确认来提前计数。后续轮次均使用新的 experiment，禁用该 experiment 内的条件确认。
+
+业务协调者在上一原分接收后，通过现有教师、作者和质量流程准备下一投入，再调用：
+
+```python
+from taskflow.execution_rounds import bind_round_from_packet
+
+bind_round_from_packet(store, plan_id, ordinal=next_ordinal,
+                       packet_ref=exact_packet_ref,
+                       factory_config_ref=exact_batch_factory_ref)
+```
+
+packet 必须带 `batch_id` 和精确 `bounded_round`：`plan_id`、`ordinal`、`root_intent`、`predecessor_digest`、`simulation_only`。predecessor_digest 是计划上一 completed 条目的 canonical JSON SHA-256。既有工厂负责登记一个新 experiment，绑定函数再检查实际来源质量、candidate 继承关系、配置和角色身份排除。此函数不准备模型调用；已运行 experiment 不可回填绑定。协调者负责业务目的，执行层不会自行构造 teacher bundle 或猜测下一研发方向。缺失绑定返回 `next_business_binding_required`，应补齐绑定后继续原计划。
+
+`lifecycle-run --allow-model` 才能领取属于当前轮次的保留工单。普通 worker、直接无 guard 的 runner、后续轮次及暂停计划均不能提前启动。每次 launch admission 重检既有 all/task/work 控制及计划状态；writer 在 admission 后释放，不跨推理持有。SQLite 与 Popen 不是一个原子操作；已进入 admission 的在途任务由原 worker 收尾，身份不确定时保留原 attempt，不自动重抽。控制在 admission 后生效于后续启动。
+
+`set_round_plan_mode(store, plan_id, mode, reason)` 支持 running/paused/cancelled；cancelled 不可恢复，不改写全局或任务控制。已有 task/global pause 使计划可恢复等待，恢复控制后继续；已有 work 控制阻止该工单领取和启动。技术性计划异常须先修复原因，再用 `resume_round_plan` 提交 expected_revision、controller、resolution 和 evidence；原异常回执追加保留，不重置来源或 attempt。来源 exception 必须使用原生命周期恢复入口处理。
+
+计数、身份占用和状态 CAS 位于同一 SQLite 事务。相同绑定和重复 tick 幂等；run、评分记录、solver attempt 和 solver/reviewer SID 不能跨轮或跨计划重复计数。每轮计数以及后继启动前重验此前证明；原证据变化会停止接续。达到目标后完成，不准备第六轮；真实 `real_original_count` 只接受确认批次的原生角色、实际完整 run、匹配输入、有效原评和本地有效性证据。模拟计划只接受 test_fixture 角色，真实计数恒为 0。中性本地五轮测试不代表已产生五个真实成绩，也不证明共享源码可安全部署。
+

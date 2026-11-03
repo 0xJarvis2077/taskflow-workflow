@@ -135,6 +135,12 @@ def enqueue_spec(store: object, spec: dict, runtime: Path, *,
 
     work = dict(spec["work"])
     runner = dict(spec["runner"])
+    with store._db() as db:
+        has_rounds = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bounded_round_work'").fetchone()
+        if has_rounds:
+            from taskflow.execution_rounds import decorate_round_runner
+
+            runner = decorate_round_runner(db, work, runner)
     if work["intent_id"] != runner["intent_id"] or work["role"] != runner["role"]:
         raise TaskflowError("work and runner intent/role must match")
     if work["policy_id"] != runner["policy_version"]:
@@ -633,7 +639,17 @@ def _run_worker_claimed(store: object, attempt: dict | None, allow_model: bool,
                 else:
                     store.mark_uncertain(attempt["attempt_id"], "process started; startup identity unavailable")
 
-            result = run_attempt(runtime, on_process=on_process)
+            with store._db() as db:
+                reserved = db.execute("SELECT 1 FROM events WHERE kind='bounded_round_work_reserved' "
+                    "AND CASE WHEN json_valid(data) THEN json_extract(data,'$.work_id')=? ELSE 0 END",
+                    (attempt["work_id"],)).fetchone()
+            if reserved:
+                from taskflow.execution_rounds import round_launch_guard
+
+                result = run_attempt(runtime, on_process=on_process,
+                                     launch_guard=lambda: round_launch_guard(store, attempt))
+            else:
+                result = run_attempt(runtime, on_process=on_process)
             if not result.get("process_ended"):
                 return store.mark_uncertain(attempt["attempt_id"], "runner has no proved termination")
             return _receive_ended_result(store, attempt, result, mark_collecting=True, resume_pending=False)

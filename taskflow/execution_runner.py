@@ -4,6 +4,7 @@ The supervisor is copied at preparation and can run without importing the projec
 No business judgement, score threshold, or automatic model retry lives here.
 """
 
+from contextlib import nullcontext
 import hashlib
 import errno
 import json
@@ -765,26 +766,30 @@ def _worker(root: Path) -> None:
 
 
 def run_attempt(root: Path, fault: str | None = None,
-                on_process: Callable[[dict], None] | None = None) -> dict:
+                on_process: Callable[[dict], None] | None = None,
+                launch_guard: Callable | None = None) -> dict:
     """Persist intent before launch; an occupied intent is never relaunched."""
     root = Path(root).absolute()
     manifest = _validate(root, before_run=True)
-    _publish(root / "dispatch.json", {"intent_id": manifest["intent_id"], "at": _now(),
-                                      "manifest": _info(root / "manifest.json")})
-    if fault == "before_start":
-        return reconcile_attempt(root)
-    with (root / "supervisor-stdout.txt").open("xb") as stdout, (root / "supervisor-stderr.txt").open("xb") as stderr:
-        try:
-            process = subprocess.Popen([sys.executable, str(root / "worker.py"), "--worker", str(root)],
-                                       stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
-                                       start_new_session=True)
-        except OSError as error:
-            _publish(root / "termination.json", {"intent_id": manifest["intent_id"],
-                       "started_at": _now(), "ended_at": _now(), "returncode": None,
-                       "exception": {"type": type(error).__name__, "message": str(error)},
-                       "timed_out": False, "spawn_state": "not_started",
-                       "spawn_failure_origin": "supervisor_popen"})
+    if b"<taskflow_bounded_original_round_v1>" in _regular(root / "request.md") and launch_guard is None:
+        raise RunnerError("bounded round requires its guarded consumer launch")
+    with launch_guard() if launch_guard is not None else nullcontext():
+        _publish(root / "dispatch.json", {"intent_id": manifest["intent_id"], "at": _now(),
+                                          "manifest": _info(root / "manifest.json")})
+        if fault == "before_start":
             return reconcile_attempt(root)
+        with (root / "supervisor-stdout.txt").open("xb") as stdout, (root / "supervisor-stderr.txt").open("xb") as stderr:
+            try:
+                process = subprocess.Popen([sys.executable, str(root / "worker.py"), "--worker", str(root)],
+                                           stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                           start_new_session=True)
+            except OSError as error:
+                _publish(root / "termination.json", {"intent_id": manifest["intent_id"],
+                           "started_at": _now(), "ended_at": _now(), "returncode": None,
+                           "exception": {"type": type(error).__name__, "message": str(error)},
+                           "timed_out": False, "spawn_state": "not_started",
+                           "spawn_failure_origin": "supervisor_popen"})
+                return reconcile_attempt(root)
     if fault in {"after_start", "before_pid"}:
         _DETACHED[str(root)] = process
         return {"status": "uncertain", "automatic_retry": False}

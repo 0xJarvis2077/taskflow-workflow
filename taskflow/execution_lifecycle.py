@@ -18,7 +18,7 @@ from taskflow.execution_formal import _handoff_errors
 from taskflow.execution_store import ExecutionStore, validate_evidence
 
 
-KINDS = {"evaluation_tail_v1", "experiment_v1", "author_quality_v1", "teacher_successor_v1", "original_score_pause_v1", "baseline_quality_v1"}
+KINDS = {"evaluation_tail_v1", "experiment_v1", "author_quality_v1", "teacher_successor_v1", "original_score_pause_v1", "baseline_quality_v1", "bounded_original_rounds_v1"}
 
 
 def register_lifecycle(store: ExecutionStore, definition: dict, evidence: list[dict]) -> dict:
@@ -43,6 +43,10 @@ def register_lifecycle(store: ExecutionStore, definition: dict, evidence: list[d
     if packet.get("task_id") and packet["task_id"] != definition["task_id"]:
         raise TaskflowError("lifecycle task differs from business authority")
     store.get_policy(definition["policy_id"])
+    if definition["kind"] == "bounded_original_rounds_v1":
+        from taskflow.execution_rounds import register_round_plan
+
+        return register_round_plan(store, definition, refs)
     if definition["kind"] == "baseline_quality_v1":
         from taskflow.execution_baseline_quality import register_baseline_quality
 
@@ -2042,6 +2046,10 @@ def advance_lifecycle(store: ExecutionStore, identity: str) -> dict:
         if state["status"] in ("accepted", "exception"):
             return _receive(store, record)
         kind = record["definition"]["kind"]
+        if kind == "bounded_original_rounds_v1":
+            from taskflow.execution_rounds import advance_round_plan
+
+            return advance_round_plan(store, record)
         if kind == "baseline_quality_v1":
             from taskflow.execution_baseline_quality import advance_baseline_quality
 
@@ -2102,6 +2110,13 @@ def run_lifecycle(store: ExecutionStore, identity: str, *, allow_model: bool = F
         while True:
             record = advance_lifecycle(store, identity)
             state = record["state"]
+            bounded = record["definition"]["kind"] == "bounded_original_rounds_v1"
+            if bounded and state.get("mode") != "running":
+                return {**record, "execution": "bounded_rounds_" + state["mode"]}
+            if bounded and not state.get("current_work_id") and state.get("waiting") in {
+                    "next_business_binding_required", "observing_locked_first_original",
+                    "source_exception_requires_original_recovery", "existing_control_blocks_rounds"}:
+                return {**record, "execution": state["waiting"]}
             if state["status"] in ("accepted", "exception") and state.get("receipt"):
                 return record
             if (record["definition"]["kind"] == "teacher_successor_v1"
@@ -2128,7 +2143,15 @@ def run_lifecycle(store: ExecutionStore, identity: str, *, allow_model: bool = F
                     from taskflow.execution import run_worker
 
                     try:
-                        run_worker(store, "lifecycle-consumer", allow_model, [work["work_id"]])
+                        if bounded:
+                            from taskflow.execution_rounds import round_claim_scope
+
+                            with round_claim_scope(store, record, work["work_id"]):
+                                outcome = run_worker(store, "bounded-round-consumer", allow_model, [work["work_id"]])
+                            if outcome.get("state") == "waiting":
+                                return {**store.get_flow(identity), "execution": "bounded_round_claim_blocked"}
+                        else:
+                            run_worker(store, "lifecycle-consumer", allow_model, [work["work_id"]])
                     except (TaskflowError, OSError, ValueError) as exc:
                         latest = store.get_flow(identity)
                         failed = dict(latest["state"])
