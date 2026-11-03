@@ -96,7 +96,7 @@ def parser() -> argparse.ArgumentParser:
     batch_config.add_argument("--plan", type=Path, required=True)
     batch_config.add_argument("--infrastructure", type=Path, required=True)
     batch_config.add_argument("--output", type=Path, required=True)
-    for name in ("batch-author-start", "batch-experiment-start"):
+    for name in ("batch-author-start", "batch-experiment-start", "batch-baseline-quality-start"):
         start = commands.add_parser(name, help="new batch only: validate confirmed snapshot before store/preparation/dispatch")
         start.add_argument("--packet", type=Path, required=True)
         start.add_argument("--factory", type=Path, required=True)
@@ -798,7 +798,7 @@ def main(argv: list[str] | None = None) -> int:
             from taskflow.execution_store import ExecutionStore
 
             batch_policy = None
-            if args.operation in ("batch-author-start", "batch-experiment-start"):
+            if args.operation in ("batch-author-start", "batch-experiment-start", "batch-baseline-quality-start"):
                 from taskflow.execution_batch_factory import checked_batch_factory
 
                 _, batch_policy = checked_batch_factory(args.factory, args.packet)
@@ -848,6 +848,14 @@ def main(argv: list[str] | None = None) -> int:
                 from taskflow.execution_lifecycle import resume_path_transport
 
                 output = resume_path_transport(store, args.flow_id, read_json(args.record))
+            elif args.operation == "batch-baseline-quality-start":
+                from taskflow.execution_baseline_quality import start_baseline_quality_from_packet
+                from taskflow.execution_store import evidence_ref
+
+                output = start_baseline_quality_from_packet(store,
+                    packet_ref=evidence_ref(args.packet.resolve(), "explicit research-ended baseline quality purpose"),
+                    factory_config_ref=evidence_ref(args.factory.resolve(), "original confirmed quality infrastructure"),
+                    allow_model=args.allow_model)
             elif args.operation in ("experiment-start", "batch-experiment-start"):
                 from taskflow.execution_experiment_factory import start_experiments_from_packet
                 from taskflow.execution_store import evidence_ref

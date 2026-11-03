@@ -94,6 +94,12 @@ def _author_source(store: object, record: dict, packet: dict, *, require_candida
     definition = record["definition"]
     author_flow = store.get_flow(definition["source_author_flow_id"])
     author_definition, state = author_flow["definition"], author_flow["state"]
+    if packet.get("source_author_flow_kind") not in (None, author_definition.get("kind")):
+        raise TaskflowError("experiment source kind differs from its explicitly selected lifecycle")
+    if author_definition.get("kind") == "baseline_quality_v1":
+        from taskflow.execution_baseline_quality import baseline_experiment_source
+
+        return baseline_experiment_source(store, record, packet, require_candidate=require_candidate)
     if require_candidate and (state.get("status") != "accepted" or not state.get("receipt")
                               or state.get("pending_business_scope")
                               or state.get("result", {}).get("outcome") != "candidate_quality_accepted"):

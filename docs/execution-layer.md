@@ -233,6 +233,29 @@ python3 -m taskflow execution author-start --help
 
 作者必须实际交付`research.md`、`candidate-decision.md`、`handoff.md`、`handoff.json`和`issues.json`。候选目录是可选成果，研究结束不因此被判缺交。完成后先封完整原件，再按原签`handoff.json`分支：研究结束只归档并接收具体结论；业务选择未决只停该生命周期；完整候选经真实作者/完整来源绑定后才准备新的严格公开重建及独立整包质量、必要返修和复检。最终仅接收研究质量资产，不自动派发正式作答。相同packet重入复用原意图；修改packet、替换模板或不明尝试不能暗中变成第二次调用。
 
+### 调研结束后独立检查已捕获基线
+
+`research_ended` 仍是原作者生命周期的终态，不能改签为 `candidate_complete`。主控明确选择继续检查原作者输入的已捕获基线时，使用独立的 `baseline_quality_v1` 生命周期，复用本批工厂的模型、公开隔离准备器和质量角色；不补派作者，不沿用旧质量签名，不自动派正式作答。
+
+```sh
+python3 -m taskflow execution --db execution/BATCH.sqlite3 batch-baseline-quality-start --packet BASELINE-PURPOSE.json --factory /path/to/batch-author-factory.json
+python3 -m taskflow execution --db execution/BATCH.sqlite3 batch-baseline-quality-start --packet BASELINE-PURPOSE.json --factory /path/to/batch-author-factory.json --allow-model
+```
+
+第一条只登记，不准备公开运行、不入队模型。带 `--allow-model` 才沿同一生命周期运行原有消费者。命令先核完整批次确认、策略登记、packet 批次和任务范围，再访问执行库。工厂必须是原批同一策略及完整角色模板；模型槽位缺失时拒绝登记。
+
+新用途包要求 `schema_version: 1`、`kind: explicit_research_ended_baseline_quality_v1`、原 `controller`、`batch_id`、`no_new_author: true`、`scope: fresh_public_then_whole_quality`、`formal_experiment: separate_after_quality`，且 `items` 恰好一项。该项包含：
+
+- `task_id`、`source_author_quality_flow`：确切原作者生命周期。
+- `source_definition_digest`、`source_author_attempt`、`source_author_sid`：原定义摘要及实际完成身份。
+- `baseline_binding`：已捕获基线的 `candidate_id`、`task_id`、`content_digest`、`input_digest`、`evaluation_digest`。
+- `source_terminal_receipt: REF`：原 `research_ended` 终态回执的真实路径、SHA 和位置说明。
+- `purpose`：本次独立基线质量检查的具体业务用途。
+
+入口重核已封原作者、同批绑定、原回执与 handoff、声明和基线字节。每个原作者终态在同库只能登记一个稳定后继身份；相同包重入复用当前记录，修改用途或换绑定会被拒绝。每次推进再核来源；原回执及新用途也作为执行器的宿主侧锁定依赖，漂移不能变成新调用。公开重建及质量模型输入仍按原隔离边界构造，不把这些宿主依赖当作模型材料。旧基线报告不代表新质量；质量必须接收新的公开原件，且独立签署者不得复用原调研作者或公开重建 SID。未决、失败或不明尝试保留原记录并停止，不自动重派。现有仅针对作者交付的技术恢复入口不用于该基线分支；发生异常须按具体来源补充验证。
+
+验收后的结果明确标记 `basis_kind: existing_captured_baseline` 和 `candidate_created_by_source_author: false`，保留原调研来源。后续实验仍须新的具体业务实验包，通过原 `batch-experiment-start` 工厂。兼容字段 `source_author_quality_flow` 此时选择新的基线质量生命周期，并必须追加 `source_author_flow_kind: baseline_quality_v1` 和原 `source_baseline_binding`；`source_author_attempt/intent/sid` 仍如实指向原调研作者，`source_business_packet` 及 SHA 指向新基线用途包。正式入口核验实际质量子流程、公开前驱和当前签名；原生质量证书同时携带原调研证据，离线验签也核其来源，不把原作者终态改写为候选交付。
+
 ### 原评接收后的明确教师后继
 
 `teacher-successor-start` 消费主控明确选择的有界后继包，连接已接收的原卷／事实／评分与唯一下一研究作者。包使用 `schema_version: 1`、`kind: explicit_bounded_post_original_teacher_business_successors`、`owner`、`batch_scope`、`author_factory: REF` 及非空 `items`。每项绑定 `predecessor_run`、`predecessor_receipt: REF`、`registered_original: REF`、`author_intent` 和 `author_packet: REF`。原分如有提供，仅用于核对原件，不触发作者或改题规则。

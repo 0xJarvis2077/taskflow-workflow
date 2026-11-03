@@ -799,10 +799,21 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
     item = next(row for row in authority["items"] if all(row.get(key) == value for key, value in selector.items()))
     parent = store.get_flow(source_flow_id)
     definition, state = parent["definition"], parent["state"]
+    if item.get("source_author_flow_kind") not in (None, definition.get("kind")):
+        raise TaskflowError("native authority source kind differs from the selected lifecycle")
     result = state.get("result", {})
     source_author = store.get_attempt(item["source_author_attempt"])
     author_binding = definition.get("source_author_binding", {})
-    if (definition.get("kind") != "author_quality_v1" or definition.get("task_id") != candidate["task_id"]
+    baseline_witness = None
+    if definition.get("kind") == "baseline_quality_v1":
+        from taskflow.execution_baseline_quality import baseline_experiment_source
+
+        bound = baseline_experiment_source(store, {"definition": {
+            "source_author_flow_id": source_flow_id, "task_id": candidate["task_id"],
+            "owner": authority["controller"], "policy_id": definition["policy_id"]}, "state": {}},
+            item, require_candidate=True)
+        baseline_witness = bound["binding"]["baseline_source"]
+    if (definition.get("kind") not in {"author_quality_v1", "baseline_quality_v1"} or definition.get("task_id") != candidate["task_id"]
             or definition.get("owner") != authority["controller"] or state.get("status") != "accepted"
             or state.get("pending_business_scope")
             or result.get("outcome") != "candidate_quality_accepted" or result.get("candidate_id") != candidate_id
@@ -929,6 +940,9 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
     certification = {"parent_flow_id": source_flow_id, "child_flow_id": child["flow_id"],
                      "child_receipt": _ref(receipt_path), "accepted_review_id": accepted["review_id"],
                      "fresh": fresh["certification"]}
+    if baseline_witness is not None:
+        certification["baseline_source"] = baseline_witness
+        protocol["native_signoff"]["baseline_source"] = baseline_witness
     if packet_witness is not None:
         certification["author_packet_transport"] = packet_witness
     if whole:
@@ -1071,6 +1085,19 @@ def validate_normative_certification(*, candidate: dict, certification: dict,
         raise TaskflowError("normative certification has no completed actual same-candidate source/trace")
     item = next(row for row in authority["items"] if isinstance(row, dict)
                 and all(row.get(key) == value for key, value in expected_item.items()))
+    if item.get("source_author_flow_kind") == "baseline_quality_v1":
+        from taskflow.execution_baseline_quality import baseline_flow_id, validate_frozen_baseline_source
+
+        proof = native["certification"].get("baseline_source")
+        if (protocol.get("native_signoff", {}).get("baseline_source") != proof
+                or item.get("source_baseline_binding") != (proof or {}).get("baseline_binding")
+                or item.get("source_author_attempt") != (proof or {}).get("source_author_attempt")
+                or item.get("source_author_sid") != (proof or {}).get("source_author_sid")
+                or flow_id != baseline_flow_id((proof or {}).get("source_flow_id", ""))):
+            raise TaskflowError("baseline normative source lacks its original research-ended provenance")
+        validate_frozen_baseline_source(proof)
+    elif native["certification"].get("baseline_source") is not None:
+        raise TaskflowError("baseline source proof requires its explicit typed authority")
     if sid == item.get("source_author_sid") or sid in candidate.get("external_author_sids", []):
         raise TaskflowError("normative source reused a captured author identity")
     identity = validate_id(fresh["attempt_id"], "native source attempt ID")

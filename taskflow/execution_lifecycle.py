@@ -18,7 +18,7 @@ from taskflow.execution_formal import _handoff_errors
 from taskflow.execution_store import ExecutionStore, validate_evidence
 
 
-KINDS = {"evaluation_tail_v1", "experiment_v1", "author_quality_v1", "teacher_successor_v1", "original_score_pause_v1"}
+KINDS = {"evaluation_tail_v1", "experiment_v1", "author_quality_v1", "teacher_successor_v1", "original_score_pause_v1", "baseline_quality_v1"}
 
 
 def register_lifecycle(store: ExecutionStore, definition: dict, evidence: list[dict]) -> dict:
@@ -43,6 +43,10 @@ def register_lifecycle(store: ExecutionStore, definition: dict, evidence: list[d
     if packet.get("task_id") and packet["task_id"] != definition["task_id"]:
         raise TaskflowError("lifecycle task differs from business authority")
     store.get_policy(definition["policy_id"])
+    if definition["kind"] == "baseline_quality_v1":
+        from taskflow.execution_baseline_quality import register_baseline_quality
+
+        return register_baseline_quality(store, definition, refs)
     if definition["kind"] == "original_score_pause_v1":
         from taskflow.execution_original_pause import validate_original_pause_definition
 
@@ -2038,6 +2042,10 @@ def advance_lifecycle(store: ExecutionStore, identity: str) -> dict:
         if state["status"] in ("accepted", "exception"):
             return _receive(store, record)
         kind = record["definition"]["kind"]
+        if kind == "baseline_quality_v1":
+            from taskflow.execution_baseline_quality import advance_baseline_quality
+
+            return advance_baseline_quality(store, record)
         if kind == "original_score_pause_v1":
             from taskflow.execution_original_pause import advance_original_score_pause
 

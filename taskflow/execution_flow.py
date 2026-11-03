@@ -86,6 +86,10 @@ def register_workflow(store: ExecutionStore, definition: dict, evidence: list[di
     roles = definition.get("roles")
     if not isinstance(initial, dict) or not isinstance(roles, dict):
         raise TaskflowError("workflow initial and roles objects required")
+    excluded = initial.get("excluded_review_sids", [])
+    if (not isinstance(excluded, list) or any(not isinstance(sid, str) or not sid for sid in excluded)
+            or len(excluded) != len(set(excluded))):
+        raise TaskflowError("excluded_review_sids requires unique nonempty identity strings")
     if not initial.get("candidate_root") or not initial.get("candidate_id"):
         raise TaskflowError("workflow initial source and stable candidate identity required")
     if not Path(definition.get("directory", "")).is_absolute() or not definition.get("accepted_use"):
@@ -884,6 +888,7 @@ def _consume_review(store: ExecutionStore, record: dict, attempt: dict, archive:
     definition, state = record["definition"], dict(record["state"])
     prior_sids = {item.get("cli_sid") for item in state["history"]
                   if item.get("kind") in ("adopted_predecessor", "public_reconstruction")}
+    prior_sids.update(definition.get("initial", {}).get("excluded_review_sids", []))
     if attempt.get("cli_sid") and attempt["cli_sid"] in prior_sids:
         raise TaskflowError("independent quality reused a public predecessor CLI identity")
     role = definition["roles"][state["stage"]]

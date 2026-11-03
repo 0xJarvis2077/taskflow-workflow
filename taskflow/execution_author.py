@@ -657,6 +657,12 @@ def _roles(store: object, definition: dict) -> dict:
                     {"path": "{{public_archive}}/observed-trace.jsonl", "kind": "trace", "target": "actual-public-trace.jsonl"}]
             runner["request_sections"] = [{"kind": "operation", "text": operation + "\n\n" + INFORMED_PUBLIC_MATERIAL_GUIDANCE}]
         roles[name] = role
+        if definition.get("kind") == "baseline_quality_v1":
+            # These are host-side immutable dependencies, never model inputs.
+            refs = definition["baseline_source"]["evidence"]
+            dependencies = list(runner.get("dependencies", []))
+            runner["dependencies"] = list(dict.fromkeys([*dependencies,
+                definition["authorization"]["path"], *[ref["path"] for ref in refs]]))
     return roles
 
 
@@ -787,6 +793,15 @@ def advance_author(store: object, record: dict) -> dict:
             raise TaskflowError("registered author candidate differs from actual optional delivery")
         state.update(candidate_id=candidate_id, candidate_root=str(root), stage="public_prepare", waiting=None)
         return _save(store, record, state, "author_actual_candidate_bound")
+    return advance_candidate_quality(store, record, author)
+
+
+def advance_candidate_quality(store: object, record: dict, author: dict) -> dict:
+    """Follow an already bound candidate through the existing public/quality chain."""
+    from taskflow.execution_completion import reconcile_ended_attempt
+
+    definition, state = record["definition"], dict(record["state"])
+
     candidate = store.get_candidate(state["candidate_id"])
     if state["stage"] == "public_prepare":
         role = _roles(store, definition)["public_rebuild"]
@@ -855,6 +870,8 @@ def advance_author(store: object, record: dict) -> dict:
                                         "predecessor_attempt": public["attempt_id"],
                                         "predecessor_binding": {key: public[key] for key in ("work_id", "intent_id", "candidate_id", "task_id")}},
                             "roles": _roles(store, definition)}
+        if definition.get("kind") == "baseline_quality_v1":
+            definition_child["initial"]["excluded_review_sids"] = [author["cli_sid"]]
         refs = [*record["evidence"], evidence_ref(Path(state["public_archive"]) / "archive-binding.json", "actual fresh public original")]
         _publish_once(Path(definition["directory"]) / "quality-definition.json", {"definition": definition_child, "evidence": refs})
         child = register_workflow(store, definition_child, refs)
@@ -877,4 +894,8 @@ def advance_author(store: object, record: dict) -> dict:
                              "candidate_id": child["state"]["candidate_id"], "candidate_root": child["state"]["candidate_root"],
                              "child_flow_id": child_id, "child_receipt": child["state"]["receipt"],
                              "accepted_review_id": child["state"]["accepted_review_id"]})
+        if definition.get("kind") == "baseline_quality_v1":
+            state["result"].update(basis_kind="existing_captured_baseline",
+                candidate_created_by_source_author=False,
+                research_ended_source_flow_id=definition["source_research_flow_id"])
     return _save(store, record, state, "author_child_quality_progress")
