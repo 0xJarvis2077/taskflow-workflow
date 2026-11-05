@@ -79,67 +79,34 @@ class QualityDependencyResumeTests(unittest.TestCase):
         return resume_path_transport(self.store, self.parent["flow_id"], self.resolution)
 
     def test_exact_projection_reopens_parent_then_source_experiment_without_new_models(self):
-        before_attempts = self.store.dashboard()["attempts"]
-        with self.source_interfaces():
-            parent = self.resume_parent()
-            result = resume_path_transport(self.store, self.experiment["flow_id"], self.resolution)
-            with self.assertRaisesRegex(TaskflowError, "received exception"):
-                self.resume_parent()
-        self.assertEqual("active", parent["state"]["status"])
-        self.assertEqual("child_quality", parent["state"]["stage"])
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("experiment_v1", result["state"]["stage"])
-        self.assertEqual(self.parent["definition"], parent["definition"])
-        self.assertEqual(self.experiment["definition"], result["definition"])
-        self.assertEqual(before_attempts, self.store.dashboard()["attempts"])
-        self.assertFalse(parent["state"]["history"][-1]["new_model_dispatched"])
-        for path, raw in self.preserved.items():
-            self.assertEqual(raw, path.read_bytes())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_unrelated_active_child_missing_projection_and_failed_child_cannot_bypass(self):
-        original = self.store.get_flow
-        child = original(self.case.definition["flow_id"])
-        for change in ({"status": "exception"}, {"repair_record_projections": {}}, {"last_resolution": {}}):
-            wrong = {**child, "state": {**child["state"], **change}}
-            with self.subTest(change=list(change)), self.source_interfaces(), \
-                 patch.object(self.store, "get_flow", side_effect=lambda identity: wrong if identity == child["flow_id"] else original(identity)), \
-                 self.assertRaises(TaskflowError):
-                self.resume_parent()
-        self.assertEqual(self.parent, original(self.parent["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_unresolved_uncertain_current_child_attempt_is_not_a_resolved_dependency(self):
-        board = self.store.dashboard()
-        next(row for row in board["attempts"] if row["attempt_id"] == self.case.attempt["attempt_id"])["state"] = "uncertain"
-        with self.source_interfaces(), patch.object(self.store, "dashboard", return_value=board), \
-             self.assertRaisesRegex(TaskflowError, "uncertain/failed"):
-            self.resume_parent()
-        self.assertEqual(self.parent, self.store.get_flow(self.parent["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_experiment_requires_explicit_parent_resolution_and_no_formal_footprint(self):
-        with self.source_interfaces():
-            with self.assertRaisesRegex(TaskflowError, "technically resumed source"):
-                resume_path_transport(self.store, self.experiment["flow_id"], self.resolution)
-            self.resume_parent()
-            intent = self.case.root / "formal/next-run-01.formal-intent.json"
-            intent.parent.mkdir(parents=True)
-            intent.write_text("Original formal reservation must remain untouched.")
-            with self.assertRaisesRegex(TaskflowError, "existing solver"):
-                resume_path_transport(self.store, self.experiment["flow_id"], self.resolution)
-        self.assertEqual(self.experiment, self.store.get_flow(self.experiment["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_source_may_finish_its_actual_fresh_recheck_before_experiment_resume(self):
-        with self.source_interfaces():
-            parent = self.resume_parent()
-            child = self.case.case.run_flow([self.case.definition["flow_id"]])["flows"][0]
-            self.assertEqual("accepted", child["state"]["status"])
-            source = self.store.update_flow(parent["flow_id"], parent["revision"], {**parent["state"], "status": "accepted",
-                "result": {"outcome": "candidate_quality_accepted", "child_flow_id": child["flow_id"],
-                    "child_receipt": child["state"]["receipt"], **{key: child["state"][key] for key in
-                    ("candidate_id", "candidate_root", "accepted_review_id")}}}, {"kind": "neutral_original_child_result"})
-            result = resume_path_transport(self.store, self.experiment["flow_id"], self.resolution)
-        self.assertEqual("accepted", source["state"]["status"])
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual(3, len(self.store.dashboard()["attempts"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

@@ -32,8 +32,6 @@ def parser() -> argparse.ArgumentParser:
     apply = commands.add_parser("apply", help="validate and append a typed command record")
     apply.description = "Allowed record operations: " + ", ".join(sorted(OPERATIONS))
     apply.add_argument("--record", type=Path, required=True)
-    controller_finding = commands.add_parser("controller-finding-reopen", help="receive an authorized public finding at an accepted idle source; no model")
-    controller_finding.add_argument("--record", type=Path, required=True)
     enqueue = commands.add_parser("enqueue", help="lock runner request and enqueue one intent")
     enqueue.add_argument("--spec", type=Path, required=True)
     enqueue.add_argument("--runtime", type=Path, required=True)
@@ -54,39 +52,61 @@ def parser() -> argparse.ArgumentParser:
                         help="required to execute a non-fixture prepared request")
     worker.add_argument("--work-id", action="append",
                         help="claim only these exact work IDs; repeat for a whitelist")
-    flows = commands.add_parser("flow-register", help="register preauthorized quality/repair loops once")
-    flows.add_argument("--spec", type=Path, required=True)
-    consume = commands.add_parser("flow-run", help="advance registered loops through existing workers")
-    consume.add_argument("--flow-id", action="append")
-    consume.add_argument("--allow-model", action="store_true")
-    resume = commands.add_parser("flow-resume", help="append an evidenced technical resolution; never retry a model")
-    resume.add_argument("--flow-id", action="append", required=True)
-    resume.add_argument("--record", type=Path, required=True,
-                        help="JSON object with reason and evidence references for this resolution")
-    repair_capacity = commands.add_parser("flow-repair-capacity-prepare", help="prepare a bounded, initially paused repair capacity continuation")
-    repair_capacity.add_argument("--parent-flow-id", required=True)
-    repair_capacity.add_argument("--flow-id", required=True)
-    repair_capacity.add_argument("--record", type=Path, required=True)
-    lifecycle = commands.add_parser("lifecycle-register", help="register one explicitly authorized complete handoff")
-    lifecycle.add_argument("--spec", type=Path, required=True)
-    lifecycle_run = commands.add_parser("lifecycle-run", help="consume one exact registered complete handoff")
-    lifecycle_run.add_argument("--flow-id", required=True)
-    lifecycle_run.add_argument("--allow-model", action="store_true")
-    lifecycle_resume = commands.add_parser("lifecycle-resume", help="resume verified preparation, resolved dependency or validated intake; never retry a model")
-    lifecycle_resume.add_argument("--flow-id", required=True)
-    lifecycle_resume.add_argument("--record", type=Path, required=True)
-    experiment_start = commands.add_parser("experiment-start", help="historical explicit-factory compatibility; new batches use batch-experiment-start")
-    experiment_start.add_argument("--packet", type=Path, required=True)
-    experiment_start.add_argument("--factory", type=Path, required=True, help="explicit original historical factory; never inferred")
-    experiment_start.add_argument("--allow-model", action="store_true")
-    author_start = commands.add_parser("author-start", help="historical explicit-factory compatibility; new batches use batch-author-start")
-    author_start.add_argument("--packet", type=Path, required=True)
-    author_start.add_argument("--factory", type=Path, required=True, help="explicit original historical factory; never inferred")
-    author_start.add_argument("--allow-model", action="store_true")
-    teacher_start = commands.add_parser("teacher-successor-start", help="bind explicit accepted-original teacher successors once through the existing author factory")
-    teacher_start.add_argument("--packet", type=Path, required=True)
-    teacher_start.add_argument("--directory", type=Path, required=True, help="separate receipt directory for these once-only links")
-    teacher_start.add_argument("--allow-model", action="store_true")
+    revision = commands.add_parser("revision", help="revise an independent copy of a frozen parent; no automatic successors")
+    revision_commands = revision.add_subparsers(dest="revision_action", required=True)
+    revision_submit = revision_commands.add_parser("submit", help="register a concrete revision; no model")
+    revision_submit.add_argument("--spec", type=Path, required=True)
+    for action in ("prepare", "collect", "status", "run"):
+        command = revision_commands.add_parser(action)
+        command.add_argument("revision_id")
+        receipt_view = command.add_mutually_exclusive_group()
+        receipt_view.add_argument("--brief", action="store_true", help="short model-facing receipt; complete machine record remains available")
+        receipt_view.add_argument("--full", action="store_true", help="expand the stored record; output view only, execution authorization unchanged")
+        if action == "run":
+            command.add_argument("--allow-model", action="store_true")
+    quality = commands.add_parser("quality", help="run an explicit independent quality task without a business workflow loop")
+    quality_commands = quality.add_subparsers(dest="quality_action", required=True)
+    submit_quality = quality_commands.add_parser("submit", help="register one role task; no model")
+    submit_quality.add_argument("--spec", type=Path, required=True)
+    for action in ("prepare", "collect", "status", "correct", "run"):
+        command = quality_commands.add_parser(action)
+        command.add_argument("quality_id")
+        receipt_view = command.add_mutually_exclusive_group()
+        receipt_view.add_argument("--brief", action="store_true", help="short model-facing receipt; complete machine record remains available")
+        receipt_view.add_argument("--full", action="store_true", help="expand the stored record; output view only, execution authorization unchanged")
+        if action == "correct":
+            command.add_argument("--record", type=Path, required=True,
+                                 help="evidence for one bounded same-reviewer delivery correction")
+        if action == "run":
+            command.add_argument("--allow-model", action="store_true")
+    solver = commands.add_parser("solver", help="execute one explicit public-only formal task")
+    solver_commands = solver.add_subparsers(dest="solver_action", required=True)
+    solver_submit = solver_commands.add_parser("submit")
+    solver_submit.add_argument("--spec", type=Path, required=True)
+    for action in ("prepare", "collect", "status", "run"):
+        command = solver_commands.add_parser(action)
+        command.add_argument("solver_id")
+        receipt_view = command.add_mutually_exclusive_group()
+        receipt_view.add_argument("--brief", action="store_true", help="short model-facing receipt; complete machine record remains available")
+        receipt_view.add_argument("--full", action="store_true", help="expand the stored record; output view only, execution authorization unchanged")
+        if action == "run":
+            command.add_argument("--allow-model", action="store_true")
+    review = commands.add_parser("review", help="explicit facts, seal and same-reviewer score tasks")
+    review_commands = review.add_subparsers(dest="review_action", required=True)
+    review_submit = review_commands.add_parser("submit")
+    review_submit.add_argument("--spec", type=Path, required=True)
+    for action in ("prepare", "collect", "status", "seal", "correct", "run"):
+        command = review_commands.add_parser(action)
+        command.add_argument("review_id")
+        receipt_view = command.add_mutually_exclusive_group()
+        receipt_view.add_argument("--brief", action="store_true", help="short model-facing receipt; complete machine record remains available")
+        receipt_view.add_argument("--full", action="store_true", help="expand the stored record; output view only, execution authorization unchanged")
+        if action in ("prepare", "collect", "correct", "run"):
+            command.add_argument("--stage", required=True, choices=("facts", "score"))
+        if action == "correct":
+            command.add_argument("--record", type=Path, required=True)
+        if action == "run":
+            command.add_argument("--allow-model", action="store_true")
     batch_check = commands.add_parser("batch-check", help="read-only new batch model/scope/binding check; no database or model")
     batch_check.add_argument("--plan", type=Path, required=True)
     batch_freeze = commands.add_parser("batch-freeze", help="freeze confirmed choices and evidence without a database or model")
@@ -96,14 +116,6 @@ def parser() -> argparse.ArgumentParser:
     batch_config.add_argument("--plan", type=Path, required=True)
     batch_config.add_argument("--infrastructure", type=Path, required=True)
     batch_config.add_argument("--output", type=Path, required=True)
-    for name in ("batch-author-start", "batch-experiment-start", "batch-baseline-quality-start"):
-        start = commands.add_parser(name, help="new batch only: validate confirmed snapshot before store/preparation/dispatch")
-        start.add_argument("--packet", type=Path, required=True)
-        start.add_argument("--factory", type=Path, required=True)
-        start.add_argument("--allow-model", action="store_true")
-        if name == "batch-author-start":
-            start.add_argument("--retry-failed-native-probe-sha256", action="append", metavar="SHA256",
-                               help="authorize one zero-model retry for the exact set of failed native reports")
     reconcile = commands.add_parser("reconcile", help="collect evidence; never relaunch a model")
     reconcile.add_argument("attempt_id")
     status = commands.add_parser("status", help="derive dashboard from database evidence")
@@ -121,6 +133,12 @@ def apply_record(store: object, record: dict) -> dict:
     arguments = record.get("arguments")
     if operation not in OPERATIONS or not isinstance(arguments, dict):
         raise TaskflowError("command needs an allowed operation and arguments object")
+    if operation == "record_decision":
+        from taskflow.execution_iteration import validate_intake
+
+        # Current coordinator writes use the intake contract. Legacy records
+        # remain readable; internal historical fixtures do not become dispatch.
+        validate_intake(arguments.get("intake"), action=arguments.get("action"))
     method = getattr(store, operation, None)
     if method is None:
         raise TaskflowError(f"operation is not implemented: {operation}")
@@ -131,7 +149,7 @@ def apply_record(store: object, record: dict) -> dict:
 def enqueue_spec(store: object, spec: dict, runtime: Path, *,
                  resume_prepared: bool = False, probe_native: bool = False,
                  retry_failed_probes: list[str] | None = None) -> dict:
-    from taskflow.execution_runner import _regular, _validate, prepare_attempt, probe_native_attempt
+    from taskflow.execution_runner import _regular, _validate, probe_native_attempt
 
     work = dict(spec["work"])
     runner = dict(spec["runner"])
@@ -152,6 +170,7 @@ def enqueue_spec(store: object, spec: dict, runtime: Path, *,
     slot = work.get("model_slot")
     if runner.get("model_slot") != slot:
         raise TaskflowError("work and runner logical model slot must match")
+    _check_public_rebuild_carrier(work, runner)
     setting = policy_setting(policy["config"], work["role"], slot, work["task_id"])
     batch = make_batch_binding(policy, work["role"], slot, work["task_id"])
     if batch is not None:
@@ -191,14 +210,13 @@ def enqueue_spec(store: object, spec: dict, runtime: Path, *,
         if projection_input and projection_input["path"] not in present:
             inputs.append(projection_input)
         runner["inputs"] = inputs
-    if runtime.exists() and resume_prepared:
-        manifest = _validate(runtime)
-        if manifest.get("preparation_config_digest") != sha256(canonical(runner)):
-            raise TaskflowError("prepared runtime belongs to a different continuation configuration")
-    else:
-        manifest = prepare_attempt(runtime, runner)
+    from taskflow.execution_preparation import prepare_or_resume
+
+    manifest = prepare_or_resume(store, work, runner, runtime, resume_prepared=resume_prepared)
     _check_work_binding(work, candidate, manifest)
-    if probe_native and manifest["mode"] == "native_role":
+    if probe_native and manifest["mode"] == "native_role" and manifest.get("text_only_delivery"):
+        _validate(runtime, before_run=True)
+    if probe_native and manifest["mode"] == "native_role" and not manifest.get("text_only_delivery"):
         if not (runtime / "native-probe-ready.json").exists():
             reports = sorted(sha256(_regular(path)) for path in runtime.glob("native-probe-*.json"))
             if reports and reports != retry_failed_probes:
@@ -220,6 +238,64 @@ def _scoring_sources(candidate: dict, runner: dict) -> tuple[list[dict], dict | 
     private = [item for item in candidate.get("files", []) if item["role"] not in PUBLIC_ROLES]
     selection = runner.get("scoring_source_allowlist")
     projection = runner.get("scoring_projection")
+    binding = runner.get("run_binding")
+    if binding is not None:
+        if (not isinstance(binding, dict) or set(binding) != {"source", "teacher_inputs"}
+                or runner.get("scoring_source_allowlist") is not None
+                or runner.get("scoring_projection") is not None):
+            raise TaskflowError("explicit review run cannot use legacy scoring projections")
+        rows = binding["teacher_inputs"]
+        if not isinstance(rows, list) or not rows:
+            raise TaskflowError("explicit score requires its exact frozen standards")
+        reference = binding["source"]
+        raw_binding = _regular(Path(reference["path"]))
+        if (sha256(raw_binding) != reference["sha256"]
+                or ("size" in reference and len(raw_binding) != reference["size"])):
+            raise TaskflowError("explicit review source binding changed")
+        source_binding = json.loads(raw_binding)
+        scoring = source_binding.get("scoring_projection")
+        declaration_ref = source_binding.get("scoring_declaration")
+        declarations = [item for item in candidate["evidence"] if item.get("location") == "explicit package declaration"]
+        if (not isinstance(scoring, dict) or scoring.get("target") != "normative/task-scoring.json"
+                or not isinstance(declaration_ref, dict) or len(declarations) != 1
+                or any(declaration_ref.get(key) != declarations[0][key] for key in ("path", "sha256"))):
+            raise TaskflowError("explicit scoring rules require their exact candidate declaration")
+        declaration_raw = _regular(Path(declaration_ref["path"]))
+        projected_raw = _regular(Path(scoring["path"]))
+        declaration = json.loads(declaration_raw)
+        if (sha256(declaration_raw) != declaration_ref["sha256"]
+                or declaration.get("task_id") != candidate["task_id"]
+                or _info(Path(scoring["path"])) != {key: scoring[key] for key in ("sha256", "size")}
+                or canonical(json.loads(projected_raw)) != canonical(declaration["scoring"])):
+            raise TaskflowError("explicit scoring rules differ from the complete frozen task.scoring")
+        by_name = {item["package_path"]: item for item in private}
+        names, paths, chosen = set(), set(), []
+        for row in rows:
+            if (not isinstance(row, dict) or set(row) != {"path", "target", "kind", "sha256", "size"}
+                    or row["kind"] != "teacher" or row["target"] in names or row["path"] in paths):
+                raise TaskflowError("explicit score standards require unique exact teacher references")
+            name = relative_path(row["target"])
+            if name == "normative/task-scoring.json":
+                if row != scoring:
+                    raise TaskflowError("explicit scoring projection input differs from its source binding")
+                names.add(name)
+                paths.add(row["path"])
+                continue
+            item = by_name.get(name)
+            if item is None or item["path"] != row["path"]:
+                raise TaskflowError("explicit score standard is not a current private candidate source")
+            observed = _info(Path(item["path"]))
+            if (observed != {key: row[key] for key in ("sha256", "size")}
+                    or observed["sha256"] != item["sha256"]):
+                raise TaskflowError("explicit score standard bytes changed after freezing")
+            names.add(name)
+            paths.add(row["path"])
+            chosen.append(item)
+        if not {"answer", "rubric"} <= {item["role"] for item in chosen}:
+            raise TaskflowError("explicit score standards require actual answer and rubric sources")
+        if "normative/task-scoring.json" not in names:
+            raise TaskflowError("explicit score is missing its complete frozen scoring rules")
+        return chosen, scoring
     if selection is None:
         if projection is not None:
             raise TaskflowError("scoring projection requires an explicit normative allowlist")
@@ -261,7 +337,15 @@ def _scoring_sources(candidate: dict, runner: dict) -> tuple[list[dict], dict | 
     return chosen, {"path": projection["path"], "kind": "teacher", "target": projection["target"]}
 
 
+def _check_public_rebuild_carrier(work: dict, runner: dict) -> None:
+    if (work.get("model_slot") == "public_rebuild" and runner.get("mode", "native_role") != "test_fixture"
+            and (runner.get("mode") != "existing_isolated"
+                 or runner.get("isolated", {}).get("flavor", "quality") != "quality")):
+        raise TaskflowError("public reconstruction requires its existing public-only isolated adapter; native quality includes teacher inputs")
+
+
 def _check_work_binding(work: dict, candidate: dict, manifest: dict) -> None:
+    _check_public_rebuild_carrier(work, manifest)
     if (manifest["intent_id"] != work["intent_id"] or manifest["role"] != work["role"]
             or manifest["policy_version"] != work["policy_id"]):
         raise TaskflowError("runtime intent/role/policy differs from the work item")
@@ -306,7 +390,7 @@ def _check_work_binding(work: dict, candidate: dict, manifest: dict) -> None:
             teachers = {(item["source"], item["sha256"]) for item in manifest["inputs"] if item["kind"] == "teacher"}
             expected = {(item["path"], item["sha256"]) for item in private}
             if projected:
-                expected.add((projected["path"], manifest["scoring_projection"]["sha256"]))
+                expected.add((projected["path"], projected.get("sha256") or manifest["scoring_projection"]["sha256"]))
             if not expected <= teachers:
                 raise TaskflowError("quality/scoring review lacks current candidate reference/rubric bytes")
             if teachers != expected:
@@ -605,6 +689,10 @@ def _run_worker_claimed(store: object, attempt: dict | None, allow_model: bool,
                 raise TaskflowError("non-fixture execution requires --allow-model")
             policy = store.get_policy(attempt["policy_id"])
             _check_work_binding(attempt, store.get_candidate(attempt["candidate_id"]), manifest)
+            if manifest.get("quality_session") is not None:
+                from taskflow.execution_quality_reading import validate_dispatch
+
+                validate_dispatch(store, attempt, manifest)
             from taskflow.execution_batch import policy_setting
             from taskflow.execution_batch_binding import validate_batch_source
 
@@ -813,94 +901,90 @@ def main(argv: list[str] | None = None) -> int:
         else:
             from taskflow.execution_store import ExecutionStore
 
-            batch_policy = None
-            if args.operation in ("batch-author-start", "batch-experiment-start", "batch-baseline-quality-start"):
-                from taskflow.execution_batch_factory import checked_batch_factory
-
-                _, batch_policy = checked_batch_factory(args.factory, args.packet)
             store = ExecutionStore(args.db)
-            if batch_policy is not None:
-                store.register_policy(batch_policy["policy_id"], batch_policy["config"])
             if args.operation == "apply":
                 output = apply_record(store, read_json(args.record))
-            elif args.operation == "controller-finding-reopen":
-                from taskflow.execution_controller_finding import reopen_controller_public_finding
-
-                output = reopen_controller_public_finding(store, **read_json(args.record))
             elif args.operation == "enqueue":
                 output = enqueue_spec(store, read_json(args.spec), args.runtime)
             elif args.operation == "worker":
                 output = run_worker(store, args.worker_id, args.allow_model, args.work_id)
-            elif args.operation == "flow-register":
-                from taskflow.execution_flow import register_workflow
+            elif args.operation == "revision":
+                from taskflow.execution_revision import (
+                    collect_revision_task, prepare_revision_task, register_revision_task,
+                    run_revision_task, status_revision_task,
+                )
+                if args.revision_action == "submit":
+                    document = read_json(args.spec)
+                    output = register_revision_task(store, document["definition"], document["evidence"])
+                elif args.revision_action == "prepare":
+                    output = prepare_revision_task(store, args.revision_id)
+                elif args.revision_action == "collect":
+                    output = collect_revision_task(store, args.revision_id)
+                elif args.revision_action == "run":
+                    output = run_revision_task(store, args.revision_id, allow_model=args.allow_model)
+                else:
+                    output = status_revision_task(store, args.revision_id)
+            elif args.operation == "quality":
+                from taskflow.execution_quality import (
+                    collect_quality_task, correct_quality_task, prepare_quality_task,
+                    register_quality_task, run_quality_task,
+                )
 
-                document = read_json(args.spec)
-                output = {"flows": [register_workflow(store, item["definition"], item["evidence"])
-                                    for item in document["workflows"]]}
-            elif args.operation == "flow-run":
-                from taskflow.execution_flow import run_workflows
-
-                output = run_workflows(store, args.flow_id, allow_model=args.allow_model)
-            elif args.operation == "flow-resume":
-                from taskflow.execution_flow import resume_workflow
-
-                document = read_json(args.record)
-                output = {"flows": [resume_workflow(store, identity, **document)
-                                    for identity in args.flow_id]}
-            elif args.operation == "flow-repair-capacity-prepare":
-                from taskflow.execution_repair_capacity import prepare_repair_capacity_budget
-
-                output = prepare_repair_capacity_budget(store, args.parent_flow_id, args.flow_id, read_json(args.record))
-            elif args.operation == "lifecycle-register":
-                from taskflow.execution_lifecycle import register_lifecycle
-
-                document = read_json(args.spec)
-                output = register_lifecycle(store, document["definition"], document["evidence"])
-            elif args.operation == "lifecycle-run":
-                from taskflow.execution_lifecycle import run_lifecycle
-
-                output = run_lifecycle(store, args.flow_id, allow_model=args.allow_model)
-            elif args.operation == "lifecycle-resume":
-                from taskflow.execution_lifecycle import resume_path_transport
-
-                output = resume_path_transport(store, args.flow_id, read_json(args.record))
-            elif args.operation == "batch-baseline-quality-start":
-                from taskflow.execution_baseline_quality import start_baseline_quality_from_packet
-                from taskflow.execution_store import evidence_ref
-
-                output = start_baseline_quality_from_packet(store,
-                    packet_ref=evidence_ref(args.packet.resolve(), "explicit research-ended baseline quality purpose"),
-                    factory_config_ref=evidence_ref(args.factory.resolve(), "original confirmed quality infrastructure"),
-                    allow_model=args.allow_model)
-            elif args.operation in ("experiment-start", "batch-experiment-start"):
-                from taskflow.execution_experiment_factory import start_experiments_from_packet
-                from taskflow.execution_store import evidence_ref
-
-                output = start_experiments_from_packet(store,
-                    packet_ref=evidence_ref(args.packet.resolve(), "separate substantive downstream experiment authority"),
-                    factory_config_ref=evidence_ref(args.factory.resolve(), "shared parameterized experiment preparation"),
-                    allow_model=args.allow_model)
-            elif args.operation in ("author-start", "batch-author-start"):
-                from taskflow.execution_author import start_author_from_packet
-                from taskflow.execution_store import evidence_ref
-
-                factory = read_json(args.factory)
-                packet = read_json(args.packet)
-                if not isinstance(packet.get("items"), list) or len(packet["items"]) != 1:
-                    raise TaskflowError("author-start accepts one concretely authorized item per packet")
-                output = start_author_from_packet(store,
-                    packet_ref=evidence_ref(args.packet.resolve(), "once-only substantive author direction and normal successors"),
-                    template_spec_ref=factory["template_spec_ref"],
-                    directory=Path(factory["research_root"]) / packet["items"][0]["intent_id"],
-                    allow_model=args.allow_model, factory_config=factory,
-                    retry_failed_probes=getattr(args, "retry_failed_native_probe_sha256", None))
-            elif args.operation == "teacher-successor-start":
-                from taskflow.execution_teacher_successor import start_teacher_successors_from_packet
-                from taskflow.execution_store import evidence_ref
-
-                output = start_teacher_successors_from_packet(store,
-                    packet_ref=evidence_ref(args.packet.resolve(), "explicit bounded post-original teacher business successors"),
-                    directory=args.directory.resolve(), allow_model=args.allow_model)
+                if args.quality_action == "submit":
+                    document = read_json(args.spec)
+                    output = register_quality_task(store, document["definition"], document["evidence"])
+                elif args.quality_action == "prepare":
+                    output = prepare_quality_task(store, args.quality_id)
+                elif args.quality_action == "collect":
+                    output = collect_quality_task(store, args.quality_id)
+                elif args.quality_action == "correct":
+                    output = correct_quality_task(store, args.quality_id,
+                                                  evidence=read_json(args.record)["evidence"])
+                elif args.quality_action == "run":
+                    output = run_quality_task(store, args.quality_id, allow_model=args.allow_model)
+                else:
+                    output = store.get_flow(args.quality_id)
+                    if output["definition"].get("kind") != "quality_task_v1":
+                        raise TaskflowError("quality status requires a quality task")
+            elif args.operation == "solver":
+                from taskflow.execution_solver import (
+                    collect_solver_task, prepare_solver_task, register_solver_task, run_solver_task,
+                )
+                if args.solver_action == "submit":
+                    document = read_json(args.spec)
+                    output = register_solver_task(store, document["definition"], document["evidence"])
+                elif args.solver_action == "prepare":
+                    output = prepare_solver_task(store, args.solver_id)
+                elif args.solver_action == "collect":
+                    output = collect_solver_task(store, args.solver_id)
+                elif args.solver_action == "run":
+                    output = run_solver_task(store, args.solver_id, allow_model=args.allow_model)
+                else:
+                    from taskflow.execution_tasks import get_task
+                    output = get_task(store, args.solver_id, "solver_task_v1")
+            elif args.operation == "review":
+                from taskflow.execution_assessment import (
+                    collect_assessment_task, correct_assessment_task, prepare_assessment_task,
+                    register_assessment_task, run_assessment_task, seal_assessment_facts,
+                )
+                if args.review_action == "submit":
+                    document = read_json(args.spec)
+                    output = register_assessment_task(store, document["definition"], document["evidence"])
+                elif args.review_action == "prepare":
+                    output = prepare_assessment_task(store, args.review_id, stage=args.stage)
+                elif args.review_action == "collect":
+                    output = collect_assessment_task(store, args.review_id, stage=args.stage)
+                elif args.review_action == "seal":
+                    output = seal_assessment_facts(store, args.review_id)
+                elif args.review_action == "correct":
+                    output = correct_assessment_task(store, args.review_id, stage=args.stage,
+                                                     evidence=read_json(args.record)["evidence"])
+                elif args.review_action == "run":
+                    output = run_assessment_task(store, args.review_id, stage=args.stage,
+                                                 allow_model=args.allow_model)
+                else:
+                    from taskflow.execution_tasks import get_task
+                    output = get_task(store, args.review_id, "assessment_task_v1")
             elif args.operation == "capture":
                 output = capture_candidate(store, args.task, args.candidate_id,
                                            args.parent_id, args.author_attempt,
@@ -922,7 +1006,26 @@ def main(argv: list[str] | None = None) -> int:
                         output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8",
                     )
+        if getattr(args, "brief", False):
+            from taskflow.execution_tasks import brief_task_receipt
+
+            output = brief_task_receipt(output, database=args.db, operation=args.operation)
+        elif args.operation == "revision" and not getattr(args, "full", False):
+            # The complete definition and originals are already durable. Return
+            # changes and receipts instead of repeating the runner and history.
+            state = output.get("state", {})
+            output = {"flow_id": output.get("flow_id"), "metrics": output.get("metrics"), "state": {
+                key: state[key] for key in ("status", "execution", "delivery", "outcome", "candidate_id",
+                    "revised_candidate_root", "errors", "diff", "actual_difference", "author_record",
+                    "impact_analysis", "metrics") if key in state},
+                "invocation": {key: state.get("invocation", {})[key] for key in
+                    ("work_id", "attempt_id", "runtime", "archive") if key in state.get("invocation", {})}}
         print(output if isinstance(output, str) else json.dumps(output, ensure_ascii=False, indent=2, allow_nan=False))
+        if (args.operation in {"revision", "quality", "solver", "review"}
+                and getattr(args, args.operation + "_action") in ("collect", "run")
+                and (output.get("state", {}).get("delivery") == "invalid"
+                     or output.get("state", {}).get("execution") in {"failed", "unknown"})):
+            return 2
         return 2 if args.operation == "batch-check" and not output["ready"] else 0
     except ReceiptWritePending as exc:
         print(json.dumps({"error": str(exc), "state": "terminal_receipt_pending",

@@ -66,8 +66,7 @@ class UnpublishedReleaseRecoveryTests(unittest.TestCase):
 
         @contextmanager
         def interfaces():
-            # Role provenance is separately tested, and the actual Q5 guard is
-            # independently checked read-only. Candidate bytes, projections,
+            # Role provenance is separately tested. Candidate bytes, projections,
             # retry state, atomic freeze/export and the receipt here are real.
             with patch("taskflow.execution_experiment._packet", return_value=packet), \
                  patch("taskflow.execution_experiment._author_source", return_value=bound), \
@@ -79,81 +78,22 @@ class UnpublishedReleaseRecoveryTests(unittest.TestCase):
         return case, store, record, resolution, interfaces
 
     def test_same_identity_makes_its_first_successful_atomic_publication_without_overwrite(self):
-        case, store, record, resolution, interfaces = self.fixture()
-        original_receipt = Path(record["state"]["receipt"]).read_bytes()
-        raw = (case.task / "task.json").read_bytes()
-        destination = Path(record["definition"]["technical"]["publication_root"])
-        self.assertFalse(destination.exists())
-        with interfaces():
-            resumed = resume_path_transport(store, record["flow_id"], resolution)
-            with self.assertRaisesRegex(TaskflowError, "exact received"):
-                resume_path_transport(store, record["flow_id"], resolution)
-        self.assertEqual("release", resumed["state"]["stage"])
-        identity = resumed["state"]["history"][-1]["first_publication_identity"]
-        reports = {key: Path(row["path"]) for key, row in identity["reports"].items()}
-        released = prepare_release(case.store, candidate_id=case.candidate["candidate_id"], source_root=case.task,
-                                   destination=destination, version="neutral-v1", quality_reports=reports)
-        self.assertEqual(identity, read_json(destination / "release-receipt.json")["binding"])
-        self.assertEqual(raw, (Path(released["snapshot"]["path"]) / "task.json").read_bytes())
-        self.assertEqual(raw, (case.task / "task.json").read_bytes())
-        self.assertEqual(original_receipt, Path(record["state"]["receipt"]).read_bytes())
-        self.assertEqual([], store.dashboard()["attempts"])
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_other_error_or_hold_missing_collision_changed_receipt_and_projection_reject(self):
-        case, store, record, resolution, interfaces = self.fixture()
-        original = store.get_flow
-        for change in ({"exception": {"stage": "release", "reason": "A substantive hold"}},
-                       {"pending_business_scope": {"reason": "Needs controller choice"}}, {"release": {"receipt": "already-published"}},
-                       {"run_index": 1}, {"author_source_binding": {"source": "different"}}):
-            wrong = {**record, "state": {**record["state"], **change}}
-            with self.subTest(change=list(change)), interfaces(), \
-                 patch.object(store, "get_flow", side_effect=lambda key: wrong if key == record["flow_id"] else original(key)), \
-                 self.assertRaises(TaskflowError):
-                resume_path_transport(store, record["flow_id"], resolution)
-        projection = Path(record["definition"]["directory"]) / "quality-projection/business.json"
-        raw = projection.read_bytes()
-        projection.write_bytes(raw + b"\n")
-        try:
-            with interfaces(), self.assertRaisesRegex(TaskflowError, "projected source bytes"):
-                resume_path_transport(store, record["flow_id"], resolution)
-        finally:
-            projection.write_bytes(raw)
-        receipt = Path(record["state"]["receipt"])
-        raw = receipt.read_bytes()
-        changed = read_json(receipt)
-        changed["exception"]["reason"] = "Unrelated original"
-        write_json(receipt, changed)
-        try:
-            with interfaces(), self.assertRaisesRegex(TaskflowError, "original exception receipt"):
-                resume_path_transport(store, record["flow_id"], resolution)
-        finally:
-            receipt.write_bytes(raw)
-        _, other_store, other_record, other_resolution, other_interfaces = self.fixture(declared=False)
-        with other_interfaces(), self.assertRaisesRegex(TaskflowError, "no original declared"):
-            resume_path_transport(other_store, other_record["flow_id"], other_resolution)
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_any_existing_publication_staging_lock_formal_or_solver_evidence_blocks_retry(self):
-        case, store, record, resolution, interfaces = self.fixture()
-        publication = Path(record["definition"]["technical"]["publication_root"])
-        publication.parent.mkdir()
-        paths = (publication, publication.with_name("." + publication.name + ".lock"),
-                 publication.with_name("." + publication.name + ".staging-original"), case.root / "formal")
-        for path in paths:
-            path.mkdir()
-            try:
-                with self.subTest(path=path.name), interfaces(), self.assertRaisesRegex(TaskflowError, "existing publication"):
-                    resume_path_transport(store, record["flow_id"], resolution)
-            finally:
-                path.rmdir()
-        board = store.dashboard()
-        for status in ("ready", "running", "failed", "uncertain"):
-            wrong = copy.deepcopy(board)
-            wrong["work"].append({"work_id": "already-selected", "role": "solver", "state": status,
-                                   "candidate_id": case.candidate["candidate_id"]})
-            with self.subTest(status=status), interfaces(), patch.object(store, "dashboard", return_value=wrong), \
-                 self.assertRaisesRegex(TaskflowError, "existing publication"):
-                resume_path_transport(store, record["flow_id"], resolution)
-        self.assertEqual(record, store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

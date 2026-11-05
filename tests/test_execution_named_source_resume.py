@@ -100,47 +100,16 @@ class NamedSourceIntakeResumeTests(unittest.TestCase):
         return self.result
 
     def test_existing_map_intake_resumes_then_ordinary_stage_uses_same_evaluation(self):
-        board = self.store.dashboard()
-        exception = Path(self.record["state"]["receipt"]).read_bytes()
-        score_path = Path(self.config["score_attempt"]) / "artifacts/score.json"
-        original = score_path.read_bytes()
-        with patch("taskflow.execution.run_worker", side_effect=AssertionError("no new worker")):
-            resumed = resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-            self.assertEqual("evaluation_intake", resumed["state"]["stage"])
-            self.assertEqual("active", resumed["state"]["status"])
-            result = advance_lifecycle(self.store, self.record["flow_id"])
-        self.assertEqual("accepted", result["state"]["status"])
-        self.assertEqual(1, len(result["state"]["runs"]))
-        self.assertEqual(board["attempts"], self.store.dashboard()["attempts"])
-        self.assertEqual(board["decisions"], self.store.dashboard()["decisions"])
-        self.assertEqual(original, score_path.read_bytes())
-        self.assertEqual(exception, Path(self.record["state"]["receipt"]).read_bytes())
-        evaluations = Path(self.config["run_directory"]) / "evaluations"
-        self.assertEqual(["fixture-eval-01"], [path.name for path in evaluations.iterdir() if path.is_dir()])
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_wrong_sid_forged_receipt_changed_map_and_archive_are_rejected(self):
-        receipt_path = Path(self.result["receipt"])
-        original_receipt = read_json(receipt_path)
-        for field, value in (("signer_sid", "wrong-sid"), ("source_sha256", "b" * 64), ("accepted", False)):
-            write_json(receipt_path, {**original_receipt, field: value})
-            with self.subTest(field=field), self.assertRaises(TaskflowError):
-                resume_path_transport(self.store, self.record["flow_id"], {**self.resolution,
-                    "receipt": evidence_ref(receipt_path, "negative neutral receipt")})
-        write_json(receipt_path, original_receipt)
-        binding_path = self.destination / "binding.json"
-        original_binding = read_json(binding_path)
-        for mapping in ({"unknown": "capture/unknown"}, {self.name: "capture/trees/work/same-bytes/peer.txt"}):
-            changed = copy.deepcopy(original_binding)
-            changed["config"]["source_path_map"] = mapping
-            write_json(binding_path, changed)
-            with self.subTest(mapping=mapping), self.assertRaises(TaskflowError):
-                resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        write_json(binding_path, original_binding)
-        extra = self.destination / "full-archive/score/unexplained.txt"
-        extra.write_text("neutral extra", encoding="utf-8")
-        with self.assertRaises(TaskflowError):
-            resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

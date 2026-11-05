@@ -9,16 +9,19 @@ import importlib.util
 import json
 from functools import wraps
 from pathlib import Path
+
 import re
 import stat
 import subprocess
 from typing import Any
 import uuid
 
+from taskflow.execution_completion_observation import author_technically_complete
 from taskflow.contracts import (
     PUBLIC_ROLES, TaskflowError, atomic_directory, canonical, parse_json,
     relative_path, sha256, validate_id, write_json,
 )
+from taskflow.execution_codex_provider import provider_references_equal as _provider_references_equal
 from taskflow.execution_runner import (
     RunnerError, _full_layout, _full_tree, _full_verify, _info, _publish, _read, _regular,
     _trace, _validate, _validated_collection,
@@ -126,7 +129,7 @@ def _projection_authority(candidate: dict, protocol_map: dict) -> dict:
         if authority.get("task_id") != candidate["task_id"]:
             raise TaskflowError("quality projection mapping lacks this task's attributed authority")
     else:
-        if (not isinstance(selector, dict) or set(selector) != {"task_id", "source_author_quality_flow"}
+        if (not isinstance(selector, dict) or set(selector) not in ({"task_id", "source_author_quality_flow"}, {"task_id", "source_quality_flow"})
                 or selector["task_id"] != candidate["task_id"]):
             raise TaskflowError("quality projection authority item does not bind the exact task and source flow")
         items = authority.get("items")
@@ -683,7 +686,9 @@ def _native_quality_source(store: object, candidate: dict, attempt_id: str,
             or collection.get("technical_accepted") is not True or collection.get("process_ended") is not True
             or not attempt.get("cli_sid") or collection.get("sid") != attempt["cli_sid"]):
         raise TaskflowError("native quality requires its actual completed independent Sol/xhigh candidate attempt")
-    request = _regular(root / "request.md")
+    from taskflow.execution_runner import _quality_locked_request
+
+    request = _quality_locked_request(root, manifest)
     if not request_has_native_signoff_protocol(request):
         raise TaskflowError("native quality protocol is absent from the actual locked request")
     refs = {}
@@ -794,6 +799,22 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
                            source_flow_id: str, packet_transport: dict | None = None) -> dict:
     """Read the same role's locked native signature; never select standards by prose."""
     candidate = store.get_candidate(candidate_id)
+    source = store.get_flow(source_flow_id)
+    if source["definition"].get("kind") is None:
+        from taskflow.execution_engineering_source import KIND, engineering_source
+
+        selector = {"task_id": candidate["task_id"], "source_quality_flow": source_flow_id}
+        authority = _projection_authority(candidate, {"authorization": authorization, "authorization_item": selector})
+        item = next(row for row in authority["items"] if all(row.get(key) == value for key, value in selector.items()))
+        bound = engineering_source(store, {"source_kind": KIND, "source_flow_id": source_flow_id,
+            "task_id": candidate["task_id"], "owner": authority["controller"],
+            "policy_id": source["definition"]["policy_id"]}, item, require_candidate=True)
+        state = bound["source"]["state"]
+        if state.get("candidate_id") != candidate_id:
+            raise TaskflowError("Engineering native source differs from the actual accepted quality candidate")
+        result = {key: state[key] for key in ("candidate_root", "accepted_review_id")}
+        return _native_quality_from_child(store, candidate, authorization, source_flow_id, selector,
+            bound["source"], result, engineering_witness=bound["binding"]["engineering_source"])
     selector = {"task_id": candidate["task_id"], "source_author_quality_flow": source_flow_id}
     authority = _projection_authority(candidate, {"authorization": authorization, "authorization_item": selector})
     item = next(row for row in authority["items"] if all(row.get(key) == value for key, value in selector.items()))
@@ -822,7 +843,7 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
             or author_binding.get("intent_id") != item["source_author_intent"]
             or any(source_author.get(key) != author_binding.get(key)
                    for key in ("task_id", "candidate_id", "intent_id", "work_id"))
-            or source_author.get("state") != "completed" or source_author.get("cli_sid") != item["source_author_sid"]
+            or not author_technically_complete(source_author) or source_author.get("cli_sid") != item["source_author_sid"]
             or (packet_transport is None and (
                 definition.get("authorization", {}).get("path") != item["source_business_packet"]
                 or definition.get("authorization", {}).get("sha256") != item["source_business_packet_sha256"]))):
@@ -849,6 +870,19 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
             or receipt.get("candidate_id") != candidate_id or receipt.get("controller") != authority["controller"]
             or receipt.get("history") != child_state.get("history")):
         raise TaskflowError("native quality parent/child receipt or current candidate differs")
+    return _native_quality_from_child(store, candidate, authorization, source_flow_id, selector,
+                                      child, result, baseline_witness=baseline_witness, packet_witness=packet_witness,
+                                      packet_transport=packet_transport)
+
+
+def _native_quality_from_child(store: object, candidate: dict, authorization: dict,
+                               source_flow_id: str, selector: dict, child: dict, result: dict, *,
+                               baseline_witness: dict | None = None, packet_witness: dict | None = None,
+                               packet_transport: dict | None = None, engineering_witness: dict | None = None) -> dict:
+    """Project the same actual native signature for either declared source kind."""
+    candidate_id = candidate["candidate_id"]
+    child_state = child["state"]
+    receipt_path = Path(child_state["receipt"])
     root = Path(result["candidate_root"])
     declarations = [row for row in candidate.get("evidence", []) if row.get("location") == "explicit package declaration"]
     if (len(declarations) != 1 or declarations[0]["path"] != str(root / "task.json")
@@ -940,6 +974,11 @@ def native_quality_handoff(store: object, *, candidate_id: str, authorization: d
     certification = {"parent_flow_id": source_flow_id, "child_flow_id": child["flow_id"],
                      "child_receipt": _ref(receipt_path), "accepted_review_id": accepted["review_id"],
                      "fresh": fresh["certification"]}
+    if engineering_witness is not None:
+        certification = {"source_flow_id": source_flow_id, "quality_flow_id": child["flow_id"],
+                         "quality_receipt": _ref(receipt_path), "accepted_review_id": accepted["review_id"],
+                         "fresh": fresh["certification"], "engineering_source": engineering_witness}
+        protocol["native_signoff"]["engineering_source"] = engineering_witness
     if baseline_witness is not None:
         certification["baseline_source"] = baseline_witness
         protocol["native_signoff"]["baseline_source"] = baseline_witness
@@ -1030,13 +1069,15 @@ def _repaired_certificate_sources(native: dict, candidate: dict, material: dict)
 def validate_normative_certification(*, candidate: dict, certification: dict,
                                      store: object | None = None) -> list[dict]:
     """Read an explicit native selection; never infer standards from file labels."""
-    fields = {"schema_version", "kind", "candidate_binding", "source_author_flow_id", "authorization", "native_quality_handoff"}
+    engineering = isinstance(certification, dict) and "source_quality_flow_id" in certification
+    source_field = "source_quality_flow_id" if engineering else "source_author_flow_id"
+    fields = {"schema_version", "kind", "candidate_binding", source_field, "authorization", "native_quality_handoff"}
     if (not isinstance(certification, dict) or set(certification) != fields
             or type(certification["schema_version"]) is not int or certification["schema_version"] != 1
             or certification["kind"] != "native_quality_handoff"
             or certification["candidate_binding"] != _binding(candidate)):
         raise TaskflowError("normative certification needs the exact typed current-candidate native handoff")
-    flow_id = validate_id(certification["source_author_flow_id"], "source author flow ID")
+    flow_id = validate_id(certification[source_field], "source quality flow ID")
     native = certification["native_quality_handoff"]
     if not isinstance(native, dict) or set(native) != {
             "source_refs", "protocol_map", "scoring_source_allowlist", "normative_sources", "certification"}:
@@ -1048,11 +1089,12 @@ def validate_normative_certification(*, candidate: dict, certification: dict,
         if canonical(expected) != canonical(native):
             raise TaskflowError("normative certification differs from the current stored native handoff")
     protocol = native["protocol_map"]
-    expected_item = {"task_id": candidate["task_id"], "source_author_quality_flow": flow_id}
+    expected_item = {"task_id": candidate["task_id"],
+                     "source_quality_flow" if engineering else "source_author_quality_flow": flow_id}
     if (protocol.get("authorization") != certification["authorization"]
             or protocol.get("authorization_item") != expected_item
             or protocol.get("native_signoff", {}).get("source_flow_id") != flow_id
-            or native["certification"].get("parent_flow_id") != flow_id):
+            or native["certification"].get("source_flow_id" if engineering else "parent_flow_id") != flow_id):
         raise TaskflowError("normative certification has a different authority or source-flow item")
     authority = _projection_authority(candidate, protocol)
     packet_transport = protocol.get("native_signoff", {}).get("packet_transport")
@@ -1085,6 +1127,22 @@ def validate_normative_certification(*, candidate: dict, certification: dict,
         raise TaskflowError("normative certification has no completed actual same-candidate source/trace")
     item = next(row for row in authority["items"] if isinstance(row, dict)
                 and all(row.get(key) == value for key, value in expected_item.items()))
+    engineering_proof = native["certification"].get("engineering_source")
+    if engineering:
+        from taskflow.execution_engineering_source import KIND, validate_frozen_engineering_source
+
+        if (item.get("source_kind") != KIND or not isinstance(engineering_proof, dict)
+                or protocol.get("native_signoff", {}).get("engineering_source") != engineering_proof
+                or engineering_proof.get("source_quality_flow") != flow_id
+                or engineering_proof.get("controller") != authority["controller"]
+                or engineering_proof.get("initial_binding") != item.get("initial_candidate_binding")
+                or engineering_proof.get("public_predecessor") != item.get("public_predecessor")
+                or engineering_proof.get("engineering_origin") != item.get("engineering_origin")
+                or sid == engineering_proof["public_predecessor"]["cli_sid"]):
+            raise TaskflowError("Engineering normative source lacks its exact independent public/whole provenance")
+        validate_frozen_engineering_source(engineering_proof)
+    elif engineering_proof is not None:
+        raise TaskflowError("Engineering source proof requires its explicit non-author authority")
     if item.get("source_author_flow_kind") == "baseline_quality_v1":
         from taskflow.execution_baseline_quality import baseline_flow_id, validate_frozen_baseline_source
 
@@ -1387,7 +1445,7 @@ def validate_formal_authority(*, config: dict, candidate: dict) -> dict:
     selector = config.get("authorization_item")
     if selector is not None:
         if (not isinstance(selector, dict)
-                or set(selector) != {"task_id", "source_author_quality_flow"}
+                or set(selector) not in ({"task_id", "source_author_quality_flow"}, {"task_id", "source_quality_flow"})
                 or selector["task_id"] != candidate["task_id"]):
             raise TaskflowError("formal authority item must bind the exact task and source flow")
         items = authority.get("items")
@@ -1422,6 +1480,123 @@ def validate_formal_authority(*, config: dict, candidate: dict) -> dict:
     return authority
 
 
+def _prepared_formal_plan(config: dict, candidate: dict, frozen: dict, runtime: Path,
+                          adapter_digest: str) -> tuple[dict, dict]:
+    plan = _read(runtime / "execution-plan.json")
+    plan_info = _info(runtime / "execution-plan.json")
+    if (_read(runtime / "plan-lock.json") != {"sha256": plan_info["sha256"]}
+            or plan.get("run_id") != config["run_id"] or plan.get("requested_model") != config["model"]
+            or plan.get("input_digest") != candidate["input_digest"]
+            or plan.get("request_sha256") != config["request"]["sha256"]
+            or plan.get("frozen_binding", {}).get("snapshot_digest") != frozen["snapshot_digest"]
+            or plan.get("launcher_python") != str(Path(config["launcher_python"]).resolve())):
+        raise TaskflowError("prepared formal plan belongs to different request/frozen/configuration bytes")
+    files = config["adapter"]["files"]
+    for name in set(files) | {"prepare_diagnostic.py"}:
+        expected = adapter_digest if name == "prepare_diagnostic.py" else files[name]
+        if _info(runtime / name)["sha256"] != expected:
+            raise TaskflowError("prepared formal source differs from its approved adapter: " + name)
+    if not _provider_references_equal(plan.get("native_provider_ref"), config.get("native_provider")):
+        raise TaskflowError("formal plan custom provider differs from selected configuration")
+    argv = plan.get("argv")
+    if not isinstance(argv, list) or not argv or not isinstance(argv[0], str) or not argv[0]:
+        raise TaskflowError("prepared formal plan has no actual CLI")
+    if config.get("cli") is not None and Path(argv[0]).resolve() != Path(config["cli"]).resolve():
+        raise TaskflowError("prepared formal CLI differs from selected configuration")
+    return plan, plan_info
+
+
+@_handoff_errors
+def validate_prepared_formal_cli(*, config: dict, release: dict, candidate: dict, runtime: Path) -> dict:
+    """Revalidate a complete preparation without preparing, probing or executing a role."""
+    runtime = _destination(runtime)
+    if release["candidate_binding"] != _binding(candidate):
+        raise TaskflowError("prepared formal release belongs to a different candidate")
+    frozen = verify_snapshot(Path(release["snapshot"]["path"]))
+    if any(frozen[key] != candidate[key] for key in ("task_id", "content_digest", "input_digest", "evaluation_digest")):
+        raise TaskflowError("prepared formal frozen source differs from current candidate")
+    validate_formal_authority(config=config, candidate=candidate)
+    adapter, _ = _checked_ref(config["adapter"])
+    _checked_ref(config["request"])
+    if config.get("native_provider") is not None:
+        validate_formal_provider(config)
+    needed = {"runtime_gate.py", "execute_diagnostic.py", "file_evidence.py", "baseline-plan.json"}
+    if set(config["adapter"].get("files", {})) != needed:
+        raise TaskflowError("prepared formal requires the complete approved source/baseline hash set")
+    for name, digest in config["adapter"]["files"].items():
+        _checked_ref({"path": str(adapter.parent / name), "sha256": digest})
+    identity = {"config_digest": sha256(canonical(config)), "release_receipt": release["receipt"],
+                "candidate_binding": _binding(candidate), "runtime": str(runtime)}
+    intent = runtime.with_name(runtime.name + ".formal-intent.json")
+    if _read(intent) != identity:
+        raise TaskflowError("prepared formal intent differs from original configuration/release")
+    plan, info = _prepared_formal_plan(config, candidate, frozen, runtime, config["adapter"]["sha256"])
+    acceptance = _read(runtime / "launch-review.json")
+    normal = acceptance.get("normal_tools", {})
+    if (acceptance.get("approved") is not True or acceptance.get("plan_sha256") != info["sha256"]
+            or acceptance.get("input_digest") != candidate["input_digest"]
+            or acceptance.get("preparation_binding") != identity
+            or normal.get("path") != str(runtime / "normal-tools-probe.json")):
+        raise TaskflowError("prepared formal launch acceptance differs from its original plan/intent")
+    _checked_ref(normal)
+    for name, fields in (("preparation-process.json", ("model_calls",)),
+                         ("exec-context.json", ("model_calls", "external_model_requests")),
+                         ("normal-tools-probe.json", ("model_calls", "external_model_requests"))):
+        report = _read(runtime / name)
+        if any(type(report.get(key)) is not int or report[key] != 0 for key in fields):
+            raise TaskflowError("prepared formal has no exact zero-model preparation evidence: " + name)
+    # The existing adapter's default command only validates sealed bytes and
+    # cached reports. No --execute, preparation command or probe is invoked.
+    python = str(Path(config["launcher_python"]).resolve())
+    result = subprocess.run([python, str(runtime / "execute_diagnostic.py")], capture_output=True, timeout=60, check=False)
+    if result.returncode:
+        raise TaskflowError("existing formal validation failed: " + result.stderr.decode(errors="replace")[-2000:])
+    return {"cli": plan["argv"][0], "plan": _ref(runtime / "execution-plan.json"),
+            "intent": _ref(intent), "acceptance": _ref(runtime / "launch-review.json"), "model_calls": 0}
+
+
+@_handoff_errors
+def validate_formal_provider(config: dict) -> None:
+    """Bind actual provider source identity; location is descriptive provenance."""
+    adapter, _ = _checked_ref(config["adapter"])
+    baseline = _read(adapter.parent / "baseline-plan.json")
+    original, selected = baseline.get("native_provider_ref"), config.get("native_provider")
+    if selected is None or not _provider_references_equal(original, selected):
+        raise TaskflowError("formal adapter does not bind the selected custom provider")
+
+
+@_handoff_errors
+def validate_prepared_formal_provider_metadata(*, config: dict, release: dict,
+                                              candidate: dict, frozen: dict,
+                                              runtime: Path) -> dict:
+    """Validate a zero-model plan stopped before acceptance; never prepare or probe."""
+    runtime = _destination(runtime)
+    validate_formal_provider(config)
+    _checked_ref(config["request"])
+    _prepared_formal_plan(config, candidate, frozen, runtime, config["adapter"]["sha256"])
+    identity = {"config_digest": sha256(canonical(config)), "release_receipt": release["receipt"],
+                "candidate_binding": _binding(candidate), "runtime": str(runtime)}
+    intent = runtime.with_name(runtime.name + ".formal-intent.json")
+    if _read(intent) != identity:
+        raise TaskflowError("prepared provider metadata has a different original intent")
+    markers = ("launch-review.json", "execution-claim.json", "execution-attempt.json",
+               "initial-input-binding.json", "real-run", "launch.json", "dispatch.json",
+               "process.json", "termination.json", "collection.json", "trace.jsonl")
+    if any((runtime / name).exists() or (runtime / name).is_symlink() for name in markers):
+        raise TaskflowError("prepared provider metadata already has acceptance or execution evidence")
+    for name, fields in (("preparation-process.json", ("model_calls",)),
+                         ("exec-context.json", ("model_calls", "external_model_requests"))):
+        report = _read(runtime / name)
+        if any(type(report.get(key)) is not int or report[key] != 0 for key in fields):
+            raise TaskflowError("prepared provider metadata lacks exact zero-model preparation evidence")
+        if name == "preparation-process.json" and (type(report.get("exit_code")) is not int
+                                                    or report["exit_code"] != 0):
+            raise TaskflowError("prepared provider metadata original preparation did not complete")
+    return {"plan": _ref(runtime / "execution-plan.json"), "intent": _ref(intent),
+            "preparation_process": _ref(runtime / "preparation-process.json"),
+            "exec_context": _ref(runtime / "exec-context.json"), "model_calls": 0}
+
+
 @_handoff_errors
 def prepare_formal(*, config: dict, release: dict, candidate: dict, runtime: Path,
                    preparation_recovery: dict | None = None) -> dict:
@@ -1437,6 +1612,8 @@ def prepare_formal(*, config: dict, release: dict, candidate: dict, runtime: Pat
     if any(frozen[key] != candidate[key] for key in ("task_id", "content_digest", "input_digest", "evaluation_digest")):
         raise TaskflowError("formal frozen source differs from current candidate")
     adapter, _ = _checked_ref(config["adapter"])
+    if config.get("native_provider") is not None:
+        validate_formal_provider(config)
     request, _ = _checked_ref(config["request"])
     authority = validate_formal_authority(config=config, candidate=candidate)
     authority_path = Path(config["authorization"]["path"])
@@ -1469,20 +1646,8 @@ def prepare_formal(*, config: dict, release: dict, candidate: dict, runtime: Pat
                                 + result.stderr.decode(errors="replace")[-2000:])
     if not (runtime / "execution-plan.json").exists():
         raise TaskflowError("existing failed/incomplete formal preparation cannot be automatically repeated")
-    plan = _read(runtime / "execution-plan.json")
-    plan_info = _info(runtime / "execution-plan.json")
-    if (_read(runtime / "plan-lock.json") != {"sha256": plan_info["sha256"]}
-            or plan.get("run_id") != run_id or plan.get("requested_model") != config["model"]
-            or plan.get("input_digest") != candidate["input_digest"]
-            or plan.get("request_sha256") != config["request"]["sha256"]
-            or plan.get("frozen_binding", {}).get("snapshot_digest") != frozen["snapshot_digest"]
-            or plan.get("launcher_python") != python):
-        raise TaskflowError("prepared formal plan belongs to different request/frozen/configuration bytes")
-    for name in needed | {"prepare_diagnostic.py"}:
-        expected = (recovered["source_change"]["executed"]["sha256"] if recovered is not None
-                    else config["adapter"]["sha256"]) if name == "prepare_diagnostic.py" else files[name]
-        if _info(runtime / name)["sha256"] != expected:
-            raise TaskflowError("prepared formal source differs from its approved adapter: " + name)
+    adapter_digest = recovered["source_change"]["executed"]["sha256"] if recovered is not None else config["adapter"]["sha256"]
+    plan, plan_info = _prepared_formal_plan(config, candidate, frozen, runtime, adapter_digest)
     validation = subprocess.run([python, str(runtime / "execute_diagnostic.py")], capture_output=True, timeout=60, check=False)
     if validation.returncode:
         raise TaskflowError("existing formal validation failed: " + validation.stderr.decode(errors="replace")[-2000:])
@@ -1495,7 +1660,7 @@ def prepare_formal(*, config: dict, release: dict, candidate: dict, runtime: Pat
                   "preparation_binding": identity, "normal_tools": normal_tools}
     _once(runtime / "launch-review.json", acceptance)
     runner = {"intent_id": config["intent_id"], "policy_version": config["policy_version"],
-              "role": "solver", "mode": "existing_isolated", "model": config["model"],
+              "role": "solver", "mode": "existing_isolated", "model": config["model"], "cli": plan["argv"][0],
               "reasoning_effort": config["reasoning_effort"],
               "reasoning_context": config.get("reasoning_context"),
               "reasoning_selection": config.get("reasoning_selection", "verified_client_default"),
@@ -1505,6 +1670,8 @@ def prepare_formal(*, config: dict, release: dict, candidate: dict, runtime: Pat
               "output_trees": config.get("output_trees", ["deliverables"]),
               "dependencies": [normal_tools["path"], _read(Path(normal_tools["path"]))["binding"]["node"]["path"]],
               "isolated": {"runtime": str(runtime), "flavor": "formal"}}
+    if config.get("native_provider") is not None:
+        runner["native_provider"] = config["native_provider"]
     return {"runner": runner, "release": release, "plan_path": str(runtime / "execution-plan.json"),
             "plan_sha256": plan_info["sha256"], "acceptance_path": str(runtime / "launch-review.json")}
 
@@ -1868,6 +2035,35 @@ def first_review_target(row: dict) -> str:
         return "original/" + row["id"] + "/payload.bin"
 
 
+def _fixed_client_observations(context: dict, source: dict | None) -> list[dict]:
+    """Project only retained local-probe model fields, never a production payload."""
+    observations = context.get("observations")
+    if source is None or not isinstance(observations, list):
+        return []
+    result = []
+    for index, row in enumerate(observations):
+        if not isinstance(row, dict):
+            continue
+        values, locators = {}, []
+        prefix = "/observations/" + str(index)
+        groups = [(row, ("model",), values, prefix)]
+        if isinstance(row.get("reasoning"), dict):
+            reasoning = {}
+            groups.append((row["reasoning"], ("effort", "context"), reasoning, prefix + "/reasoning"))
+        else:
+            reasoning = None
+        for original, keys, projected, pointer in groups:
+            for key in keys:
+                if key in original and (original[key] is None or isinstance(original[key], str)):
+                    projected[key] = original[key]
+                    locators.append(pointer + "/" + key)
+        if reasoning:
+            values["reasoning"] = reasoning
+        if values:
+            result.append({"values": values, "source": {**source, "locators": locators}})
+    return result
+
+
 @_handoff_errors
 def import_formal(*, attempt: dict, archive: Path, snapshot: Path, run_id: str) -> dict:
     """Transport a sealed full archive into the existing append-only run format."""
@@ -2013,6 +2209,12 @@ def import_formal(*, attempt: dict, archive: Path, snapshot: Path, run_id: str) 
                                      (context_path, ["/model_calls", "/external_model_requests", "/observations/0/model", "/observations/0/reasoning"])):
                 if source:
                     locators[source] = pointers
+            client_observations = _fixed_client_observations(context or {},
+                {"artifact_id": source_ids[context_path], **_info(archive / context_path)} if context_path else None)
+            if context_path:
+                locators[context_path] = list(dict.fromkeys([
+                    *locators[context_path],
+                    *(pointer for row in client_observations for pointer in row["source"]["locators"])]))
             configuration = {
                 "schema_version": 1, "scope": "Actual local configuration/process observations; no served identity or business/quality judgment.",
                 "input_digest": actual_input, "snapshot_digest": frozen["snapshot_digest"],
@@ -2032,7 +2234,11 @@ def import_formal(*, attempt: dict, archive: Path, snapshot: Path, run_id: str) 
                 "input_readback_matches": (readback or {}).get("matches"),
                 "normal_tools": {key: observed.get(key) for key in
                                  ("node", "openssl_conf", "private_denied", "deny_code", "public_sha256", "own_write", "fork_ipc", "sqlite")},
-                "client_capture": {key: (context or {}).get(key) for key in ("model_calls", "external_model_requests", "passed")},
+                "client_capture": {
+                    **{key: (context or {}).get(key) for key in ("model_calls", "external_model_requests", "passed")},
+                    "observation_scope": "projection_of_retained_local_fixed_client_probe_not_production_payload",
+                    "observation_count": len(context["observations"]) if isinstance((context or {}).get("observations"), list) else None,
+                    "observations": client_observations},
                 "fact_sources": [{"artifact_id": source_ids[source], "locators": pointers, **_info(archive / source)}
                                  for source, pointers in locators.items()]}
             configuration_path = "derived/actual-configuration.json"

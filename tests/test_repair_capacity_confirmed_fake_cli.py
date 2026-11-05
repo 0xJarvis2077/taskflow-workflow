@@ -136,7 +136,7 @@ class ConfirmedRepairCapacityFakeCliTests(unittest.TestCase):
                 'filesystem':{str(self.repo):'read',str(work):'write',str(scratch):'write'},
                 'readonly_probe':str(self.task/'task.json'),'probe_sources':[str(self.task/'task.json')]}
 
-    def build_chain(self):
+    def build_chain(self, *, prepare_only=False):
         work=self.base/'author-work';scratch=self.base/'author-scratch';work.mkdir();scratch.mkdir()
         required=['research.md','candidate-decision.md','handoff.md','handoff.json','issues.json']
         item={'task_id':'neutral','intent_id':'source-author-intent'}
@@ -152,7 +152,9 @@ class ConfirmedRepairCapacityFakeCliTests(unittest.TestCase):
                 'cwd':str(work),'native_permissions':self.permissions(work,scratch),'inputs':inputs,'outputs':required,'request_sections':[]}
         spec={'work':{'work_id':'source-author','task_id':'neutral','candidate_id':'seed','role':'author','model_slot':'author','policy_id':'batch-v1','intent_id':'source-author-intent','purpose':'neutral local fixture','dispatch_owner':'fixture-controller','evidence':[ref]},'runner':runner}
         with patch('taskflow.execution_runner.probe_native_attempt',side_effect=fake_probe):
-            execution.enqueue_spec(self.store,spec,self.base/'author-runtime',probe_native=True)
+            prepared = execution.enqueue_spec(self.store,spec,self.base/'author-runtime',probe_native=True)
+            if prepare_only:
+                return prepared['work']
             author=execution.run_worker(self.store,'fixture-author',True,['source-author'])
         self.assertEqual('completed',author['state'],author)
         roles={}
@@ -223,56 +225,47 @@ class ConfirmedRepairCapacityFakeCliTests(unittest.TestCase):
         self.assertEqual([failed],self.store.list_attempts(failed['work_id']))
         self.assertFalse([item for item in self.store.dashboard()['work'] if item['role'] in {'solver','review-facts','review-score'}])
 
-    def test_confirmed_batch_native_full_chain(self):
-        parent,child,dependent,failed,proof=self.prepare_chain()
-        with patch('taskflow.execution_runner.probe_native_attempt',side_effect=fake_probe):
-            prepared=advance_workflow(self.store,child['flow_id'])
-            retry=execution.run_worker(self.store,'fixture-retry',True,[prepared['state']['current_work_id']]);self.assertEqual('failed',retry['state'],retry)
-            next_state=advance_workflow(self.store,child['flow_id'])
-            if not next_state['state'].get('current_work_id'):
-                next_state=advance_workflow(self.store,child['flow_id'])
-            success=execution.run_worker(self.store,'fixture-retry',True,[next_state['state']['current_work_id']]);self.assertEqual('completed',success['state'],success)
-            consumed=advance_workflow(self.store,child['flow_id'])
-        self.assertEqual('3',self.cli.with_name('repair-counter').read_text())
-        self.assert_originals_retained(parent,dependent,failed)
-        self.assertEqual(3,len({failed['cli_sid'],retry['cli_sid'],success['cli_sid']}))
-        self.assertTrue(any(item.get('kind')=='repair_capacity_failed_retry' for item in consumed['state']['history']))
+    def test_confirmed_batch_old_native_chain_is_retired(self):
+        write_json(self.cli.with_name('repair-fixture-config.json'), {})
+        work = self.build_chain(prepare_only=True)
+        manifest = Path(work['runtime_path']) / 'manifest.json'
+        self.assertEqual('native_role', read_json(manifest)['mode'])
+        original = manifest.read_bytes()
+        before = (self.store.dashboard(), self.store.events())
+        with patch('taskflow.execution_runner.run_attempt', side_effect=AssertionError('retired native chain cannot run')):
+            with self.assertRaisesRegex(TaskflowError, 'dispatch is retired'):
+                execution.run_worker(self.store, 'retired-old-author', True, [work['work_id']])
+        self.assertEqual(before, (self.store.dashboard(), self.store.events()))
+        self.assertEqual(original, manifest.read_bytes())
+        self.assertEqual([], self.store.list_attempts(work['work_id']))
+        self.assertFalse(self.cli.with_name('repair-counter').exists())
 
-    def test_noncapacity_failure_stops_without_issuing_another_retry(self):
-        write_json(self.cli.with_name('repair-fixture-config.json'),{'capacity_failures':1,'noncapacity_at':2})
-        parent,child,dependent,failed,proof=self.prepare_chain()
-        with patch('taskflow.execution_runner.probe_native_attempt',side_effect=fake_probe):
-            prepared=advance_workflow(self.store,child['flow_id'])
-            retry=execution.run_worker(self.store,'fixture-retry',True,[prepared['state']['current_work_id']])
-            self.assertEqual('failed',retry['state'])
-            stopped=advance_workflow(self.store,child['flow_id'])
-            self.assertEqual('exception',stopped['state']['status'])
-            self.assertIn('sole terminal capacity failure',stopped['state']['exception']['reason'])
-            self.assertEqual(1,stopped['state']['repair_capacity_attempt_ordinal'])
-            self.assertEqual('2',self.cli.with_name('repair-counter').read_text())
-            with self.store._db() as db:
-                self.assertEqual(1,db.execute('SELECT count(*) FROM repair_capacity_issuance').fetchone()[0])
-            advance_workflow(self.store,child['flow_id'])
-        self.assert_originals_retained(parent,dependent,failed)
+    def test_noncapacity_setting_cannot_restore_old_native_dispatch(self):
+        write_json(self.cli.with_name('repair-fixture-config.json'), {'capacity_failures':1,'noncapacity_at':2})
+        work = self.build_chain(prepare_only=True)
+        manifest = Path(work['runtime_path']) / 'manifest.json'
+        self.assertEqual('native_role', read_json(manifest)['mode'])
+        original = manifest.read_bytes()
+        before = (self.store.dashboard(), self.store.events())
+        with patch('taskflow.execution_runner.run_attempt', side_effect=AssertionError('retired native chain cannot run')):
+            with self.assertRaisesRegex(TaskflowError, 'dispatch is retired'):
+                execution.run_worker(self.store, 'retired-old-author', True, [work['work_id']])
+        self.assertEqual(before, (self.store.dashboard(), self.store.events()))
+        self.assertEqual(original, manifest.read_bytes())
+        self.assertEqual([], self.store.list_attempts(work['work_id']))
+        self.assertFalse(self.cli.with_name('repair-counter').exists())
 
-    def test_tenth_capacity_failure_stops_without_an_eleventh_retry(self):
-        write_json(self.cli.with_name('repair-fixture-config.json'),{'capacity_failures':11})
-        parent,child,dependent,failed,proof=self.prepare_chain()
-        with patch('taskflow.execution_runner.probe_native_attempt',side_effect=fake_probe):
-            for ordinal in range(1,11):
-                prepared=advance_workflow(self.store,child['flow_id'])
-                self.assertEqual(ordinal,prepared['state']['repair_capacity_attempt_ordinal'])
-                retry=execution.run_worker(self.store,'fixture-retry',True,[prepared['state']['current_work_id']])
-                self.assertEqual('failed',retry['state'])
-                stopped=advance_workflow(self.store,child['flow_id'])
-                if ordinal < 10:
-                    self.assertEqual('active',stopped['state']['status'])
-                else:
-                    self.assertEqual('exception',stopped['state']['status'])
-                    self.assertEqual('authorized repair capacity retries exhausted',stopped['state']['exception']['reason'])
-            self.assertEqual(10,len([row for row in stopped['state']['history'] if row.get('kind')=='repair_capacity_failed_retry']))
-            self.assertEqual('11',self.cli.with_name('repair-counter').read_text())
-            with self.store._db() as db:
-                self.assertEqual(10,db.execute('SELECT count(*) FROM repair_capacity_issuance').fetchone()[0])
-            advance_workflow(self.store,child['flow_id'])
-        self.assert_originals_retained(parent,dependent,failed)
+    def test_retry_allowance_cannot_restore_old_native_dispatch(self):
+        write_json(self.cli.with_name('repair-fixture-config.json'), {'capacity_failures':11})
+        work = self.build_chain(prepare_only=True)
+        manifest = Path(work['runtime_path']) / 'manifest.json'
+        self.assertEqual('native_role', read_json(manifest)['mode'])
+        original = manifest.read_bytes()
+        before = (self.store.dashboard(), self.store.events())
+        with patch('taskflow.execution_runner.run_attempt', side_effect=AssertionError('retired native chain cannot run')):
+            with self.assertRaisesRegex(TaskflowError, 'dispatch is retired'):
+                execution.run_worker(self.store, 'retired-old-author', True, [work['work_id']])
+        self.assertEqual(before, (self.store.dashboard(), self.store.events()))
+        self.assertEqual(original, manifest.read_bytes())
+        self.assertEqual([], self.store.list_attempts(work['work_id']))
+        self.assertFalse(self.cli.with_name('repair-counter').exists())

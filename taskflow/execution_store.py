@@ -128,6 +128,22 @@ def validate_evidence(evidence: Any) -> list[dict[str, Any]]:
     return result
 
 
+
+def same_original_ref(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Verify both original sources; only their attribution location may differ."""
+    validated = validate_evidence([left, right])
+    for item in validated:
+        if "size" in item:
+            path = Path(item["path"])
+            raw = safe_read(Path(path.anchor), str(path.relative_to(path.anchor)))
+            if type(item["size"]) is not int or item["size"] != len(raw):
+                raise TaskflowError("evidence.size differs from original source")
+    # Retain every declared key, including optional size and authority metadata.
+    # Path aliases alone have already been canonicalized by validate_evidence.
+    return (canonical({key: value for key, value in validated[0].items() if key != "location"})
+            == canonical({key: value for key, value in validated[1].items() if key != "location"}))
+
+
 def evidence_ref(path: Path, location: str) -> dict[str, Any]:
     """Capture the current bytes of one source for a later attributed record."""
     path = _evidence_path(path)
@@ -315,7 +331,9 @@ class ExecutionStore:
                 author = self._load(db, "attempts", author_attempt)
                 if author["task_id"] != task_id or author["role"] not in ("author", "repair"):
                     raise TaskflowError("candidate requires a completed author/repair attempt for this task")
-                if author["state"] != "completed":
+                from taskflow.execution_completion_observation import author_technically_complete
+
+                if not author_technically_complete(author):
                     resolved = self._validated_delivery_resolution(author)["candidate"]
                     if any(resolved[key] != value for key, value in (
                             ("candidate_id", candidate_id), ("task_id", task_id),
@@ -811,6 +829,34 @@ class ExecutionStore:
             raise TaskflowError("Delivery resolution no longer matches its immutable originals")
         return material
 
+    def observe_author_completion(self, attempt_id: str, *, evidence: list[dict[str, Any]]) -> dict[str, Any]:
+        """Append an original-turn interpretation while retaining terminal failure."""
+        from taskflow.execution_completion_observation import observation_material, validated_observation
+
+        refs = validate_evidence(evidence)
+        with self._db(True) as db:
+            attempt = self._load(db, "attempts", attempt_id)
+            work = self._load(db, "work", attempt["work_id"])
+            if any(attempt.get(key) != work.get(key) for key in
+                   ("task_id", "candidate_id", "intent_id", "policy_id", "runtime_path", "request_digest")):
+                raise TaskflowError("Completion observation work and attempt bindings differ")
+            material = observation_material(attempt)
+            from taskflow.execution_runner import _read
+
+            parent = self._load(db, "candidates", attempt["candidate_id"])
+            manifest = _read(Path(attempt["runtime_path"]) / "manifest.json")
+            if manifest.get("candidate_binding") != {key: parent[key] for key in
+                    ("candidate_id", "task_id", "input_digest", "content_digest", "evaluation_digest")}:
+                raise TaskflowError("Completion observation parent candidate differs from the locked source")
+            if attempt.get("completion_observation") is not None:
+                receipt = validated_observation(attempt)
+                if receipt["evidence"] != refs:
+                    raise TaskflowError("Completion observation cannot replace its original reception evidence")
+                return attempt
+            attempt["completion_observation"] = {**material, "evidence": refs}
+            self._update_attempt(db, attempt, "author_completion_observed")
+            return attempt
+
     def accept_delivery_resolution(self, attempt_id: str, *, omitted_outputs: list[str],
                                    evidence: list[dict[str, Any]]) -> dict[str, Any]:
         """Append acceptance of an unrequested narrative omission, retaining failure."""
@@ -1115,10 +1161,15 @@ class ExecutionStore:
 
         if declaration_transport is not None and (transport_candidate is not None or transport_evidence is not None):
             raise TaskflowError("Declaration transport cannot be combined with path-only transport")
-        if (attempt.get("state") != "completed" or attempt.get("role") not in ("author", "repair")
+        from taskflow.execution_completion_observation import (
+            author_collection, author_technically_complete, received_dependencies,
+        )
+
+        observed = attempt.get("completion_observation") is not None
+        if (not author_technically_complete(attempt) or attempt.get("role") not in ("author", "repair")
                 or type(attempt.get("process_exit")) is not int or attempt["process_exit"] != 0
-                or any(attempt.get(key) is not True for key in
-                       ("response_complete", "artifacts_complete", "technical_accepted"))):
+                or (not observed and any(attempt.get(key) is not True for key in
+                       ("response_complete", "artifacts_complete", "technical_accepted")))):
             raise TaskflowError("Optional candidate requires the actual completed author/repair attempt")
         candidate_subpath = relative_path(candidate_subpath)
         if candidate_subpath != "next-task/" + attempt["task_id"]:
@@ -1126,8 +1177,8 @@ class ExecutionStore:
         root = Path(_required_text(attempt.get("runtime_path"), "runtime_path"))
         archive = Path(archive).absolute()
         try:
-            manifest = _validate(root)
-            collected = _validated_collection(root, manifest)
+            manifest = _validate(root, received_dependencies=received_dependencies(attempt))
+            collected = author_collection(attempt, root)
             termination = _read(root / "termination.json")
             trace = _trace(root / "trace.jsonl", attempt.get("cli_sid"))
             if (manifest.get("role") != attempt["role"]
@@ -1800,11 +1851,21 @@ class ExecutionStore:
             elif disposition == "private_repair":
                 changed = [item for item in changed if item["role"] not in PUBLIC_ROLES]
             delivered = self._delivered_artifacts(author)
-            if not changed or any(item["sha256"] not in delivered for item in changed):
+            declaration_change = None
+            if not changed and disposition != "material_repair":
+                before = [item for item in original["evidence"] if Path(item["path"]).name == "task.json"]
+                after = [item for item in candidate["evidence"] if Path(item["path"]).name == "task.json"]
+                if (len(before) == len(after) == 1 and before[0]["sha256"] != after[0]["sha256"]
+                        and after[0]["sha256"] in delivered):
+                    validate_evidence([before[0], after[0]])
+                    declaration_change = {"before": before[0], "after": after[0]}
+            if (not changed and declaration_change is None) or any(item["sha256"] not in delivered for item in changed):
                 raise TaskflowError("changed candidate files must match this author's actually collected delivery SHA256")
             defect.update(state="repaired", repair_candidate_id=candidate_id, disposition=disposition, repair_evidence=refs)
             defect["author_attempt"] = author_id
             defect["changed_files"] = changed
+            if declaration_change is not None:
+                defect["changed_declaration"] = declaration_change
             defect["prior_decision_id"] = prior_decision_id
             defect["repair_seq"] = self._event(db, "defect_repaired", defect)
             db.execute("UPDATE defects SET state='repaired',data=? WHERE id=?", (canonical(defect).decode(), defect_id))
@@ -1813,9 +1874,15 @@ class ExecutionStore:
     @staticmethod
     def _delivered_artifacts(attempt: dict[str, Any]) -> set[str]:
         if attempt.get("state") == "failed":
-            material = ExecutionStore._validated_delivery_resolution(attempt)
-            return {item["sha256"] for item in material["collection"]["artifacts"].values()}
-        delivered = set()
+            if attempt.get("completion_observation") is None:
+                material = ExecutionStore._validated_delivery_resolution(attempt)
+                return {item["sha256"] for item in material["collection"]["artifacts"].values()}
+            from taskflow.execution_completion_observation import author_collection
+
+            delivered = {item["sha256"] for item in
+                         author_collection(attempt, Path(attempt["runtime_path"]))["artifacts"].values()}
+        else:
+            delivered = set()
         for source in validate_evidence(attempt["evidence"]):
             if source.get("kind") == "delivery":
                 delivered.add(source["sha256"])
@@ -1853,9 +1920,15 @@ class ExecutionStore:
             if review["verdict"] != "accepted" or review["created_seq"] <= defect["repair_seq"]:
                 raise TaskflowError("closure requires a subsequent accepted independent review")
             if not review["whole_package"]:
+                from taskflow.execution_quality_coverage import (
+                    is_affected_quality_review, validate_affected_defect_closure,
+                )
+
                 original = self._load(db, "candidates", defect["candidate_id"])
                 repaired = self._load(db, "candidates", review["candidate_id"])
-                if (defect["kind"] == "material"
+                if is_affected_quality_review(db, review):
+                    validate_affected_defect_closure(db, review, defect)
+                elif (defect["kind"] == "material"
                         or defect_id not in review.get("covered_defect_ids", [])
                         or repaired["input_digest"] != original["input_digest"]):
                     raise TaskflowError("closure requires whole-package review or explicit covered same-public private recheck")
@@ -2336,7 +2409,8 @@ class ExecutionStore:
         return {entry["target"]: aliases[entry["target"]] for entry in observed}
 
     @staticmethod
-    def _composition_review(db: sqlite3.Connection, review: dict[str, Any], scope: str) -> dict:
+    def _composition_review(db: sqlite3.Connection, review: dict[str, Any], scope: str, *,
+                            report_file: str = "adoption-readiness.json", issues_file: str = "issues.json") -> dict:
         from taskflow.execution_flow_contracts import parse_review, review_metadata_aliases
         from taskflow.execution_runner import _info, _read, _validate, _validated_collection
 
@@ -2363,13 +2437,15 @@ class ExecutionStore:
         root = Path(runtime)
         manifest = _validate(root)
         collected = _validated_collection(root, manifest)
-        report, issues = root / "artifacts/adoption-readiness.json", root / "artifacts/issues.json"
+        report_file, issues_file = relative_path(report_file), relative_path(issues_file)
+        report, issues = root / "artifacts" / report_file, root / "artifacts" / issues_file
         if (collected.get("technical_accepted") is not True or collected.get("sid") != attempt["cli_sid"]
                 or manifest.get("intent_id") != attempt["intent_id"]
                 or manifest.get("role") != "quality"
                 or manifest.get("candidate_binding") != {key: candidate[key] for key in
                                                          ("candidate_id", "task_id", "input_digest", "content_digest", "evaluation_digest")}
-                or any(_info(path) != collected["artifacts"].get(path.name) for path in (report, issues))
+                or any(_info(path) != collected["artifacts"].get(name)
+                       for path, name in ((report, report_file), (issues, issues_file)))
                 or not all(any(ref["path"] == str(path) and ref["sha256"] == _info(path)["sha256"]
                                for ref in review["evidence"]) for path in (report, issues))):
             raise TaskflowError("Composition signature is not bound to its sealed actual report and issues")
@@ -2396,7 +2472,7 @@ class ExecutionStore:
         from taskflow.execution_flow_contracts import (
             NATIVE_SIGNOFF_PROTOCOL_SHA256, request_has_native_signoff_protocol, review_metadata_aliases,
         )
-        from taskflow.execution_runner import _info, _read, _regular, _validate
+        from taskflow.execution_runner import _info, _quality_locked_request, _read, _regular, _validate
 
         before, after = original.get("scoring"), current.get("scoring")
         if (not isinstance(before, dict) or not isinstance(after, dict) or canonical(before) == canonical(after)
@@ -2421,7 +2497,7 @@ class ExecutionStore:
         signoff = fresh["report"].get("native_signoff", {})
         if (type(signoff.get("schema_version")) is not int or signoff["schema_version"] != 1
                 or signoff.get("protocol_sha256") != NATIVE_SIGNOFF_PROTOCOL_SHA256
-                or not request_has_native_signoff_protocol(_regular(root / "request.md"))):
+                or not request_has_native_signoff_protocol(_quality_locked_request(root, manifest))):
             raise TaskflowError("Scoring mirror needs the actual requested native normative signoff")
         normative = _native_normative({"candidate": fresh["candidate"], "manifest": manifest,
                                        "root": root, "signoff": signoff})
@@ -3385,14 +3461,23 @@ class ExecutionStore:
 
     @staticmethod
     def _assert_quality(db: sqlite3.Connection, candidate_id: str, *, require_repair_alias: bool = False) -> dict[str, Any]:
+        from taskflow.execution_quality_coverage import (
+            is_affected_quality_review, validate_affected_quality_gate,
+        )
+
         candidate = ExecutionStore._load(db, "candidates", candidate_id)
         ancestors = ExecutionStore._ancestors(db, candidate_id)
         quality_scope = ExecutionStore._quality_scope(db, candidate_id)
         reviews = [_data(row) for row in db.execute("SELECT data FROM reviews WHERE candidate_id=?", (candidate_id,))]
-        current = [row for row in reviews if row["verdict"] == "accepted" and (row["whole_package"] or row.get("snapshot_bound_acceptance")) and row["content_digest"] == candidate["content_digest"]]
+        current = [row for row in reviews if row["verdict"] == "accepted"
+                   and (row["whole_package"] or row.get("snapshot_bound_acceptance")
+                        or is_affected_quality_review(db, row))
+                   and row["content_digest"] == candidate["content_digest"]]
         if not current:
             raise TaskflowError("current whole-package independent quality review missing/stale")
         latest = max(current, key=lambda row: (ExecutionStore._review_time(db, row), row["created_seq"]))
+        if is_affected_quality_review(db, latest):
+            validate_affected_quality_gate(db, latest)
         if latest.get("composite_quality_coverage"):
             ExecutionStore._validate_repaired_quality(db, latest)
         latest_order = ExecutionStore._review_time(db, latest)
@@ -3434,12 +3519,16 @@ class ExecutionStore:
                 return decision
         raise TaskflowError("solver requires an authorized experiment decision for this candidate and exact purpose")
 
-    def record_decision(self, decision_id: str, task_id: str, candidate_id: str, *, action: str, rationale: str, evidence: list[dict[str, Any]], experiment_purpose: str | None = None, authorized: bool = False) -> dict[str, Any]:
+    def record_decision(self, decision_id: str, task_id: str, candidate_id: str, *, action: str, rationale: str, evidence: list[dict[str, Any]], experiment_purpose: str | None = None, authorized: bool = False, intake: dict[str, Any] | None = None) -> dict[str, Any]:
         validate_id(decision_id, "decision_id")
         if action not in DECISIONS:
             raise TaskflowError("unknown next investment action")
         _required_text(rationale, "rationale")
         refs = validate_evidence(evidence)
+        if intake is not None:
+            from taskflow.execution_iteration import validate_intake
+
+            intake = validate_intake(intake, action=action)
         with self._db(True) as db:
             candidate = self._load(db, "candidates", candidate_id)
             if candidate["task_id"] != task_id:
@@ -3450,6 +3539,8 @@ class ExecutionStore:
                 if authorized is not True:
                     raise TaskflowError("experiment requires explicit authorization evidence")
             value = {"decision_id": decision_id, "task_id": task_id, "candidate_id": candidate_id, "action": action, "rationale": rationale, "evidence": refs, "experiment_purpose": experiment_purpose, "authorized": authorized}
+            if intake is not None:
+                value["intake"] = intake
             value["created_seq"] = self._event(db, "next_investment", value)
             db.execute("INSERT INTO decisions VALUES(?,?,?)", (decision_id, task_id, canonical(value).decode()))
             return value

@@ -357,14 +357,16 @@ class TeacherSuccessorTests(unittest.TestCase):
         self.assertEqual([], self.author.native_specs)
         self.assertFalse(self.directory.exists())
 
-    def test_cli_requires_explicit_allow_flag_and_only_passes_the_original_bundle(self):
-        out, error = io.StringIO(), io.StringIO()
+    def test_retired_teacher_cli_never_creates_a_successor(self):
+        before = self.store.events()
         args = ["--db", str(self.store.path), "teacher-successor-start", "--packet", str(self.bundle), "--directory", str(self.directory)]
-        with patch("taskflow.execution_teacher_successor.start_teacher_successors_from_packet", return_value={"nature": "test_fixture"}) as started, \
-             redirect_stdout(out), redirect_stderr(error):
-            self.assertEqual(0, execution.main(args), error.getvalue())
-        self.assertFalse(started.call_args.kwargs["allow_model"])
-        self.assertEqual(str(self.bundle), started.call_args.kwargs["packet_ref"]["path"])
+        with patch("taskflow.execution_teacher_successor.start_teacher_successors_from_packet") as started, redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                execution.main(args)
+        self.assertEqual(2, error.exception.code)
+        started.assert_not_called()
+        self.assertEqual(before, self.store.events())
+        self.assertFalse(self.directory.exists())
 
 
 if __name__ == "__main__":

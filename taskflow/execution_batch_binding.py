@@ -8,11 +8,12 @@ import copy
 from pathlib import Path
 
 from taskflow.contracts import TaskflowError, canonical, sha256
+from taskflow.execution_codex_provider import provider_references_equal
 
 
 SLOTS = {
     "author": {"author"}, "repair": {"repair"}, "quality": {"quality", "public_rebuild", "recheck"},
-    "solver": {"solver"}, "review-facts": {"reviewer"}, "review-score": {"reviewer"},
+    "content-inspector": {"content_inspector"}, "solver": {"solver"}, "review-facts": {"reviewer"}, "review-score": {"reviewer"},
 }
 
 
@@ -67,6 +68,10 @@ def validate_batch_runner(value: dict, *, manifest: bool = False) -> dict | None
     if canonical(setting) != canonical(binding.get("setting")):
         raise TaskflowError("batch runner setting differs from its original user confirmation")
     observed = value.get("model", {}) if manifest else value
+    expected_native = setting.get("native_provider")
+    actual_native = observed.get("native_provider_ref") if manifest else value.get("native_provider")
+    if not provider_references_equal(expected_native, actual_native) or (expected_native is not None and not (value.get("mode") == "native_role" or public_adapter or (value.get("isolated") or {}).get("flavor") == "formal")):
+        raise TaskflowError("native Codex provider differs from confirmed batch")
     model = observed.get("requested") if manifest else observed.get("model")
     if (model != setting["model"] or observed.get("reasoning_effort") != setting["reasoning_effort"]
             or value.get("timeout_seconds") != setting["timeout_seconds"]):

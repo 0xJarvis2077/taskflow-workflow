@@ -346,13 +346,15 @@ def _affected_diff_instructions(context: dict) -> str:
     )
 
 
-def review_metadata_aliases(candidate: dict, manifest: dict, runtime: Path) -> dict:
+def review_metadata_aliases(candidate: dict, manifest: dict, runtime: Path, *, received_dependencies=None) -> dict:
     """Resolve only the actual review's locked same-candidate declaration."""
     from taskflow.execution_runner import _info, _validate
     from taskflow.packages import check_task
 
     runtime = Path(runtime)
-    if _validate(runtime) != manifest or manifest.get("candidate_binding") != {
+    checked = (_validate(runtime) if received_dependencies is None
+               else _validate(runtime, received_dependencies=received_dependencies))
+    if checked != manifest or manifest.get("candidate_binding") != {
             key: candidate[key] for key in ("candidate_id", "task_id", "input_digest", "content_digest", "evaluation_digest")}:
         raise TaskflowError("review metadata belongs to a different candidate or intent")
     matches = [item for item in manifest["inputs"] if item["target"] == "execution/task.json"]
@@ -397,7 +399,10 @@ def review_instructions(context: dict, scope: str) -> str:
         "明确排除affected_paths。任何维度都不强迫affirmed=true。"
     )
     if scope == "affected":
-        order = "本次是知情affected复检，不重新声称未见教师的公开盲评或新的整包判断。\n" + _affected_diff_instructions(context)
+        order = ("本次是独立受影响复检，先完成当前公开阶段检查点，再读取教师侧修订依据、旧签与父版差异；"
+                 "如实核完整业务单元及跨文件关联，不将局部签发升级为新整包签发。\n"
+                 if context.get("public_first") is not None else
+                 "本次是知情affected复检，不重新声称未见教师的公开盲评或新的整包判断。\n") + _affected_diff_instructions(context)
     elif context.get("public_first") is not None:
         index, checkpoint, digest = _public_first_parameters(context)
         order = ("本次整包报告须保留前置公开阶段的实际顺序证据：中性索引 " + index + "、input_digest=" + digest
@@ -426,6 +431,15 @@ def review_instructions(context: dict, scope: str) -> str:
         "每条为 path=当前题包相对路径、sha256=该实际原件摘要、location=原句/单元格/字段位置）。"
         "material 必须引用至少一条当前公开 prompt/input/template 依据。不要仅引自写报告"
         "或私有答案证明公开材料缺陷；非阻断说明可保留，但不得冒充阻断。"
+        "公开重建的答卷和运行记录属于独立试解观察，不是当前题包文件；"
+        "不得把它们作为阻断问题的affected_paths或题包返修目标。"
+        "试解出错本身不证明题包有缺陷；须核对当前题包依据并独立判断。"
+        "非阻断claim可据绑定的试解观察保留该观察路径；reference/rubric引用绑定的"
+        "试解观察时须另有当前题包或绑定元数据依据，受影响路径仍为当前题包文件。"
+        "阻断reference/rubric须明确blocking=true并列入revision_required的阻断清单；"
+        "非阻断reference/rubric须明确blocking=false、status=open_nonblocking、"
+        "nonblocking_reason且无需业务决定。无法确定真实归属或必要依据时签inconclusive，"
+        "不得靠改写问题种类、弱化阻断或假定通过消除分歧。"
         "没有问题时 issues=[]。保留真实批准成果、制度、公式、稳定键及必要条件，"
         "对新问题和正常反例据实际范围签发；不评分、不更改原卷、冻结或旧评价。\n"
         + "\n在同一次adoption-readiness.json原业务报告中增加native_signoff，"
@@ -439,16 +453,9 @@ def review_instructions(context: dict, scope: str) -> str:
 
 def _nonblocking_observation(row: object, blocking_ids: list[str]) -> bool:
     """Classify an original observation without changing its issue kind."""
-    if (not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"].strip()
-            or row["id"] in blocking_ids):
-        return False
-    if row.get("kind") == "claim":
-        return row.get("blocking", False) is False
-    reason = row.get("nonblocking_reason")
-    return (row.get("kind") in {"reference", "rubric"} and row.get("blocking") is False
-            and row.get("status") == "open_nonblocking" and isinstance(reason, str) and bool(reason.strip())
-            and row.get("needs_business_decision", False) is False
-            and row.get("disposition") in (None, "observed_unrepaired", "retained"))
+    from taskflow.execution_quality_progress_contract import nonblocking_observation
+
+    return nonblocking_observation(row, blocking_ids)
 
 
 def parse_review(report_path: Path, issues_path: Path, *, candidate: dict,
@@ -521,10 +528,11 @@ def parse_review(report_path: Path, issues_path: Path, *, candidate: dict,
         affected = _ids(row.get("affected_paths"), "affected_paths", nonempty=True)
         for value in affected:
             key = relative_path(value)
-            if key in observed and (not observation or row["kind"] != "claim"):
-                raise TaskflowError("Observed paths are only for nonblocking claims, not repair targets")
-            if key not in files and key not in observed:
-                raise TaskflowError(f"Unknown affected candidate path: {value}")
+            from taskflow.execution_quality_progress_contract import target_path_error
+
+            error = target_path_error(row, blocking, key, files, observed)
+            if error:
+                raise TaskflowError(error)
         citations = row.get("evidence")
         if not isinstance(citations, list) or not citations:
             raise TaskflowError("Issue requires actual candidate evidence")

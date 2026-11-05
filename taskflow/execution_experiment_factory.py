@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Iterator
 
 from taskflow.contracts import TaskflowError, canonical, sha256, validate_id
@@ -192,10 +193,12 @@ def _consumer_recovery(repository: Path, recovery: dict | None) -> dict:
 
 def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
                               evidence: list[dict] | None = None, resume_dead: bool = False,
-                              recovery: dict | None = None) -> dict:
+                              recovery: dict | None = None, resume_normal_wait: bool = False) -> dict:
     """Launch once, or explicitly append a generation for a proven dead consumer."""
     if type(resume_dead) is not bool or (recovery is not None and not resume_dead):
         raise TaskflowError("consumer recovery requires explicit resume_dead=True")
+    if type(resume_normal_wait) is not bool or (resume_normal_wait and resume_dead):
+        raise TaskflowError("normal wait continuation cannot also be technical recovery")
     repository = Path(repository).resolve()
     if repository != Path(__file__).resolve().parents[1]:
         raise TaskflowError("consumer repository differs from the running execution package")
@@ -206,6 +209,10 @@ def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
         raise TaskflowError("consumer record differs from its registered immutable definition")
     if current["definition"].get("kind") not in KINDS:
         raise TaskflowError("consumer launch requires an existing execution lifecycle")
+    if resume_normal_wait:
+        from taskflow.execution_rounds import validate_round_plan
+
+        validate_round_plan(store, current["definition"])
     directory = Path(current["definition"]["directory"])
     base = {"flow_id": current["flow_id"], "revision": current["revision"],
             "lifecycle_status": current["state"]["status"], "consumer_spawned": False}
@@ -228,14 +235,20 @@ def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
                 return {**base, "status": "attention", "reason": str(error)}
             identity = launched.get("process", {})
             status, reason = _process_status(identity)
-            if not resume_dead or status != "dead":
+            if not (resume_dead or resume_normal_wait) or status != "dead":
                 return {**base, "status": "alive_reused" if status == "alive" else "attention",
                         "reason": reason, "process_status": status, "process": identity,
                         "launch_receipt": evidence_ref(latest_receipt, "original consumer PID receipt")}
             if not isinstance(identity, dict) or not isinstance(identity.get("start_identity"), str) or not identity["start_identity"].strip():
                 return {**base, "status": "attention", "reason": "dead consumer has no original proven start identity; no relaunch"}
-            recovered = _consumer_recovery(repository, recovery)
-            refs = validate_evidence([*refs, recovered["publication"], *recovered["publication_evidence"]])
+            if resume_normal_wait:
+                from taskflow.execution_rounds import validate_normal_wait_exit
+
+                recovered = validate_normal_wait_exit(store, current, latest_intent, launched, repository)
+                refs = validate_evidence([*refs, recovered["normal_wait_exit"]])
+            else:
+                recovered = _consumer_recovery(repository, recovery)
+                refs = validate_evidence([*refs, recovered["publication"], *recovered["publication_evidence"]])
             previous = {"intent": evidence_ref(latest_intent, "preceding consumer launch intent"),
                         "receipt": evidence_ref(latest_receipt, "preceding consumer PID receipt")}
             original = {"intent": evidence_ref(intent_path, "original consumer launch intent"),
@@ -245,7 +258,7 @@ def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
             return {**base, "status": "attention", "reason": "dead consumer recovery has no original launch intent; no launch"}
         try:
             with _lifecycle_lock(store, current["flow_id"]):
-                if resume_dead and canonical(store.get_flow(current["flow_id"])) != canonical(current):
+                if (resume_dead or resume_normal_wait) and canonical(store.get_flow(current["flow_id"])) != canonical(current):
                     return {**base, "status": "attention", "reason": "consumer lifecycle changed during recovery validation"}
         except TaskflowError:
             return {**base, "status": "attention", "reason": "existing lifecycle consumer owns its lock; no second launch"}
@@ -265,12 +278,15 @@ def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
                   "created_at": datetime.now(timezone.utc).isoformat(), "launcher_pid": os.getpid(),
                   "stdout": str(stdout_path), "stderr": str(stderr_path), "evidence": refs,
                   "source_refs": _source_refs(repository)}
+        if resume_normal_wait:
+            intent["normal_wait_handshake"] = True
         if generation:
-            if canonical(_consumer_recovery(repository, recovery)) != canonical(recovered):
+            if not resume_normal_wait and canonical(_consumer_recovery(repository, recovery)) != canonical(recovered):
                 raise TaskflowError("consumer recovery source publication changed before launch")
             intent.update(generation=generation, previous_launch=previous, original_launch=original,
                           definition_binding=_consumer_definition(current),
-                          recovery={key: recovered[key] for key in ("publication", "source_refs")},
+                          recovery=recovered if resume_normal_wait else {
+                              key: recovered[key] for key in ("publication", "source_refs")},
                           old_source_refs_are_historical=True)
         _exclusive_intent(intent_path, intent)
         process = None
@@ -279,6 +295,25 @@ def launch_lifecycle_consumer(store: object, record: dict, repository: Path, *,
                 process = subprocess.Popen(argv, cwd=repository, stdin=subprocess.DEVNULL,
                                            stdout=stdout, stderr=stderr, start_new_session=True)
             identity = _process_identity(process.pid)
+            if resume_normal_wait:
+                started_path = launch_directory / ("consumer-started-" + str(process.pid) + ".json")
+                deadline = time.monotonic() + 5
+                while not started_path.exists() and time.monotonic() < deadline:
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                if started_path.exists():
+                    started = _read(started_path)
+                    observed = _process_identity(process.pid)
+                    child = started.get("process", {})
+                    if (started.get("launch_intent") == evidence_ref(intent_path, "original consumer launch intent")
+                            and child.get("pid") == process.pid and child.get("start_identity")
+                            and child.get("start_identity") == observed.get("start_identity")):
+                        identity = observed
+                    else:
+                        identity = {"pid": process.pid, "start_identity": None}
+                else:
+                    identity = {"pid": process.pid, "start_identity": None}
             try:
                 pgid = os.getpgid(process.pid)
             except ProcessLookupError:
@@ -358,8 +393,12 @@ def start_experiments_from_packet(store: object, *, packet_ref: dict, factory_co
                         or any(carrier.get(key, "explicit" if key == "reasoning_selection" else None) != setting[key]
                                for key in ("reasoning_selection", "reasoning_context"))):
                     raise TaskflowError("experiment factory runtime differs from its confirmed " + slot + " slot")
-        source_id = validate_id(item.get("source_author_quality_flow"), "source_author_quality_flow")
-        selector = {"task_id": task_id, "source_author_quality_flow": source_id}
+        from taskflow.execution_engineering_source import KIND as ENGINEERING_SOURCE
+
+        engineering = item.get("source_kind") == ENGINEERING_SOURCE
+        source_field = "source_quality_flow" if engineering else "source_author_quality_flow"
+        source_id = validate_id(item.get(source_field), source_field)
+        selector = {"task_id": task_id, source_field: source_id}
         identity = (task_id, source_id)
         if identity in seen:
             raise TaskflowError("experiment factory packet contains duplicate item selectors")
@@ -374,8 +413,14 @@ def start_experiments_from_packet(store: object, *, packet_ref: dict, factory_co
         definitions.append({"schema_version": 1, "kind": "experiment_v1", "flow_id": flow_id,
             "task_id": task_id, "owner": packet.get("controller"), "policy_id": policy,
             "authorization": packet_ref, "business_packet_ref": packet_ref, "factory_config_ref": config_ref,
-            "directory": str(paths["lifecycle_root"] / flow_id), "source_author_flow_id": source_id,
-            "business_packet_item": selector, "technical": technical})
+            "directory": str(paths["lifecycle_root"] / flow_id),
+            **({"source_flow_id": source_id, "source_kind": ENGINEERING_SOURCE} if engineering
+               else {"source_author_flow_id": source_id}),
+            "business_packet_item": selector, "technical": technical,
+            **({"solver_profile_update": packet["solver_profile_update"]} if packet.get("solver_profile_update") is not None else {})})
+        if packet.get("solver_profile_update") is not None:
+            from taskflow.execution_solver_profile import source_policy_id
+            source_policy_id(store, definitions[-1])
     results = []
     for definition in definitions:
         try:

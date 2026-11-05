@@ -143,31 +143,10 @@ class AuthorPacketTransportTests(unittest.TestCase):
                 db.execute("UPDATE " + table + " SET data=? WHERE id=?", (raw, identity))
 
     def test_exact_alias_online_offline_and_normal_wait_preserve_originals(self):
-        value = self.fixture()
-        case, store = value["case"], value["store"]
-        paths = [value["authority"], value["staged"], Path(value["record"]["state"]["receipt"])]
-        paths += [case.directory / "runtime" / name for name in ("manifest.json", "request.md", "collection.json", "trace.jsonl")]
-        before = {str(p): p.read_bytes() for p in paths}
-        count = len(store.dashboard()["attempts"])
-        store.set_control("work:" + _node(value["record"], "solver"), "pause", "Existing business purpose remains held.")
-        with store._db() as db:
-            controls = [tuple(row) for row in db.execute("SELECT * FROM controls ORDER BY scope")]
-        with patch("subprocess.run", side_effect=AssertionError("transport cannot launch a process")):
-            witness = self.validate(value)
-            self.assertEqual(witness, self.validate(value, offline=True))
-            result = resume_path_transport(store, value["record"]["flow_id"], self.resolution(value))
-            bound = _author_source(store, result, _packet(result))
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("experiment_v1", result["state"]["stage"])
-        self.assertEqual(value["record"]["definition_digest"], result["definition_digest"])
-        self.assertEqual(value["record"]["state"]["exception"], result["state"]["history"][-1]["previous_exception"])
-        self.assertEqual("source_author_quality_not_received", bound["record"]["state"]["waiting"]["reason"])
-        self.assertEqual(count, len(store.dashboard()["attempts"]))
-        with store._db() as db:
-            self.assertEqual(controls, [tuple(row) for row in db.execute("SELECT * FROM controls ORDER BY scope")])
-        self.assertEqual(before, {str(p): p.read_bytes() for p in paths})
-        with self.assertRaises(TaskflowError):
-            resume_path_transport(store, result["flow_id"], self.resolution(value))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_absent_explicit_transport_keeps_legacy_exact_path_fail_closed(self):
         value = self.fixture()
@@ -233,92 +212,17 @@ class AuthorPacketTransportTests(unittest.TestCase):
             value["staged"].chmod(mode)
 
     def test_exact_resume_guards_hold_receipt_locks_cas_and_zero_formal_boundary(self):
-        value = self.fixture()
-        store, record = value["store"], value["record"]
-        before = store.events()
-        with _lifecycle_lock(store, record["flow_id"]), self.assertRaises(TaskflowError):
-            resume_path_transport(store, record["flow_id"], self.resolution(value))
-        self.assertEqual(before, store.events())
-        bad = self.resolution(value)
-        bad["evidence"] = [evidence_ref(value["note"], "transport ref intentionally absent")]
-        with self.assertRaisesRegex(TaskflowError, "explicit resolution evidence"):
-            resume_path_transport(store, record["flow_id"], bad)
-        receipt = Path(record["state"]["receipt"])
-        original = receipt.read_bytes()
-        try:
-            payload = read_json(receipt)
-            payload["controller"] = "foreign-controller"
-            write_json(receipt, payload)
-            with self.assertRaisesRegex(TaskflowError, "original received exception"):
-                resume_path_transport(store, record["flow_id"], self.resolution(value))
-        finally:
-            receipt.write_bytes(original)
-        self.assertEqual(before, store.events())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
 
-        for field, changed in (("pending_business_scope", {}), ("run_index", 1), ("current_work_id", "some-work")):
-            state = {**record["state"], field: changed}
-            forged = {**record, "state": state}
-            from taskflow.execution_lifecycle import _resume_author_packet_transport
-            with self.subTest(field=field), self.assertRaises(TaskflowError):
-                _resume_author_packet_transport(store, forged, self.resolution(value), self.resolution(value)["evidence"])
-        root = Path(record["definition"]["technical"]["formal_runtime_root"])
-        root.mkdir()
-        try:
-            with self.assertRaisesRegex(TaskflowError, "formal preparation"):
-                resume_path_transport(store, record["flow_id"], self.resolution(value))
-        finally:
-            root.rmdir()
-        self.assertEqual(before, store.events())
-        actual = ExecutionStore.update_flow
-        def conflict(self, identity, revision, state, event):
-            if event.get("kind") == "lifecycle_author_packet_transport_resumed":
-                return actual(self, identity, revision + 1, state, event)
-            return actual(self, identity, revision, state, event)
-        with patch.object(ExecutionStore, "update_flow", new=conflict), self.assertRaises(TaskflowError):
-            resume_path_transport(store, record["flow_id"], self.resolution(value))
-        self.assertEqual(record, store.get_flow(record["flow_id"]))
-        self.assertEqual(before, store.events())
+        assert_legacy_recovery_retired(self)
 
 
     def test_original_owner_sidecar_authority_and_existing_work_or_decision_cannot_be_replaced(self):
-        value = self.fixture()
-        store, record = value["store"], value["record"]
-        original = copy.deepcopy(value["spec"])
-        for key, replacement in (("kind", "unknown_alias"), ("schema_version", True),
-                                 ("source_author_attempt", "foreign-attempt"), ("source_author_flow_id", "foreign-parent")):
-            spec = {**original, key: replacement}
-            write_json(value["transport_path"], spec)
-            with self.subTest(key=key), self.assertRaises(TaskflowError):
-                self.validate(value)
-        write_json(value["transport_path"], original)
-        parent = value["parent"]
-        for field, replacement in (("pending_business_scope", {}), ("exception", {"reason": "actual unresolved choice"})):
-            state = {**parent["state"], field: replacement}
-            source = store.update_flow(parent["flow_id"], parent["revision"], state, {"kind": "neutral_source_hold"})
-            before = store.events()
-            with self.subTest(field=field), self.assertRaises(TaskflowError):
-                resume_path_transport(store, record["flow_id"], self.resolution(value))
-            self.assertEqual(before, store.events())
-            parent = store.update_flow(parent["flow_id"], source["revision"], value["parent"]["state"], {"kind": "neutral_restore_source"})
-        target = _node(record, "solver")
-        store.record_decision(_node(record, "experiment-decision"), "neutral", value["case"].attempt["candidate_id"],
-            action="research", rationale="Existing exact purpose ID, not a new experiment authority.",
-            evidence=[value["authorization"]])
-        before = store.events()
-        with self.assertRaisesRegex(TaskflowError, "formal work/attempt/decision"):
-            resume_path_transport(store, record["flow_id"], self.resolution(value))
-        self.assertEqual(before, store.events())
-        store.enqueue(target, "neutral", value["case"].attempt["candidate_id"], "quality", "fixture-v1",
-            intent_id=target + "-intent", purpose="Preexisting neutral ready work must not be replaced.",
-            request_digest="0" * 64, evidence=[value["authorization"]], dispatch_owner="fixture-controller")
-        for claim in (False, True):
-            if claim:
-                self.assertIsNotNone(store.claim("neutral-existing-owner", [target]))
-            before = store.events()
-            with self.subTest(claim=claim), self.assertRaisesRegex(TaskflowError, "formal work/attempt/decision"):
-                resume_path_transport(store, record["flow_id"], self.resolution(value))
-            self.assertEqual(before, store.events())
-        self.assertEqual(record, store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
     def test_native_handoff_projection_and_offline_certificate_use_the_same_transport(self):
         value = self.fixture()
         maker = normative_fixtures.NormativeCertificationTests()
@@ -422,31 +326,10 @@ class AuthorPacketTransportTests(unittest.TestCase):
         return {**value, "parent": parent, "revised": revised}
 
     def test_actual_revised_result_candidate_foreign_work_and_decision_are_not_missed(self):
-        for mode in ("solver", "decision", "child_hold"):
-            with self.subTest(mode=mode):
-                value = self.accepted_revised_source()
-                store, revised = value["store"], value["revised"]
-                if mode == "solver":
-                    purpose = "Existing source candidate solver belongs to another managed work."
-                    store.record_decision("original-authority-for-foreign-solver", "neutral", revised["candidate_id"],
-                        action="experiment", rationale="Preexisting exact neutral solver purpose.",
-                        experiment_purpose=purpose, authorized=True, evidence=[value["authorization"]])
-                    store.enqueue("foreign-current-solver", "neutral", revised["candidate_id"], "solver", "fixture-v1",
-                        intent_id="different-solver-intent", purpose=purpose,
-                        request_digest="0" * 64, evidence=[value["authorization"]], dispatch_owner="fixture-controller")
-                elif mode == "decision":
-                    store.record_decision("foreign-current-experiment-decision", "neutral", revised["candidate_id"], action="experiment",
-                        rationale="Existing source current-version experiment purpose.", experiment_purpose="A separate previously authorized purpose.",
-                        authorized=True, evidence=[value["authorization"]])
-                else:
-                    child = store.get_flow(value["parent"]["state"]["child_flow_id"])
-                    store.update_flow(child["flow_id"], child["revision"],
-                        {**child["state"], "pending_business_scope": {}}, {"kind": "neutral_child_business_hold"})
-                before = store.events()
-                with self.assertRaisesRegex(TaskflowError, "business hold" if mode == "child_hold" else "formal work/attempt/decision"):
-                    resume_path_transport(store, value["record"]["flow_id"], self.resolution(value))
-                self.assertEqual(before, store.events())
-                self.assertEqual(value["record"], store.get_flow(value["record"]["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

@@ -1,61 +1,37 @@
 # 真实角色运行的本机配置
 
-这里说明现有执行层的接入边界。空模板只展示需要填写的字段，不是可直接运行的部署配置；模型、路径、身份、授权和摘要必须来自本批用户选择及真实本机文件。核心工具及中性模拟可直接使用，真实模型调用还需要实际 CLI、权限探针和适配器。
+空模板展示字段，不是可直接运行的部署配置。模型、档位、路径、身份、权限、授权和摘要必须来自本批用户选择及实际本机文件。Python核确定结构和来源，Codex提供Agent、工具和上下文能力。
 
 ## 先确认，再准备
 
-先完成[批次模型表](../knowledge/templates/task-batch-plan.template.json)，核启用角色、用户选择范围和本机支持。不能把一个模型名称猜成另一个，也不能从旧模板代填。事实与评分必须共享 reviewer 模型和实际 SID。
+先完成[批次模型表](../knowledge/templates/task-batch-plan.template.json)，核启用角色、用户选择范围和本机支持。不能猜模型名或从旧模板代填。事实与评分共享reviewer模型、provider、policy、home及实际SID。
 
-然后准备新的不可覆盖策略和本机文件。引用文件须有实际 `path/sha256/location`；不要填写虚构 SHA 或照抄他人的机器路径。模板中的 null 和空数组仍是未配置，不能据此准备真实角色。
+使用batch-check、batch-freeze、batch-config核验、冻结并编译本批配置。保留不可覆盖的policy及真实path/sha256/location来源；null与空模板仍是未配置，不授予模型调用权。各启用角色的runtime、用户选择来源、模型与范围摘要必须对应当前批次。
 
-新批次通过 `batch-check`、`batch-freeze` 和 `batch-config` 核验并锁定配置，再使用 `batch-author-start`／`batch-experiment-start`。每个启用角色须补齐其 `runtime`、用户直接选择的原件与范围／模型摘要；CLI 角色提供实际支持观察，四个聊天角色提供真实 thread/host/model/provider 配置证据。程序只核结构化来源与字节，不解释自然语言同意，也不替用户选择或切换模型。完整字段与现有推理设置限制见[新批次入口](execution-layer.md#新批次模型确认入口)。
+## 明确角色任务
 
-## 作者工厂与业务委托
-
-[作者工厂形状](../config/examples/author-factory.example.json)的字段：
-
-| 字段 | 含义 |
+| 工作 | 当前入口与规格 |
 | --- | --- |
-| `schema_version` | 当前格式版本 |
-| `policy_id` | 本批已注册的不可覆盖角色策略 |
-| `template_spec_ref` | 已审查作者运行配置的真实文件引用 |
-| `role_template_ref` | 公开重建、质量、返修和复检模板的真实文件引用 |
-| `research_root` / `lifecycle_root` | 本机为新工作分配的根目录 |
+| 材料修订 | [revision submit/prepare/run/collect](material-revisions.md)，父版与新版独立，runner和本批policy显式一致 |
+| 独立质量及受影响复检 | [quality submit/prepare/run/collect](quality-tasks.md)，公开先行，独立签发；复用公开原件须核完整相同关系 |
+| 独立正式作答 | [solver submit/prepare/run/collect](formal-review-tasks.md)，仅当前公开资料，明确有效quality来源与业务授权 |
+| 全卷事实、封存、同会话评分 | [review](formal-review-tasks.md)，facts不见标准，封存后同actual reviewer/SID追加当前标准 |
+| 新公开重建 | 底层enqueue/worker/runner及existing_isolated公开适配器，须提供完整公开输入/权限/输出与policy，不恢复旧自动父子链 |
 
-作者模板的 runner 至少明确 mode、role、CLI、model、reasoning_effort、timeout_seconds、cwd、native_permissions，以及类型化输入和输出。原生运行需要实际权限探针；仅把字符串填好不证明环境可用。
+runner明确mode、CLI/provider、model、reasoning_effort、timeout、role_session、权限和输出。角色任务派生实际输入，不接随意追加的历史材料。原生权限和当前实际工具能力仍经正常零模型预检；填配置或文件哈希不证明隔离。
 
-[业务 packet 形状](../config/examples/author-packet.example.json)一次交一个确切业务 item。`controller` 是真实协调者身份；item 绑定 task、intent、candidate、结构完整的 baseline、实际方向及相关来源；`author_work` 交代完整岗位工作、输入范围、正常对照、必交成果及权限。完整作者输出契约见[执行层](execution-layer.md)。
+run需要显式--allow-model。准备可能写任务目录和执行零模型预检，不能把它当只读预览；登记、准备或配置本身不授予付费与资料外发许可。实际系统审批拒绝不得绕过。
 
-`init` 生成的草稿有意不完整，不能直接用作工厂要求的 baseline。首次题目须先按[单题契约](task-contract.md)完成可解析、task ID 一致的初稿，再进入受管作者研发；不能靠复制题目历史来填空。
+## 会话及资料
 
-后继模板有 `quality/repair/recheck/public_rebuild/recheck_public` 五个键，分别绑定各自运行配置。公开重建使用只见公开输入的隔离入口；配置需包含实际 prepare adapter、其 SHA、launcher Python、prepare config 与检查。其他审查保留独立上下文和真实候选绑定。
+任务使用独立home。fresh_persistent允许保存该角色的实际SID，fresh_ephemeral结束后不能追认恢复。质量交付纠错以及facts到score仅走合法同角色/阶段通道，新turn有新work/intent/attempt；未知或失败不重放。材料继承通过独立文件副本，不依赖旧作者SID。
 
-```sh
-python3 -m taskflow execution batch-author-start --packet /path/to/author-packet.json --factory /path/to/batch-configuration/author-factory.json
-```
+正式作答、公开重建和首facts不能读取作者Skill、教师参考、历史答卷、旧分或私有修订分析。质量公开先行后才读教师资料；修订角色可以按显式来源读取完整历史诊断。来源和当前规范按各自实际版本绑定，不能迁旧签为新签。
 
-省略 `--allow-model` 仍可能准备目录、执行零模型探针并入队，不是只读预览。先读实际帮助和契约，再按已有授权启动。
+## 退役与限制
 
-示例中的本批 factory 由 `batch-config` 结合已确认计划及实际基础设施生成；前述空模板说明基础设施的形状，不能直接替代带确认绑定的编译结果。业务 packet 必须携带同一 `batch_id`，题目须在用户确认范围内。
+旧author-start、teacher-successor-start、batch-author-start、batch-baseline-quality-start、experiment/round和lifecycle运行/恢复CLI已移除，不做旧任务执行兼容。历史工厂和packet示例仅保留原合同及证据用途，不能作为当前可执行命令。历史状态与原件仍可只读核验。
 
-## 实验工厂与正式适配器
+完整不可变运行依赖bundle尚未实现；源码安装仍需全部注册执行域的实际锁与自然空闲窗口。聊天模型选择另核实际载体；请求模型不等于served身份。工具探针、中性测试、业务质量和正式成绩分别留证，不为连接检查例行调用模型。
 
-[实验工厂形状](../config/examples/experiment-factory.example.json)绑定 policy、repository、生命周期／正式运行／发布根目录，以及 `technical.real_repository/formal_config_base/review_runner`。
-
-`formal_config_base` 至少包含：实际 adapter 脚本及伴随文件摘要；中性公开请求；launcher Python；已确认模型及推理／限时；必要拒读探针和输出要求。实验 packet 另须绑定 task、源作者质量 flow、运行 ID、冻结版本、实际用途与授权。评阅 runner 则按[两阶段契约](execution-layer.md)完成事实封存与原 SID 评分。
-
-```sh
-python3 -m taskflow execution batch-experiment-start --packet /path/to/experiment-packet.json --factory /path/to/batch-configuration/experiment-factory.json
-```
-
-正式桥是显式 adapter 接口。本仓库不把某个项目的题目探针、历史答卷、本机账户或固定型号适配器当成通用默认。自备适配器必须符合 `taskflow.execution_formal.prepare_formal` 的调用和回执契约；运行前的探针、输入锁定、单次启动与失败留证不能省略。
-
-若适配器使用基线方案，[基线字段模板](../config/examples/baseline-plan.template.json)只说明 argv、隔离 root 与 observed CLI 的路径／摘要。真实 argv 必须由当前环境生成并核可见文件、能力和自动上下文；空模板不证明隔离。脚本所依赖的 Codex home、解释器、系统依赖、中性规则和拒读目标都应为本机配置，不能要求所有业务使用固定答案文件名或别人的题目。
-
-## 当前实现限制
-
-新批入口已将公开重建、整包质量、返修、复检、正式作答和评阅按七个 CLI 模型槽分别绑定本批确认；来源核验绑定原版本策略及确认快照，不以型号品牌替代来源身份。事实和评分仍使用同一 reviewer 配置及实际 SID。实际模型能力或推理配置不兼容时拒绝继续，不静默映射成其他角色的选择。
-
-旧 `author-start/experiment-start` 只承接显式历史工厂；低层手工策略、旧导入和恢复 API 保留兼容，不能宣称它们全局实施了新批门禁。新的委托应走 `batch-*`，不能借兼容入口绕过确认。模型支持观察、权限探针、实际服务端身份和正式表现分别留证；中性模拟不证明某个新服务已经实测可用。
-
-聊天模型的选择还须核实际载体配置。配置表不能自动切换已有聊天，模型请求值也不能证明服务端实际身份。新服务、费用和资料外传另按本批授权处理。
+普通native quality会追加教师资料，不能作为公开重建载体；真实public_rebuild slot对此在准备及派发前拒绝，使用现有公开隔离适配器。没有把尚未迁移的native公开专用入口当成已实现能力。

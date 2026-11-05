@@ -270,6 +270,7 @@ def commands(root: Path, config: dict) -> tuple[list[str], list[str]]:
         'web_search="live"', "apps._default.enabled=false", "agents.enabled=false",
         "allow_login_shell=false",
     ]
+    settings.extend(config.get("codex_provider_options", []))
     options = [part for setting in settings for part in ("-c", setting)]
     for feature in ("apps", "plugins", "hooks", "memories", "computer_use",
                     "browser_use", "browser_use_external", "in_app_browser",
@@ -381,7 +382,10 @@ def prepare_public(package: dict, inputs: dict[str, bytes], binding: dict,
                    denied: list[Path] | None, timeout: int,
                    neutral_rtk_sha256: str) -> dict:
     """Own the common copy, permissions and lock policy for both source modes."""
+    from taskflow.task_directories import iter_task_packages
+
     model, effort = requested_selection(config)
+    provider_ref = config.get("native_provider")
     if root.is_symlink():
         raise ValueError("Symlink runtime root is not allowed")
     root = root.parent.resolve() / root.name
@@ -393,8 +397,16 @@ def prepare_public(package: dict, inputs: dict[str, bytes], binding: dict,
     config = {key: str(Path(config[key]).resolve()) for key in
               ("cli", "python", "dependencies", "rtk", "repository")}
     config.update(model=model, reasoning_effort=effort)
+    if provider_ref is not None:
+        config["native_provider"] = provider_ref
     config["repository"] = str(repository)
     config["codex_home"] = str(Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve())
+    if provider_ref is not None:
+        from taskflow.execution_codex_provider import _checked
+        from taskflow import execution_codex_provider, execution_codex_retry
+
+        selected = load(_checked(provider_ref))
+        config["codex_home"] = selected["codex_home"]
     protected = [repository, root, Path(config["codex_home"])]
     for key in ("dependencies", "rtk", "python", "cli"):
         value = Path(config[key])
@@ -420,7 +432,21 @@ def prepare_public(package: dict, inputs: dict[str, bytes], binding: dict,
     for directory in (work, work / "deliverables", root / "scratch", root / "control"):
         directory.mkdir()
     evidence = capture_cli_evidence(root, config["cli"])
-    model_metadata, cli_version = selection_metadata(config, evidence)
+    if provider_ref is not None:
+        from taskflow.execution_codex_provider import selection_metadata as custom_metadata
+        from taskflow.execution_codex_retry import provider_settings_with_retry
+        from taskflow import execution_codex_environment
+
+        native_config = {**config, "native_permissions": {"profile": PROFILE}}
+        filesystem = {":root": "deny", ":minimal": "read", ":tmpdir": "deny",
+                      ":slash_tmp": "deny", "/private/tmp": "deny", config["codex_home"]: "deny"}
+        options, provider = provider_settings_with_retry(native_config, filesystem)
+        config.update(codex_provider_options=options, codex_provider=provider)
+        (root / "codex_environment.py").write_bytes(Path(execution_codex_environment.__file__).read_bytes())
+        model_metadata, cli_version = custom_metadata(config, evidence, provider)
+        model_metadata["native_provider_ref"] = provider_ref
+    else:
+        model_metadata, cli_version = selection_metadata(config, evidence)
     for member, data in inputs.items():
         relative(member)
         if len(data) > MAX_FILE:
@@ -441,7 +467,11 @@ def prepare_public(package: dict, inputs: dict[str, bytes], binding: dict,
     actual_denied += [path for path in (repository / "knowledge/index.md",
                                        codex_home / "sessions", codex_home / "config.toml")
                       if path.exists()]
-    old_run = next(repository.glob("tasks/*/runs/*/run.json"), None)
+    old_run = next(
+        (path for task in iter_task_packages(repository / "tasks")
+         for path in sorted((task / "runs").glob("*/run.json"))),
+        None,
+    )
     if old_run is not None:
         actual_denied.append(old_run)
     actual_denied += denied or []
@@ -472,13 +502,22 @@ def prepare_public(package: dict, inputs: dict[str, bytes], binding: dict,
     paths = {root / "runner.py", root / "request.md", root / "plan.json",
              root / "plan-lock.json", root / "cli-evidence.json", Path(sys.executable).resolve(),
              Path(config["cli"]), Path(config["python"]), Path(config["rtk"])}
+    if provider_ref is not None:
+        paths.add(root / "codex_environment.py")
+        paths.update(_checked(item) for item in [provider_ref, selected["catalog"], *selected["documentation"]])
+        paths.update({Path(execution_codex_provider.__file__).resolve(),
+                      Path(execution_codex_retry.__file__).resolve()})
     paths.update(path for path in (global_rules, neutral_rtk) if path.is_file())
     for module in list(sys.modules.values()):
         name = getattr(module, "__file__", None)
         if name and Path(name).suffix in (".py", ".so") and Path(name).is_file():
             paths.add(Path(name).resolve())
     # Mutable repository modules are preparation-only; execute never imports them.
-    paths = {path for path in paths if not path.is_relative_to(repository)}
+    declared = {_checked(item) for item in [provider_ref, selected["catalog"], *selected["documentation"]]} if provider_ref else set()
+    if provider_ref:
+        declared.update({Path(execution_codex_provider.__file__).resolve(),
+                         Path(execution_codex_retry.__file__).resolve()})
+    paths = {path for path in paths if not path.is_relative_to(repository) or path in declared}
     source_lock = {"python": str(Path(sys.executable).resolve()),
                    "files": [{"path": str(path), **info(path)} for path in sorted(paths)]}
     save(root / "source-lock.json", source_lock)
@@ -498,7 +537,13 @@ def validate(root: Path, require_probe: bool = True, before_run: bool = True) ->
     if plan["root"] != str(root.resolve()):
         raise ValueError("Runtime root moved")
     expect(root / "cli-evidence.json", plan["cli"]["evidence"])
-    model_metadata, cli_version = selection_metadata(plan["config"], load(root / "cli-evidence.json"))
+    if plan["config"].get("native_provider"):
+        evidence = load(root / "cli-evidence.json")
+        if evidence["commands"][0]["returncode"] != 0:
+            raise ValueError("Original custom-provider CLI observation changed")
+        model_metadata, cli_version = plan["model"], evidence["commands"][0]["stdout"].strip()
+    else:
+        model_metadata, cli_version = selection_metadata(plan["config"], load(root / "cli-evidence.json"))
     if plan.get("model") != model_metadata or plan["cli"].get("version") != cli_version:
         raise ValueError("Model or CLI metadata differs from explicit request/evidence")
     current_instructions = instruction_context(root, Path(plan["config"]["codex_home"]),
@@ -684,8 +729,15 @@ def execute(root: Path) -> dict:
     started = time.monotonic()
     try:
         with (output / "trace.jsonl").open("xb") as stdout, (output / "stderr.txt").open("xb") as stderr:
+            environment = None
+            if plan["config"].get("codex_provider"):
+                if __package__:
+                    from taskflow.execution_codex_environment import process_environment
+                else:
+                    from codex_environment import process_environment
+                environment = process_environment(plan["config"]["codex_provider"])
             process = subprocess.Popen(plan["argv"], cwd=root / "work", stdin=subprocess.PIPE,
-                                       stdout=stdout, stderr=stderr, start_new_session=True)
+                                       stdout=stdout, stderr=stderr, env=environment, start_new_session=True)
             attempt["status"] = "process_exited"
             try:
                 process.communicate(request, timeout=plan["timeout_seconds"])

@@ -96,115 +96,22 @@ class RepairAliasResumeTests(unittest.TestCase):
         self.assertEqual(before["attempts"], case.store.dashboard()["attempts"])
 
     def test_received_resume_appends_and_preserves_all_original_bytes_and_records(self):
-        helper, case, source, initial, record, resolution = self.received()
-        store = case.store
-        def originals():
-            with store._db() as db:
-                return {table: [json.loads(row["data"]) for row in db.execute("SELECT data FROM " + table + " ORDER BY rowid")]
-                        for table in ("candidates", "reviews", "defects", "work", "attempts")}
-        before = originals()
-        paths = {Path(record["state"]["receipt"]), Path(source["state"]["receipt"]),
-                 Path(source["state"]["result"]["child_receipt"])}
-        for candidate in before["candidates"]:
-            paths.update(Path(row["path"]) for row in candidate["files"] + candidate["evidence"])
-        for row in before["reviews"]:
-            paths.update(Path(ref["path"]) for ref in row["evidence"])
-        raw = {path: path.read_bytes() for path in paths}
-        with self.native_interface(helper), patch("taskflow.execution.run_worker", side_effect=AssertionError("zero launch")):
-            result = resume_path_transport(store, record["flow_id"], resolution)
-            with self.assertRaisesRegex(TaskflowError, "exact received"):
-                resume_path_transport(store, record["flow_id"], resolution)
-            advanced = advance_experiment(store, result)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("experiment_v1", result["state"]["stage"])
-        self.assertEqual(record["state"]["history"], result["state"]["history"][:-1])
-        self.assertEqual(record["state"]["exception"], result["state"]["history"][-1]["previous_exception"])
-        self.assertFalse(result["state"]["history"][-1]["new_model_dispatched"])
-        self.assertEqual("release", advanced["state"]["stage"])
-        after = originals()
-        for key in ("candidates", "reviews", "defects", "work", "attempts"):
-            self.assertEqual(before[key], after[key], key)
-        self.assertEqual(raw, {path: path.read_bytes() for path in paths})
-        self.assertFalse(Path(record["definition"]["technical"]["publication_root"]).exists())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_no_alias_unknown_business_complete_and_noninitial_states_reject(self):
-        helper, case, _, _, record, resolution = self.received(alias=False)
-        with self.native_interface(helper), self.assertRaisesRegex(TaskflowError, "no closed repair through"):
-            resume_path_transport(case.store, record["flow_id"], resolution)
-        original_get = case.store.get_flow
-        changes = [{"status": "accepted", "stage": "complete"}, {"stage": "release"},
-                   {"exception": {"stage": "experiment_v1", "reason": "unknown transport error"}},
-                   {"pending_business_scope": {"reason": "specific unresolved choice"}},
-                   {"current_work_id": "running"}, {"release": {"receipt": "published"}},
-                   {"runs": [{"score": 1}]}, {"run_index": 1}]
-        for change in changes:
-            wrong = {**record, "state": {**record["state"], **change}}
-            with self.subTest(change=change), patch.object(case.store, "get_flow", side_effect=lambda key: wrong if key == record["flow_id"] else original_get(key)), \
-                 self.assertRaisesRegex(TaskflowError, "exact received"):
-                resume_path_transport(case.store, record["flow_id"], resolution)
-        self.assertEqual(record, original_get(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_source_receipt_whole_bytes_and_formal_footprints_reject_without_resume(self):
-        helper, case, source, initial, record, resolution = self.received()
-        store = case.store
-        paths = [Path(record["state"]["receipt"]), Path(source["state"]["result"]["child_receipt"]),
-                 Path(store.get_review(source["state"]["result"]["accepted_review_id"])["evidence"][0]["path"]),
-                 Path(initial["files"][0]["path"])]
-        for path in paths:
-            raw = path.read_bytes()
-            if path.suffix == ".json" and path != paths[-1]:
-                value = read_json(path)
-                value["flow_id"] = "another-flow"
-                write_json(path, value)
-            else:
-                path.write_bytes(raw + b"changed")
-            try:
-                with self.subTest(path=path.name), self.native_interface(helper), self.assertRaises(TaskflowError):
-                    resume_path_transport(store, record["flow_id"], resolution)
-            finally:
-                path.write_bytes(raw)
-        receipt = paths[0]
-        raw = receipt.read_bytes()
-        changed = read_json(receipt)
-        changed["history"].append({"kind": "substituted_history"})
-        write_json(receipt, changed)
-        try:
-            with self.native_interface(helper), self.assertRaisesRegex(TaskflowError, "received history/hash"):
-                resume_path_transport(store, record["flow_id"], resolution)
-        finally:
-            receipt.write_bytes(raw)
-        current = store.quality_gate(initial["candidate_id"])
-        with patch.object(store, "quality_gate", return_value={**current, "derived": True}), \
-             self.assertRaisesRegex(TaskflowError, "original current independent whole"):
-            resume_path_transport(store, record["flow_id"], resolution)
-        formal = Path(record["definition"]["technical"]["formal_runtime_root"])
-        outer = Path(record["definition"]["directory"]) / "runtimes" / _node(record, "solver")
-        publication = Path(record["definition"]["technical"]["publication_root"])
-        for path in (formal, outer, publication):
-            path.mkdir(parents=True)
-            try:
-                with self.subTest(path=path.name), self.native_interface(helper), self.assertRaisesRegex(TaskflowError, "existing formal"):
-                    resume_path_transport(store, record["flow_id"], resolution)
-            finally:
-                path.rmdir()
-        import json
-        for kind in ("work", "attempts"):
-            row = {"intent_id": _node(record, "solver") + "-intent", "state": "failed"}
-            identity = "exact-intent-footprint-" + kind
-            with store._db(True) as db:
-                if kind == "work":
-                    db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)", (identity, "neutral", initial["candidate_id"],
-                        row["intent_id"], "failed", json.dumps(row)))
-                else:
-                    db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?)",
-                        (identity, identity + "-work", "neutral", "failed", 0, json.dumps(row)))
-            try:
-                with self.subTest(kind=kind), self.native_interface(helper), self.assertRaisesRegex(TaskflowError, "existing formal"):
-                    resume_path_transport(store, record["flow_id"], resolution)
-            finally:
-                with store._db(True) as db:
-                    db.execute("DELETE FROM " + kind + " WHERE id=?", (identity,))
-        self.assertEqual(record, store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

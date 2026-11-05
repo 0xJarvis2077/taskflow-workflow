@@ -455,6 +455,9 @@ class ReceiptDBContentionTests(unittest.TestCase):
 import pathlib,sys,time
 from unittest.mock import patch
 from taskflow import execution,execution_runner
+from taskflow.execution_flow import run_workflows
+from taskflow.execution_store import ExecutionStore
+import json
 actual_run=execution_runner.run_attempt
 actual_receive=execution._receive_ended_result
 marker,held=map(pathlib.Path,sys.argv[1:3])
@@ -472,7 +475,12 @@ def ended(root,on_process=None,**kwargs):
 def bounded(store,attempt,result,**kwargs):
  return actual_receive(store,attempt,result,**{**kwargs,'wait_seconds':.1})
 with patch.object(execution_runner,'run_attempt',side_effect=ended),patch.object(execution,'_receive_ended_result',side_effect=bounded):
- raise SystemExit(execution.main(['--db',sys.argv[3],'flow-run','--flow-id',sys.argv[4],'--allow-model']))
+ try:
+  result=run_workflows(ExecutionStore(pathlib.Path(sys.argv[3])),[sys.argv[4]],allow_model=True)
+ except execution.ReceiptWritePending as error:
+  print(json.dumps({'error':str(error),'state':'terminal_receipt_pending','receipt':error.receipt,'automatic_retry':False}),file=sys.stderr)
+  raise SystemExit(2)
+ print(json.dumps(result))
 '''
         process = subprocess.Popen([sys.executable, "-B", "-c", program, str(marker), str(held),
             str(case.store.path), definition["flow_id"]], cwd=Path(__file__).resolve().parents[1],
@@ -539,8 +547,12 @@ with patch.object(execution_runner,'run_attempt',side_effect=ended),patch.object
         source_names = ("execution.py", "execution_store.py", "execution_flow.py",
                         "execution_completion.py", "execution_runner.py")
         source_before = {name: sha256((repository / "taskflow" / name).read_bytes()) for name in source_names}
-        argv = [sys.executable, "-B", "-m", "taskflow", "execution", "--db", str(case.store.path),
-                "flow-run", "--flow-id", definition["flow_id"], "--allow-model"]
+        program = ("import json,sys; from pathlib import Path; "
+                   "from taskflow.execution_store import ExecutionStore; "
+                   "from taskflow.execution_flow import run_workflows; "
+                   "print(json.dumps(run_workflows(ExecutionStore(Path(sys.argv[1])),"
+                   "[sys.argv[2]],allow_model=True)))")
+        argv = [sys.executable, "-B", "-c", program, str(case.store.path), definition["flow_id"]]
         process = subprocess.Popen(argv, cwd=repository, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         pid = process.pid
         try:

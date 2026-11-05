@@ -75,113 +75,32 @@ class DeclarationTransportResumeTests(unittest.TestCase):
         return record, resolution
 
     def test_explicit_resume_preserves_original_actor_then_normal_handler_captures_same_author(self):
-        resumed = self.resume()
-        self.assertEqual("active", resumed["state"]["status"])
-        self.assertEqual("author_handoff", resumed["state"]["stage"])
-        self.assertEqual(self.spec, resumed["state"]["optional_candidate_declaration_transport"])
-        self.assertEqual(self.record["definition"], resumed["definition"])
-        self.assertEqual(self.attempt, self.store.get_attempt(self.attempt["attempt_id"]))
-        self.assertNotIn("candidate_id", resumed["state"])
-        captured = advance_author(self.store, resumed)
-        self.assertEqual("public_prepare", captured["state"]["stage"])
-        candidate = self.store.get_candidate(captured["state"]["candidate_id"])
-        self.assertEqual(self.attempt["attempt_id"], candidate["author_attempt"])
-        self.assertEqual([], candidate["external_author_sids"])
-        self.assertEqual(1, len(self.store.dashboard()["attempts"]))
-        for path, content in self.originals.items():
-            self.assertEqual(content, path.read_bytes())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_legacy_wrong_link_extra_role_new_payload_public_change_and_foreign_source_reject(self):
-        for action in ("accept_path_only_candidate_transport", "accept_unsigned_author_placeholders"):
-            with self.subTest(action=action), self.assertRaises(TaskflowError):
-                self.resume({**self.resolution, "action": action})
-        mutations = [lambda value: value["scoring"].update(rubric_file="answer"),
-                     lambda value: value["files"][0].update(role="teacher"),
-                     lambda value: value["files"].append({"id": "extra", "path": "checks/extra.txt", "role": "teacher"})]
-        (self.target / "checks").mkdir(exist_ok=True)
-        (self.target / "checks/extra.txt").write_text("Not original payload")
-        for mutation in mutations:
-            declaration = copy.deepcopy(self.declaration)
-            mutation(declaration)
-            with self.subTest(mutation=mutation), self.assertRaises(TaskflowError):
-                self.resume(self.rewritten(declaration))
-        self.rewritten(self.declaration)
-        public = self.target / "draft/input/prompt.md"
-        content = public.read_bytes()
-        public.write_bytes(content + b"Changed public requirement")
-        with self.assertRaisesRegex(TaskflowError, "payload bytes"):
-            self.resume()
-        public.write_bytes(content)
-        foreign = self.case.root / "foreign-task.json"
-        shutil.copyfile(self.source / "task.json", foreign)
-        for spec in ({**self.spec, "original": evidence_ref(foreign, "foreign same-byte source")},
-                     {key: value for key, value in self.spec.items() if key != "original"}):
-            with self.subTest(spec=spec), self.assertRaises(TaskflowError):
-                self.resume({**self.resolution, "declaration_transport": spec})
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_nonterminal_signed_or_changed_metadata_successor_and_business_hold_reject(self):
-        actual = _author(self.store, self.record["definition"])
-        with patch("taskflow.execution_author._author", return_value=({**actual[0], "state": "running"}, actual[1])):
-            with self.assertRaisesRegex(TaskflowError, "same completed original"):
-                self.resume()
-        report = self.target / self.declaration["reviews"][0]["path"]
-        original_report = report.read_bytes()
-        for changes in ({"status": "passed"}, {"reason": "Changed unsigned metadata"}):
-            write_json(report, {**read_json(self.source / self.declaration["reviews"][0]["path"]), **changes})
-            with self.subTest(changes=changes), self.assertRaises(TaskflowError):
-                self.resume()
-        report.write_bytes(original_report)
-        self.store.register_flow(_identity(self.record["flow_id"], "quality-flow"), {}, self.case.refs,
-                                 {"status": "active", "stage": "quality", "current_work_id": None})
-        with self.assertRaisesRegex(TaskflowError, "existing candidate or public/quality"):
-            self.resume()
-        blocked = self.store.register_flow("business-held-composition", {"kind": "experiment_v1"}, self.case.refs,
-            {"status": "exception", "stage": "experiment_v1", "pending_business_scope": {"reason": "Fresh public responsibility remains unsigned."}})
-        with self.assertRaisesRegex(TaskflowError, "pending business scope"):
-            resume_path_transport(self.store, blocked["flow_id"], {"action": "resume_validated_quality_composition",
-                "reason": "Technical composition cannot clear business hold.", "evidence": self.case.refs})
-        self.assertEqual(blocked, self.store.get_flow(blocked["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_downstream_resumes_same_initial_stage_and_only_waits_for_existing_quality(self):
-        downstream, resolution = self.downstream()
-        receipt = Path(downstream["state"]["receipt"])
-        original = receipt.read_bytes()
-        self.resume()
-        attempts = copy.deepcopy(self.store.dashboard()["attempts"])
-        with patch("taskflow.execution.run_worker", side_effect=AssertionError("no dispatch")):
-            resumed = resume_path_transport(self.store, downstream["flow_id"], resolution)
-            waiting = advance_lifecycle(self.store, resumed["flow_id"])
-        self.assertEqual("active", waiting["state"]["status"])
-        self.assertEqual("experiment_v1", waiting["state"]["stage"])
-        self.assertEqual("source_author_quality_not_received", waiting["state"]["waiting"]["reason"])
-        self.assertIsNone(waiting["state"]["current_work_id"])
-        self.assertNotIn("accepted_review_id", waiting["state"])
-        self.assertNotIn("candidate_id", waiting["state"])
-        self.assertEqual(attempts, self.store.dashboard()["attempts"])
-        self.assertEqual(original, receipt.read_bytes())
-        self.assertEqual(downstream["definition"], resumed["definition"])
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_downstream_rejects_unresolved_parent_drift_existing_intent_and_other_exception(self):
-        downstream, resolution = self.downstream()
-        with self.assertRaisesRegex(TaskflowError, "technically resumed active"):
-            resume_path_transport(self.store, downstream["flow_id"], resolution)
-        self.resume()
-        path = self.target / "task.json"
-        original = path.read_bytes()
-        path.write_bytes(original + b" ")
-        with self.assertRaises(TaskflowError):
-            resume_path_transport(self.store, downstream["flow_id"], resolution)
-        path.write_bytes(original)
-        intent = self.case.root / "formal/neutral-01.formal-intent.json"
-        intent.parent.mkdir()
-        intent.write_text("Existing formal intent must remain unchanged.")
-        with self.assertRaisesRegex(TaskflowError, "existing solver"):
-            resume_path_transport(self.store, downstream["flow_id"], resolution)
-        self.assertEqual(downstream, self.store.get_flow(downstream["flow_id"]))
-        intent.unlink()
-        changed = {**downstream["state"], "exception": {"stage": "experiment_v1", "reason": "A different source business issue."}}
-        self.store.update_flow(downstream["flow_id"], downstream["revision"], changed, {"kind": "neutral different exception"})
-        with self.assertRaisesRegex(TaskflowError, "one exact resolution"):
-            resume_path_transport(self.store, downstream["flow_id"], resolution)
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 

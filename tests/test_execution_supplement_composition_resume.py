@@ -124,34 +124,16 @@ class SupplementCompositionResumeTests(unittest.TestCase):
         return record, resolution, bound, receipt
 
     def test_resume_only_consumes_validated_composite_and_keeps_original_source_ids_and_exception(self):
-        with patch("taskflow.execution_recheck_supplement.validate_recheck_supplement", side_effect=self.adapter, create=True):
-            result = self.compose()
-            record, resolution, bound, receipt = self.lifecycle(result)
-            original = receipt.read_bytes()
-            with patch("taskflow.execution_experiment._author_source", return_value=bound), \
-                 patch("taskflow.execution.run_worker", side_effect=AssertionError("no dispatch")):
-                resumed = resume_path_transport(self.store, record["flow_id"], resolution)
-        self.assertEqual("active", resumed["state"]["status"])
-        self.assertEqual("experiment_v1", resumed["state"]["stage"])
-        self.assertEqual(self.spec, resumed["state"]["quality_recheck_supplement"])
-        self.assertEqual(result["review_id"], resumed["state"]["quality_recheck_supplement_review_id"])
-        self.assertEqual(original, receipt.read_bytes())
-        self.assertEqual(record["definition"], resumed["definition"])
-        self.assertEqual(self.value["recheck"], self.store.get_flow(self.value["flow"]["flow_id"])["state"]["accepted_review_id"])
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_resume_rejects_wrong_composite_or_existing_formal_intent(self):
-        with patch("taskflow.execution_recheck_supplement.validate_recheck_supplement", side_effect=self.adapter, create=True):
-            result = self.compose()
-            record, resolution, bound, _ = self.lifecycle(result)
-            with patch("taskflow.execution_experiment._author_source", return_value=bound):
-                with self.assertRaisesRegex(TaskflowError, "exact validated"):
-                    resume_path_transport(self.store, record["flow_id"], {**resolution, "composite_review_id": "another-review"})
-                intent = self.root / "formal/neutral-01.formal-intent.json"
-                intent.parent.mkdir(parents=True)
-                intent.write_text("Original reservation must not be replaced.")
-                with self.assertRaisesRegex(TaskflowError, "existing solver"):
-                    resume_path_transport(self.store, record["flow_id"], resolution)
-            self.assertEqual(record, self.store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

@@ -43,6 +43,16 @@ class ReviewInstructionTests(unittest.TestCase):
         legacy = {key: value for key, value in self.context.items() if key != "public_first"}
         self.assertIn("不凭空宣称已有公开先行顺序锚点", review_instructions(legacy, "whole_package"))
 
+    def test_observed_attempt_is_distinguished_from_candidate_repair_scope(self):
+        for scope in ("whole_package", "affected"):
+            rendered = review_instructions(self.context, scope)
+            for value in ("独立试解观察，不是当前题包文件", "不得把它们作为阻断问题的affected_paths",
+                          "试解出错本身不证明题包有缺陷", "非阻断claim", "当前题包或绑定元数据依据",
+                          "revision_required的阻断清单", "status=open_nonblocking",
+                          "无法确定真实归属或必要依据时签inconclusive"):
+                with self.subTest(scope=scope, value=value):
+                    self.assertIn(value, rendered)
+
     def test_affected_review_reads_historical_parent_and_complete_actual_changes(self):
         context = {**self.context, "repair_diff": {"index": "execution/repair-diff.json", "available": True,
                     "parent_candidate_id": "neutral-parent", "candidate_id": "neutral-current"}}

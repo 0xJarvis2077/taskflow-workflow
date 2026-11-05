@@ -10,11 +10,11 @@ import shutil
 import subprocess
 import sys
 import threading
-import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from taskflow import execution
 from taskflow import execution_experiment_factory as factory
 from taskflow import execution_runner as runner
 from taskflow.contracts import PUBLIC_ROLES, TaskflowError, read_json, write_json
@@ -193,7 +193,7 @@ class OriginalPauseProducerTests(unittest.TestCase):
         self.assertNotIn("original_pause", first["items"][0])
         self.assertNotIn("control_consumers_started", first)
 
-    def test_grant_register_only_starts_actual_control_child_waiting_without_any_model_work(self):
+    def test_old_producer_child_cli_rejects_retired_plan_without_model_work(self):
         case = self.factory_case(grant={"round_scope": "this_round_original", "first_run_only": True})
         actual, children = factory.subprocess.Popen, []
 
@@ -215,20 +215,14 @@ class OriginalPauseProducerTests(unittest.TestCase):
         self.assertEqual("work:" + second, controls(case.store)[0]["scope"])
         intent = read_json(Path(follower["definition"]["directory"]) / "consumer-launch-intent.json")
         self.assertFalse(intent["allow_model"]); self.assertNotIn("--allow-model", intent["argv"])
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            follower = case.store.get_flow(pause["flow_id"])
-            if follower["state"].get("waiting") == "first_original_not_received": break
-            time.sleep(.05)
-        self.assertEqual("first_original_not_received", follower["state"]["waiting"])
+        self.assertEqual(2, children[0].wait(timeout=10))
+        self.assertEqual(follower, case.store.get_flow(pause["flow_id"]))
+        self.assertIsNone(follower["state"]["waiting"])
         self.assertEqual([], metadata(case.store)["attempts"])
         self.assertEqual([], metadata(case.store)["work"])
-        # End this fixture-only observer normally, without inventing a score or
-        # sending a signal. Real accepted-score consumption is tested separately.
-        case.store.update_flow(follower["flow_id"], follower["revision"],
-            {**follower["state"], "status": "accepted", "result": {"nature": "test_fixture", "outcome": "observer test finished"}},
-            {"kind": "neutral observer fixture terminal"})
-        self.assertEqual(0, children[0].wait(timeout=10))
+        directory = Path(follower["definition"]["directory"])
+        self.assertIn("invalid choice: 'lifecycle-run'", (directory / "consumer.stderr.log").read_text())
+        self.assertFalse((directory / "result.json").exists())
         self.assertIsNone(case.store.get_flow(source["flow_id"])["state"]["current_work_id"])
 
     def test_two_calls_reuse_one_control_and_start_it_before_any_opted_in_model_consumer(self):
@@ -267,19 +261,21 @@ class OriginalPauseProducerTests(unittest.TestCase):
             spawn.assert_not_called(); self.assertEqual([], case.store.list_flows()); self.assertEqual([], controls(case.store))
         self.assertIsNone(original_pause_grant(original))
 
-    def test_existing_isolated_empty_stdout_uses_actual_observed_events_through_original_pause(self):
-        case, source = source_fixture(self, solver_prepare=isolated_solver, original_import=isolated_import, allow_solver=True)
-        root = Path(source["state"]["formal_attempt"]["runtime_path"])
-        self.assertEqual(b"", (root / "trace.jsonl").read_bytes())
-        self.assertEqual(3, len((root / "observed-trace.jsonl").read_text().splitlines()))
-        before = metadata(case.store)
-        original = validated_original(case.store, source)
-        follower = register_pause(case, source)
-        result = run_lifecycle(case.store, follower["flow_id"], allow_model=False, poll_seconds=0)
-        self.assertEqual("accepted", result["state"]["status"])
-        self.assertEqual(SID, original["solver_sid"])
-        self.assertEqual(before, metadata(case.store)); self.assertEqual("pause", controls(case.store)[0]["action"])
-        self.assertEqual(b"", (root / "trace.jsonl").read_bytes())
+    def test_old_isolated_solver_is_retired_before_original_pause_can_run(self):
+        case, _ = source_fixture(self, stop="unprepared", solver_prepare=isolated_solver)
+        record = case.ready()
+        work_id = record["state"]["current_work_id"]
+        work = case.store.get_work(work_id)
+        manifest = Path(work["runtime_path"]) / "manifest.json"
+        self.assertEqual("existing_isolated", read_json(manifest)["mode"])
+        original = manifest.read_bytes()
+        before = (metadata(case.store), case.store.events(), case.store.get_flow(record["flow_id"]))
+        with self.assertRaisesRegex(TaskflowError, "dispatch is retired"):
+            execution.run_worker(case.store, "retired-old-solver", True, [work_id])
+        self.assertEqual(before, (metadata(case.store), case.store.events(), case.store.get_flow(record["flow_id"])))
+        self.assertEqual(original, manifest.read_bytes())
+        self.assertEqual([], case.store.list_attempts(work_id))
+        self.assertEqual([], controls(case.store))
 
 
 if __name__ == "__main__":

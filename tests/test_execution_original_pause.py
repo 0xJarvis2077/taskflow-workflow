@@ -10,7 +10,6 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import threading
-import time
 import unittest
 from unittest.mock import patch
 
@@ -22,9 +21,6 @@ from taskflow.execution_original_pause import (
 )
 from taskflow.execution_store import evidence_ref
 from tests import test_execution_experiment as experiments
-
-
-COLD_LAUNCH_OBSERVATIONS = []
 
 
 def source_fixture(owner, *, score=7, stop=None, solver_prepare=None, original_import=None, allow_solver=False):
@@ -233,15 +229,13 @@ class OriginalScorePauseTests(unittest.TestCase):
         self.assertEqual(1, len(matches))
         self.assertEqual([], controls(case.store))
 
-    def test_cold_existing_launcher_child_receives_and_pauses_without_allow_model_or_new_attempt(self):
+    def test_retired_pause_consumer_cli_cannot_receive_or_change_originals(self):
         from taskflow import execution_experiment_factory as factory
         from taskflow.execution_experiment_factory import launch_lifecycle_consumer
 
         case, source = source_fixture(self)
         follower = register_pause(case, source)
         before = metadata(case.store)
-        # Record the real Popen handle solely to wait/reap this finite fixture.
-        # No process, identity, probe or SQLite behavior is simulated here.
         actual_popen, processes = factory.subprocess.Popen, []
 
         def record_process(*args, **kwargs):
@@ -254,34 +248,17 @@ class OriginalScorePauseTests(unittest.TestCase):
             launched = launch_lifecycle_consumer(case.store, follower, Path(__file__).resolve().parents[1])
         self.assertTrue(launched["consumer_spawned"], launched)
         self.assertEqual(1, len(processes))
-        self.assertEqual(0, processes[0].wait(timeout=30))
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            current = case.store.get_flow(follower["flow_id"])
-            if current["state"]["status"] in ("accepted", "exception") and current["state"].get("receipt"):
-                break
-            time.sleep(.05)
-        self.assertEqual("accepted", current["state"]["status"], current["state"])
-        self.assertTrue(current["state"].get("receipt"))
+        self.assertEqual(2, processes[0].wait(timeout=30))
+        self.assertEqual(follower, case.store.get_flow(follower["flow_id"]))
         self.assertEqual(before, metadata(case.store))
         self.assertEqual(source, case.store.get_flow(source["flow_id"]))
-        self.assertEqual("pause", controls(case.store)[0]["action"])
+        self.assertEqual([], controls(case.store))
         directory = Path(follower["definition"]["directory"])
         intent = read_json(directory / "consumer-launch-intent.json")
         self.assertNotIn("--allow-model", intent["argv"])
         self.assertFalse(intent["allow_model"])
-        launch_receipt = read_json(directory / "consumer-launch.json")
-        self.assertGreater(launch_receipt["process"]["pid"], 0)
-        self.assertEqual(b"", (directory / "consumer.stderr.log").read_bytes())
-        captured = {}
-        for name in ("consumer-launch-intent.json", "consumer-launch.json", "consumer.stdout.log", "consumer.stderr.log", "result.json"):
-            raw = (directory / name).read_bytes()
-            captured[name] = {"sha256": sha256(raw), "size": len(raw), "text": raw.decode()}
-        COLD_LAUNCH_OBSERVATIONS.append({"nature": "real local zero-model consumer over sealed neutral fixtures",
-            "launch_result": launched, "child_returncode": processes[0].returncode,
-            "start_identity_proven": bool(launch_receipt["process"].get("start_identity")),
-            "managed_rows_before_sha256": sha256(canonical(before)), "managed_rows_after_sha256": sha256(canonical(metadata(case.store))),
-            "source_unchanged": source == case.store.get_flow(source["flow_id"]), "captures": captured})
+        self.assertIn("invalid choice: 'lifecycle-run'", (directory / "consumer.stderr.log").read_text())
+        self.assertFalse((directory / "result.json").exists())
 
     def test_failed_commit_rolls_back_control_and_follower_together_and_source_cas_revalidates(self):
         case, source = source_fixture(self)

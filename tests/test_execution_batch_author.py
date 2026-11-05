@@ -115,11 +115,11 @@ class BatchAuthorTests(unittest.TestCase):
             manifest = {"mode": "native_role", "preparation_config_digest": sha256(canonical(runner)),
                         "request": {"sha256": "a" * 64}}
             write_json(root / "manifest.json", manifest)
-            (root / "original-manifest.sha256").write_text(sha256((root / "manifest.json").read_bytes()))
+            write_json(root / "manifest-lock.json", execution_author._info(root / "manifest.json"))
             return manifest
 
         def validate(root, **kwargs):
-            if sha256((root / "manifest.json").read_bytes()) != (root / "original-manifest.sha256").read_text():
+            if read_json(root / "manifest-lock.json") != execution_author._info(root / "manifest.json"):
                 raise TaskflowError("fixture locked manifest changed")
             if kwargs.get("before_run") and not (root / "native-probe-ready.json").exists():
                 raise TaskflowError("fixture native seal missing")
@@ -151,7 +151,8 @@ class BatchAuthorTests(unittest.TestCase):
 
     def test_author_probe_retry_requires_exact_failure_and_preserves_originals(self):
         case, runtime, calls, failure = self.failed_author_probe()
-        original = {path: path.read_bytes() for path in (failure, runtime / "manifest.json", case.directory / "spec.json")}
+        original = {path: path.read_bytes() for path in (
+            failure, runtime / "manifest.json", runtime / "manifest-lock.json", case.directory / "spec.json")}
         digest = sha256(failure.read_bytes())
         with self.assertRaisesRegex(TaskflowError, "previous native probe"):
             start_author_from_packet(case.store, **case.kwargs())
@@ -166,6 +167,7 @@ class BatchAuthorTests(unittest.TestCase):
         self.assertEqual(2, len(calls))
         self.assertEqual([], case.store.dashboard()["attempts"])
         self.assertEqual(original, {path: path.read_bytes() for path in original})
+        self.assertFalse(runtime.with_name("runtime.preparation-originals").exists())
         records = list((case.directory / "probe-retry-authorizations").glob("*.json"))
         self.assertEqual(1, len(records))
         self.assertEqual(digest, read_json(records[0])["reports"][0]["sha256"])

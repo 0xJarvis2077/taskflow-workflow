@@ -11,6 +11,74 @@ from taskflow.execution_store import ExecutionStore, evidence_ref
 from tools.execution_simulation import fixture_policy, perform
 
 
+def replay_decisions(spec_path: Path, output: Path) -> dict:
+    """Exercise current decision intake on explicit historical/normal proposals.
+
+    Proposals and expected choices are supplied by a coordinator. The replay
+    checks enforcement and preservation, not the semantic truth of a decision.
+    Its SQLite, review and all runtime events are offline fixtures.
+    """
+    from taskflow.execution import apply_record, capture_candidate
+    from taskflow.execution_iteration import explicit_solver_decision, validate_intake
+    from taskflow.execution_store import validate_evidence
+    from tools.execution_simulation import make_package
+
+    specification = read_json(spec_path)
+    cases = specification.get("cases") if isinstance(specification, dict) else None
+    if (not isinstance(specification, dict) or specification.get("schema_version") != 1
+            or not isinstance(cases, list) or not cases
+            or any(not isinstance(row, dict) or not isinstance(row.get("id"), str) for row in cases)
+            or len({row["id"] for row in cases}) != len(cases)):
+        raise TaskflowError("decision replay requires unique explicit cases")
+    for case in cases:
+        if (type(case.get("expected_changed")) is not bool
+                or type(case.get("expected_before_accepted")) is not bool
+                or not isinstance(case.get("before"), dict) or not isinstance(case.get("after"), dict)):
+            raise TaskflowError("decision replay must declare before/after proposals and expected choices")
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    store = ExecutionStore(output / "state.sqlite3")
+    store.register_policy("fixture-v1", fixture_policy())
+    task = make_package(output)
+    candidate = capture_candidate(store, task, "replay-candidate")
+    quality = perform(store, output, candidate["candidate_id"], "quality", "replay-quality", {
+        "review.json": json.dumps({"nature": "test_fixture", "scope": "neutral replay gate only"})})
+    quality_refs = [evidence_ref(Path(quality["runtime_path"]) / "artifacts/review.json", "offline fixture only")]
+    store.record_review("replay-review", candidate["candidate_id"], quality["attempt_id"],
+        verdict="accepted", scope="neutral offline decision replay", whole_package=True, evidence=quality_refs)
+    results = []
+    for case in cases:
+        sources = validate_evidence(case.get("sources"))
+        observations = {}
+        for phase in ("before", "after"):
+            proposal = deepcopy(case[phase])
+            proposal.update(decision_id=case["id"] + "-" + phase,
+                task_id=candidate["task_id"], candidate_id=candidate["candidate_id"], evidence=sources)
+            try:
+                decision = apply_record(store, {"operation": "record_decision", "arguments": proposal})["result"]
+                if decision["action"] == "experiment":
+                    explicit_solver_decision(decision)
+                else:
+                    validate_intake(decision.get("intake"), action=decision["action"])
+                observations[phase] = {"accepted": True, "action": decision["action"],
+                                       "decision_id": decision["decision_id"]}
+            except TaskflowError as error:
+                observations[phase] = {"accepted": False, "action": proposal["action"], "error": str(error)}
+        changed = observations["before"]["action"] != observations["after"]["action"]
+        passed = (observations["after"]["accepted"] is True and changed == case["expected_changed"]
+                  and observations["before"]["accepted"] is case["expected_before_accepted"])
+        results.append({"id": case["id"], "sources": sources, **observations,
+                        "choice_changed": changed, "passed": passed})
+    result = {"nature": "offline_decision_replay", "real_model_calls": 0,
+        "cases": results, "passed": all(row["passed"] for row in results),
+        "specification": evidence_ref(spec_path, "explicit coordinator proposals and normal controls"),
+        "limitations": "Historical proposals are coordinator reconstructions, not replayed model reasoning. "
+                        "Only current intake enforcement and explicit decision behavior are tested; "
+                        "no model effect, increased difficulty, new business approval or fee saving is established."}
+    write_json(output / "decision-verification.json", result)
+    return result
+
+
 def replay(manifest_path: Path, input_path: Path, scenario_path: Path, output: Path) -> dict:
     manifest = read_json(manifest_path)
     adjudication = read_json(input_path)
@@ -141,10 +209,19 @@ def replay(manifest_path: Path, input_path: Path, scenario_path: Path, output: P
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--scenario", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--input", type=Path)
+    parser.add_argument("--scenario", type=Path)
+    parser.add_argument("--decisions", type=Path, help="offline coordinator decision proposals and normal controls")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    result = replay(args.manifest, args.input, args.scenario, args.output)
-    print(json.dumps({key: result[key] for key in ("nature", "rejected", "history_intact", "changed_copy_paths", "unchanged_other_public_files")}))
+    if args.decisions:
+        if any((args.manifest, args.input, args.scenario)):
+            parser.error("--decisions cannot be mixed with material replay arguments")
+        result = replay_decisions(args.decisions, args.output)
+        print(json.dumps({key: result[key] for key in ("nature", "passed", "real_model_calls")}))
+    else:
+        if not all((args.manifest, args.input, args.scenario)):
+            parser.error("material replay requires --manifest, --input and --scenario")
+        result = replay(args.manifest, args.input, args.scenario, args.output)
+        print(json.dumps({key: result[key] for key in ("nature", "rejected", "history_intact", "changed_copy_paths", "unchanged_other_public_files")}))

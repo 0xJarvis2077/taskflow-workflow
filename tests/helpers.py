@@ -35,3 +35,41 @@ def add_reviews(task: Path) -> dict:
             "limitations": ["not a real business/model review"], "evidence": ["neutral fixture"],
         })
     return check
+
+
+def assert_legacy_recovery_retired(case, *, action="resume_unclaimed_public_preparation"):
+    """Assert the removed recovery contract against unchanged actual fixture data."""
+    from pathlib import Path
+    import tempfile
+
+    from taskflow.contracts import TaskflowError
+    from taskflow.execution_lifecycle import resume_path_transport
+    from taskflow.execution_store import ExecutionStore, evidence_ref
+
+    store = getattr(case, "store", None)
+    if store is None:
+        for name in ("case", "fixture", "author"):
+            store = getattr(getattr(case, name, None), "store", None)
+            if store is not None:
+                break
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        if store is None:
+            store = ExecutionStore(root / "state.sqlite3")
+        original = root / "original-exception.json"
+        original.write_text('{"status":"exception","simulation":true}\n', encoding="utf-8")
+        old_bytes = original.read_bytes()
+        before = (store.dashboard(), store.list_flows(), store.events())
+        receipts = {}
+        for record in before[1]:
+            name = record["state"].get("receipt")
+            if name and Path(name).is_file():
+                receipts[name] = Path(name).read_bytes()
+        with case.assertRaisesRegex(TaskflowError, "recovery is retired"):
+            resume_path_transport(store, "historical-source", {
+                "action": action, "reason": "Explicitly retired neutral recovery contract",
+                "evidence": [evidence_ref(original, "original simulated exception")]})
+        case.assertEqual(before, (store.dashboard(), store.list_flows(), store.events()))
+        case.assertEqual(old_bytes, original.read_bytes())
+        for name, raw in receipts.items():
+            case.assertEqual(raw, Path(name).read_bytes())

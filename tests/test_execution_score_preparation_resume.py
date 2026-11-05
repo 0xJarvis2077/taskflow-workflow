@@ -171,34 +171,20 @@ class ScorePreparationResumeTests(unittest.TestCase):
             return resume_path_transport(self.store, self.record["flow_id"], self.resolution)
 
     def test_ready_same_sid_resume_preserves_originals_and_same_stage_without_claim(self):
-        attempts = copy.deepcopy(self.store.dashboard()["attempts"])
-        result = self.resume()
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("score_prepare", result["state"]["stage"])
-        self.assertIsNone(result["state"]["current_work_id"])
-        self.assertEqual(attempts, self.store.dashboard()["attempts"])
-        self.assertEqual(self.record["definition"], result["definition"])
-        for path, data in self.originals.items():
-            self.assertEqual(data, path.read_bytes())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_any_claimed_score_attempt_rejects_without_reset(self):
-        attempt = self.store.claim("neutral-score-owner", [self.prepared["work"]["work_id"]])
-        with self.assertRaisesRegex(TaskflowError, "score attempt already exists"):
-            self.resume()
-        self.assertEqual("claimed", self.store.get_attempt(attempt["attempt_id"])["state"])
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_prepared_proof_or_existing_launch_marker_cannot_be_cleared(self):
-        changed = copy.deepcopy(self.prepared)
-        changed["run_digest"] = "0" * 64
-        write_json(self.prepared_path, changed)
-        self.resolution["preparation"] = evidence_ref(self.prepared_path, "wrong run proof")
-        with self.assertRaisesRegex(TaskflowError, "original facts/run"):
-            self.resume()
-        write_json(self.prepared_path, self.prepared)
-        self.resolution["preparation"] = evidence_ref(self.prepared_path, "actual ready proof")
-        write_json(Path(self.prepared["runtime"]) / "dispatch.json", {"intent": "already uncertain"})
-        with self.assertRaisesRegex(TaskflowError, "launch or collection"):
-            self.resume()
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 

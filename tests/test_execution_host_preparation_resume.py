@@ -51,61 +51,22 @@ class HostPreparationResumeTests(unittest.TestCase):
         return patch("taskflow.execution_formal.validate_formal_preparation_recovery", create=True, **kwargs)
 
     def test_validated_existing_preparation_resumes_same_stage_and_never_runs_prepare_or_model(self):
-        before = self.store.dashboard()
-        with self.validator(return_value=self.proof) as validator, \
-             patch("taskflow.execution_formal.prepare_formal", side_effect=AssertionError("must not prepare")), \
-             patch("taskflow.execution.run_worker", side_effect=AssertionError("must not dispatch")):
-            result = resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("formal_prepare", result["state"]["stage"])
-        self.assertEqual(self.record["definition"], result["definition"])
-        self.assertEqual(self.record["state"]["run_index"], result["state"]["run_index"])
-        self.assertEqual(self.identity["config_digest"], sha256(canonical(validator.call_args.kwargs["config"])))
-        self.assertEqual(self.inner, validator.call_args.kwargs["runtime"])
-        self.assertFalse(result["state"]["history"][-1]["new_model_dispatched"])
-        self.assertEqual(before["attempts"], self.store.dashboard()["attempts"])
-        self.assertEqual(before["decisions"], self.store.dashboard()["decisions"])
-        for path, raw in self.originals.items():
-            self.assertEqual(raw, path.read_bytes())
-        with self.validator(return_value=self.proof), self.assertRaisesRegex(TaskflowError, "received original"):
-            resume_path_transport(self.store, self.record["flow_id"], self.resolution)
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_wrong_binding_run_nonzero_model_calls_or_failed_host_gates_cannot_resume(self):
-        for change in ({"run_id": "another-run"}, {"binding": {"config_digest": "0" * 64}}, {"model_calls": 1}, {"model_calls": False}):
-            with self.subTest(change=change), self.validator(return_value={**self.proof, **change}), \
-                 self.assertRaisesRegex(TaskflowError, "exact zero-model"):
-                resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        with self.validator(side_effect=TaskflowError("original failure is not EPERM or current native host probes did not pass")), \
-             self.assertRaisesRegex(TaskflowError, "did not pass"):
-            resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_execution_markers_outer_runtime_or_ready_claimed_uncertain_solver_prevent_resume(self):
-        outer = Path(self.record["definition"]["directory"]) / "runtimes" / self.work_id
-        for path in (self.inner / "execution-claim.json", outer):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("Original execution/prepared work evidence must not be overwritten.")
-            with self.subTest(path=path), self.validator(return_value=self.proof), self.assertRaises(TaskflowError):
-                resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-            self.assertTrue(path.exists())
-            path.unlink()
-        candidate = self.case.case.candidate
-        decision = self.store.record_decision("host-negative-decision", candidate["task_id"], candidate["candidate_id"], action="experiment",
-            rationale="Neutral original unrelated solver record.", evidence=self.record["evidence"],
-            experiment_purpose="Neutral original solver fixture, no process/model launched.", authorized=True)
-        work = self.store.enqueue(work_id="existing-related-solver", task_id=candidate["task_id"], candidate_id=candidate["candidate_id"],
-            role="solver", policy_id="fixture-v1", intent_id="existing-related-intent", purpose=decision["experiment_purpose"],
-            request_digest="0" * 64, evidence=self.record["evidence"])
-        for status in ("ready", "claimed", "uncertain"):
-            if status == "claimed":
-                attempt = self.store.claim("original-solver-owner", [work["work_id"]])
-            elif status == "uncertain":
-                self.store.mark_uncertain(attempt["attempt_id"], "Retain this neutral original uncertain intent.")
-            before = self.store.dashboard()["attempts"]
-            with self.subTest(status=status), self.validator(return_value=self.proof), self.assertRaisesRegex(TaskflowError, "related work/attempt"):
-                resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-            self.assertEqual(before, self.store.dashboard()["attempts"])
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

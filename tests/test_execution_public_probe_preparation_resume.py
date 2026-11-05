@@ -84,95 +84,40 @@ class PublicProbePreparationResumeTests(unittest.TestCase):
                 db.execute("UPDATE execution_flows SET state=? WHERE flow_id=?", (original, self.record["flow_id"]))
 
     def test_final_typed_recovery_resumes_once_and_preserves_original_decision_intent_and_receipt(self):
-        before = self.metadata()
-        with self.validator(return_value=self.proof) as validated, \
-             patch("taskflow.execution_formal.validate_formal_preparation_recovery", side_effect=AssertionError("not EPERM")), \
-             patch("taskflow.execution_formal.prepare_formal", side_effect=AssertionError("must not prepare")), \
-             patch("taskflow.execution.run_worker", side_effect=AssertionError("must not dispatch")), \
-             patch.object(self.store, "dashboard", side_effect=AssertionError("no unrelated quality scan")):
-            result = resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("formal_prepare", result["state"]["stage"])
-        self.assertEqual(self.record["definition"], result["definition"])
-        self.assertEqual(self.resolution["preparation"], result["state"]["formal_preparation_recovery"])
-        self.assertEqual(self.case.identity["config_digest"], sha256(canonical(validated.call_args.kwargs["config"])))
-        self.assertEqual(before, self.metadata())
-        appended = result["state"]["history"][-1]
-        self.assertEqual("validated_public_probe_formal_preparation_resolution", appended["kind"])
-        self.assertEqual(self.record["state"]["exception"], appended["previous_exception"])
-        self.assertEqual(self.proof, appended["preparation_validation"])
-        self.assertFalse(appended["new_model_dispatched"])
-        for path, raw in self.originals.items():
-            self.assertEqual(raw, path.read_bytes())
-        with self.validator(return_value=self.proof), self.assertRaisesRegex(TaskflowError, "replace a recovery"):
-            resume_path_transport(self.store, self.record["flow_id"], self.resolution)
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_draft_old_kind_foreign_binding_or_nonzero_model_proofs_cannot_resume(self):
-        variants = [{"schema_version": True}, {"kind": "public_probe_source_recovery_preparation"},
-            {"kind": "validated_zero_inference_host_preparation_recovery"}, {"run_id": "another-run"},
-            {"binding": {}}, {"model_calls": 1}, {"model_calls": False}, {"recovery": {}},
-            {"source_change": {"kind": "unrelated_source_change"}},
-            {"source_change": {"kind": "deterministic_public_probe_target_v1"}}]
-        before = self.metadata()
-        for variant in variants:
-            with self.subTest(variant=variant), self.validator(return_value={**self.proof, **variant}), self.assertRaises(TaskflowError):
-                resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        with self.validator(side_effect=TaskflowError("real public source/probe validation failed")), self.assertRaisesRegex(TaskflowError, "validation failed"):
-            resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
-        self.assertEqual(before, self.metadata())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_business_holds_prior_recovery_and_wrong_stage_never_reach_validator(self):
-        for changes in ({"pending_business_scope": {}}, {"pending_business_scope": False},
-                        {"pending_business_scope": {"reason": "substantive choice pending"}},
-                        {"formal_preparation_recovery": self.resolution["preparation"]},
-                        {"current_work_id": "an-original-work"}, {"stage": "formal_wait"}):
-            with self.subTest(changes=changes), self.changed_state(**changes), \
-                 self.validator(side_effect=AssertionError("must reject before helper")), self.assertRaises(TaskflowError):
-                resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_execution_markers_and_related_ready_claimed_uncertain_work_block_without_requeue(self):
-        outer = Path(self.record["definition"]["directory"]) / "runtimes" / self.case.work_id
-        for path in (self.case.inner / "execution-claim.json", self.case.inner / "collection.json", outer):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("Retain original execution evidence.\n", encoding="utf-8")
-            with self.subTest(path=path), self.validator(return_value=self.proof), self.assertRaises(TaskflowError):
-                resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-            path.unlink()
-        candidate = self.case.case.case.candidate
-        work = self.store.enqueue(work_id="existing-related-solver", task_id=candidate["task_id"], candidate_id=candidate["candidate_id"],
-            role="solver", policy_id="fixture-v1", intent_id="existing-related-intent", purpose=self.decision["experiment_purpose"],
-            request_digest="0" * 64, evidence=self.record["evidence"])
-        for status in ("ready", "claimed", "uncertain"):
-            if status == "claimed":
-                attempt = self.store.claim("original-owner", [work["work_id"]])
-            elif status == "uncertain":
-                self.store.mark_uncertain(attempt["attempt_id"], "Retain the actual uncertain original fixture.")
-            before = self.metadata()
-            with self.subTest(status=status), self.validator(return_value=self.proof), self.assertRaisesRegex(TaskflowError, "related work/attempt"):
-                resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-            self.assertEqual(before, self.metadata())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_original_intent_receipt_and_current_source_bytes_are_rechecked(self):
-        for path in (self.case.intent, Path(self.record["state"]["receipt"]),
-                     Path(self.record["state"]["candidate_root"]) / "task.json"):
-            raw = path.read_bytes()
-            try:
-                path.write_bytes(raw + b"drift")
-                with self.subTest(path=path), self.validator(return_value=self.proof), self.assertRaises((TaskflowError, ValueError)):
-                    resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-            finally:
-                path.write_bytes(raw)
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_old_host_action_never_selects_public_probe_validator(self):
-        resolution = {**self.resolution, "action": "resume_validated_host_formal_preparation"}
-        with patch("taskflow.execution_formal.validate_formal_preparation_recovery", side_effect=TaskflowError("not the old EPERM failure")) as old, \
-             self.validator(side_effect=AssertionError("old route cannot invoke public source recovery")), \
-             self.assertRaisesRegex(TaskflowError, "not the old EPERM"):
-            resume_path_transport(self.store, self.record["flow_id"], resolution)
-        old.assert_called_once()
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 class PublicProbeConsumerForwardingTests(unittest.TestCase):

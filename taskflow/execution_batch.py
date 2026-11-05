@@ -24,7 +24,8 @@ ROLE_KEYS = (
 CHAT_ROLES = frozenset({"coordinator", "content_inspector", "engineer", "health_auditor"})
 CLI_ROLES = frozenset(set(ROLE_KEYS) - CHAT_ROLES)
 NATURAL_SLOTS = {"author": "author", "repair": "repair", "solver": "solver",
-                 "reviewer": "reviewer", "review-facts": "reviewer", "review-score": "reviewer"}
+                 "reviewer": "reviewer", "review-facts": "reviewer", "review-score": "reviewer",
+                 "content-inspector": "content_inspector"}
 LOW_ROLE_SLOTS = {**{key: {value} for key, value in NATURAL_SLOTS.items()},
                   "quality": {"quality", "public_rebuild", "recheck"}}
 
@@ -92,10 +93,11 @@ def _scope(plan: dict) -> dict:
 def _runtime(role: str, runtime: Any) -> dict:
     if not isinstance(runtime, dict):
         raise TaskflowError(role + ".runtime: explicit runtime required")
-    carrier = "chat" if role in CHAT_ROLES else "cli"
+    carrier = "chat" if role in CHAT_ROLES and not (
+        role == "content_inspector" and runtime.get("carrier") == "cli") else "cli"
     allowed = {"carrier", "provider"} if carrier == "chat" else {
         "carrier", "provider", "cli", "reasoning_selection", "reasoning_effort",
-        "reasoning_context", "timeout_seconds", "support_evidence"}
+        "reasoning_context", "timeout_seconds", "support_evidence", "native_provider"}
     if set(runtime) - allowed:
         raise TaskflowError(role + ".runtime has unknown configuration fields")
     if runtime.get("carrier") != carrier:
@@ -122,6 +124,8 @@ def _runtime(role: str, runtime: Any) -> dict:
         raise TaskflowError(role + ".timeout_seconds must be positive and finite")
     result["timeout_seconds"] = timeout
     result["support_evidence"] = copy.deepcopy(runtime.get("support_evidence"))
+    if "native_provider" in runtime:
+        result["native_provider"] = copy.deepcopy(runtime["native_provider"])
     return result
 
 
@@ -168,6 +172,32 @@ def _catalog_effort(item: Any) -> str | None:
 
 def _support(role: str, row: dict, mode: str, refs: list[dict], captured: dict | None) -> None:
     runtime = row["runtime"]
+    if runtime.get("native_provider") is not None:
+        native_ref, raw = _reference(runtime["native_provider"], captured)
+        native = parse_json(raw, "native Codex provider")
+        if (native.get("kind") != "codex_role_provider_v1" or native.get("model") != row["model"]
+                or native.get("provider") != runtime["provider"]
+                or native.get("reasoning_effort") != runtime["reasoning_effort"]
+                or native.get("wire_api") != "responses"
+                or native.get("cli", {}).get("path") != runtime["cli"]):
+            raise TaskflowError("native Codex provider differs from explicit batch choices")
+        refs.append(native_ref)
+        sources = [native["cli"], native["catalog"], *native["documentation"]]
+        if not native["documentation"]:
+            raise TaskflowError("native Codex provider documentation required")
+        for item in sources:
+            original, _ = _reference(item, captured)
+            refs.append(original)
+        _, raw = _reference(native["catalog"], captured)
+        catalog = parse_json(raw, "explicit role model catalog")
+        matches = [item for item in catalog["models"] if item.get("slug") == row["model"]]
+        if (len(matches) != 1 or matches[0].get("tool_mode") != "direct"
+                or runtime["reasoning_effort"] not in [
+                    _catalog_effort(item) for item in matches[0]["supported_reasoning_levels"]]):
+            raise TaskflowError("requested model/effort absent from explicit role catalog")
+        # This is a documented configuration declaration, not an account/service probe.
+        # The actual CLI and provider config are checked again by native preparation.
+        return
     reference, raw = _reference(runtime["support_evidence"], captured)
     proof = parse_json(raw, role + " support evidence")
     origin = "test_fixture" if mode == "test_fixture" else "original_cli_observation"
@@ -269,7 +299,7 @@ def _check(plan: dict, captured: dict | None = None) -> dict:
     for key, row in roles.items():
         if not row["enabled"]:
             continue
-        if key in CHAT_ROLES:
+        if row["runtime"]["carrier"] == "chat":
             chats[key] = _chat(key, row, bindings.get(key), digests["scope"], refs, captured)
         else:
             _support(key, row, mode, refs, captured)
@@ -297,7 +327,8 @@ def check_batch_plan(plan_path: Path) -> dict:
                 if not isinstance(model, str) or not model.strip() or model.strip().casefold() in {"auto", "default"}:
                     missing.append(key)
                 bindings = plan.get("role_bindings", {})
-                if key in CHAT_ROLES and (not isinstance(bindings, dict) or not bindings.get(key)):
+                if (key in CHAT_ROLES and (row.get("runtime") or {}).get("carrier") != "cli"
+                        and (not isinstance(bindings, dict) or not bindings.get(key))):
                     unknown_chats.append(key)
     try:
         normalized = _check(plan)
@@ -419,7 +450,8 @@ def validate_batch_policy(config: dict) -> dict | None:
     if config.get("model_confirmation_required") is not True or not isinstance(config.get("model_slots"), dict):
         raise TaskflowError("batch policy requires confirmation flag, snapshot and complete model_slots")
     snapshot = load_batch_snapshot(config.get("batch_snapshot"))
-    expected = {k: role_config(snapshot, k) for k in ROLE_KEYS if k in CLI_ROLES and snapshot["roles"][k]["enabled"]}
+    expected = {k: role_config(snapshot, k) for k in ROLE_KEYS
+                if snapshot["roles"][k]["enabled"] and snapshot["roles"][k]["runtime"]["carrier"] == "cli"}
     if config["model_slots"] != expected:
         raise TaskflowError("batch policy model_slots differ from the complete confirmed CLI map")
     return snapshot

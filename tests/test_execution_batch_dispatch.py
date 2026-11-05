@@ -129,15 +129,14 @@ class BatchDispatchTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskflowError, "original batch"):
             validate_batch_runner(value)
 
-    def test_new_batch_entry_rejects_missing_snapshot_before_store_and_historical_factory_has_no_default(self):
-        factory, packet = self.root / "factory.json", self.root / "packet.json"
-        write_json(factory, {"schema_version": 1, "policy_id": "old"})
-        write_json(packet, {"items": [{"task_id": "neutral-task"}]})
-        code, _, _ = self.call("batch-author-start", "--factory", str(factory), "--packet", str(packet))
-        self.assertEqual(2, code)
+    def test_retired_author_entries_reject_before_store_with_no_historical_default(self):
+        for command in ("batch-author-start", "author-start"):
+            with self.subTest(command=command), patch("taskflow.execution_store.ExecutionStore") as store, contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    execution.main([command, "--factory", "unused.json", "--packet", "unused.json"])
+                self.assertEqual(2, error.exception.code)
+                store.assert_not_called()
         self.assertFalse((self.root / "never.sqlite3").exists())
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            execution.parser().parse_args(["author-start", "--packet", str(packet)])
 
     def factory_infrastructure(self):
         template = self.root / "generic-template.json"
@@ -162,33 +161,22 @@ class BatchDispatchTests(unittest.TestCase):
         self.assertEqual("other-provider/reviewer", experiment["technical"]["review_runner"]["model"])
         packet = self.root / "packet.json"
         write_json(packet, {"batch_id": "foreign-batch", "items": [{"task_id": "neutral-task"}]})
-        code, _, error = self.call("batch-author-start", "--factory", str(factory), "--packet", str(packet))
-        self.assertEqual(2, code)
-        self.assertIn("batch_id", error)
-        self.assertFalse((self.root / "never.sqlite3").exists())
-        code, _, error = self.call("batch-author-start", "--factory", str(factory), "--packet", str(packet),
-                                   "--retry-failed-native-probe-sha256", "a" * 64)
-        self.assertEqual(2, code)
-        self.assertIn("batch_id", error)
+        with self.assertRaisesRegex(TaskflowError, "batch_id"):
+            checked_batch_factory(factory, packet)
         self.assertFalse((self.root / "never.sqlite3").exists())
         write_json(packet, {"batch_id": "neutral-batch", "items": [{"task_id": "foreign-task"}]})
         with self.assertRaisesRegex(TaskflowError, "scope"):
             checked_batch_factory(factory, packet)
 
-    def test_batch_policy_registration_reuses_exact_bytes_and_cli_reentry_is_idempotent(self):
+    def test_batch_policy_registration_reuses_exact_confirmed_bytes_idempotently(self):
         self.factory_infrastructure()
         result = compile_batch_configuration(self.plan_path, self.infra, self.root / "configuration")
         factory, packet = Path(result["author_factory"]["path"]), self.root / "packet.json"
-        # The author interface is a deliberate no-dispatch double here. The
-        # separate full-chain test executes actual fixture workers/collectors.
-        with patch("taskflow.execution_author.start_author_from_packet", return_value={"state": "fixture_ready", "model_calls": 0}) as prepare:
-            for intent in ("first", "first", "second"):
-                write_json(packet, {"batch_id": "neutral-batch", "items": [{"task_id": "neutral-task", "intent_id": intent}]})
-                code, output, error = self.call("batch-author-start", "--factory", str(factory), "--packet", str(packet))
-                self.assertEqual(0, code, error)
-                self.assertEqual("fixture_ready", output["state"])
-            self.assertEqual(3, prepare.call_count)
         store = ExecutionStore(self.root / "never.sqlite3")
+        for intent in ("first", "first", "second"):
+            write_json(packet, {"batch_id": "neutral-batch", "items": [{"task_id": "neutral-task", "intent_id": intent}]})
+            _, policy = checked_batch_factory(factory, packet)
+            store.register_policy(**policy)
         original = store.get_policy("neutral-batch-v1")
         self.assertEqual(1, len([event for event in store.events() if event["kind"] == "policy_registered"]))
         changed = copy.deepcopy(original["config"])
@@ -196,23 +184,19 @@ class BatchDispatchTests(unittest.TestCase):
         with self.assertRaisesRegex(TaskflowError, "different original"):
             store.register_policy("neutral-batch-v1", changed)
         self.assertEqual(original, store.get_policy("neutral-batch-v1"))
+        self.assertEqual([], store.dashboard()["attempts"])
 
-    def test_probe_retry_flag_is_exclusive_to_batch_author_and_is_forwarded(self):
-        self.factory_infrastructure()
-        result = compile_batch_configuration(self.plan_path, self.infra, self.root / "configuration")
-        factory, packet = Path(result["author_factory"]["path"]), self.root / "packet.json"
-        write_json(packet, {"batch_id": "neutral-batch", "items": [{"task_id": "neutral-task", "intent_id": "first"}]})
-        with patch("taskflow.execution_author.start_author_from_packet", return_value={"state": "ready"}) as prepare:
-            code, _, error = self.call("batch-author-start", "--factory", str(factory), "--packet", str(packet),
-                                       "--retry-failed-native-probe-sha256", "a" * 64,
-                                       "--retry-failed-native-probe-sha256", "b" * 64)
-            self.assertEqual(0, code, error)
-            self.assertEqual(["a" * 64, "b" * 64], prepare.call_args.kwargs["retry_failed_probes"])
-        with contextlib.redirect_stderr(io.StringIO()):
-            for operation in ("author-start", "batch-experiment-start"):
-                with self.subTest(operation=operation), self.assertRaises(SystemExit):
-                    execution.parser().parse_args([operation, "--factory", str(factory), "--packet", str(packet),
-                                                   "--retry-failed-native-probe-sha256", "a" * 64])
+    def test_retired_probe_retry_flag_cannot_create_an_author_attempt(self):
+        for operation in ("author-start", "batch-author-start", "batch-experiment-start"):
+            with self.subTest(operation=operation), contextlib.redirect_stderr(io.StringIO()), patch(
+                "taskflow.execution_author.start_author_from_packet"
+            ) as prepare:
+                with self.assertRaises(SystemExit) as error:
+                    execution.main([operation, "--factory", "unused.json", "--packet", "unused.json",
+                                    "--retry-failed-native-probe-sha256", "a" * 64])
+                self.assertEqual(2, error.exception.code)
+                prepare.assert_not_called()
+        self.assertFalse((self.root / "never.sqlite3").exists())
 
     def test_invalid_infrastructure_fails_before_freezing(self):
         base = read_json(self.infra)

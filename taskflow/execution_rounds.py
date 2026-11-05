@@ -8,8 +8,10 @@ locked first run, relaxes a quality gate, or starts a process from a tick.
 from contextlib import contextmanager
 from contextvars import ContextVar
 import json
+import os
 from pathlib import Path
 import sqlite3
+import time
 from types import SimpleNamespace
 
 from taskflow.contracts import TaskflowError, canonical, read_json, sha256, validate_id
@@ -21,6 +23,109 @@ KIND = "bounded_original_rounds_v1"
 PROTOCOL = "<taskflow_bounded_original_round_v1>"
 _CLAIM = ContextVar("bounded_original_round_claim", default=None)
 _ROLES = ("solver", "review-facts", "review-score")
+
+
+def managed_round_startup(store, record, directory):
+    """Handshake after interpreter startup, before work or normal exit.
+
+    On framework Python the launch executable can re-exec into Python.app.
+    The parent must observe the settled child identity, not that transient PID.
+    """
+    from taskflow.execution_experiment_factory import _process_identity
+    from taskflow.execution_flow import _publish_once
+
+    paths = [directory / "consumer-launch-intent.json"]
+    paths.extend(sorted((directory / "consumer-generations").glob("*/consumer-launch-intent.json")))
+    if not paths[-1].exists():
+        return
+    intent_path = paths[-1]
+    intent = read_json(intent_path)
+    if not intent.get("normal_wait_handshake"):
+        return
+    _require(intent.get("flow_id") == record["flow_id"]
+             and intent.get("definition_digest") == record["definition_digest"], "startup intent differs")
+    process = _process_identity(os.getpid())
+    _publish_once(intent_path.parent / ("consumer-started-" + str(os.getpid()) + ".json"), {
+        "process": process, "launch_intent": evidence_ref(intent_path, "original consumer launch intent")})
+    deadline = time.monotonic() + 5
+    receipt_path = intent_path.parent / "consumer-launch.json"
+    while not receipt_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    _require(receipt_path.exists(), "startup PID receipt missing; no round work permitted")
+    receipt = read_json(receipt_path)
+    _require(receipt.get("process", {}).get("pid") == os.getpid()
+             and process.get("start_identity")
+             and receipt["process"].get("start_identity") == process["start_identity"],
+             "startup process identity is unproven; no round work permitted")
+
+
+def record_normal_wait_exit(store, record):
+    """Seal a managed consumer's normal wait while its lifecycle lock is held.
+
+    Missing launcher receipts fail closed: this does not reconstruct a launch
+    window or turn a direct/manual invocation into a managed consumer.
+    """
+    from taskflow.execution_experiment_factory import _consumer_launch_chain, _process_identity, _source_refs
+    from taskflow.execution_flow import _publish_once
+
+    repository = Path(__file__).resolve().parents[1]
+    directory = Path(record["definition"]["directory"])
+    if not (directory / "consumer-launch-intent.json").exists():
+        return
+    try:
+        intent_path, _, intent, receipt, _ = _consumer_launch_chain(directory, record, store, repository)
+    except (TaskflowError, OSError, ValueError, KeyError, TypeError) as exc:
+        return {"recorded": False, "reason": str(exc)}
+    process = _process_identity(os.getpid())
+    original = receipt.get("process", {})
+    if (not process.get("start_identity")
+            or any(original.get(key) != process.get(key) for key in ("pid", "start_identity"))
+            or intent["source_refs"] != _source_refs(repository)):
+        return {"recorded": False, "reason": "consumer process identity or loaded source differs from launch",
+                "identity_matches": all(original.get(key) == process.get(key) for key in ("pid", "start_identity")),
+                "identity_observable": bool(process.get("start_identity")),
+                "source_matches": intent["source_refs"] == _source_refs(repository)}
+    _publish_once(intent_path.parent / "consumer-wait-exit.json", {
+        "schema_version": 1, "kind": "bounded_round_normal_wait_v1",
+        "flow_id": record["flow_id"], "definition_digest": record["definition_digest"],
+        "process": original, "launch_intent": evidence_ref(intent_path, "original consumer launch intent"),
+        "waiting": record["state"]["waiting"], "revision": record["revision"],
+        "state_digest": sha256(canonical(record["state"])),
+    })
+    return {"recorded": True}
+
+
+def validate_normal_wait_exit(store, record, intent_path, receipt, repository):
+    """Require exact normal-wait provenance; caller proves process death and lock."""
+    from taskflow.execution_experiment_factory import _source_refs
+
+    ref = evidence_ref(intent_path.parent / "consumer-wait-exit.json", "proven normal bounded-round wait exit")
+    proof = read_json(Path(ref["path"]))
+    intent = read_json(intent_path)
+    _require(proof.get("schema_version") == 1 and proof.get("kind") == "bounded_round_normal_wait_v1"
+             and proof.get("flow_id") == record["flow_id"]
+             and proof.get("definition_digest") == record["definition_digest"]
+             and proof.get("process") == receipt.get("process")
+             and proof.get("launch_intent") == evidence_ref(intent_path, "original consumer launch intent")
+             and proof.get("waiting") in {"observing_locked_first_original", "next_business_binding_required"},
+             "consumer has no exact normal wait exit proof")
+    _require(intent["source_refs"] == _source_refs(repository), "normal wait source changed; technical recovery required")
+    state = record["state"]
+    _require(state.get("status") == "active" and state.get("mode") == "running"
+             and not state.get("exception") and not state.get("pending_business_scope")
+             and not state.get("current_work_id")
+             and record["revision"] >= proof["revision"], "normal wait plan is no longer active")
+    with store._db() as db:
+        _schema(db)
+        _controls(db, record["definition"])
+        completed = _completed(db, record)
+        _revalidate_completed(store, record, completed)
+        pending = [item for item in _bindings(db, record["flow_id"])
+                   if item["ordinal"] > len(completed) and item["owned"]]
+        _require(not any(store.list_attempts(work) for item in pending
+                         for work in item["work_ids"].values()),
+                 "normal wait cannot restart a round with existing attempts")
+    return {"normal_wait_exit": ref, "source_refs": intent["source_refs"]}
 
 
 def _require(value, message):
@@ -252,7 +357,10 @@ def bind_round_from_packet(store, identity, *, ordinal, packet_ref, factory_conf
         _revalidate_completed(tx, record, done)
         prepared = start_experiments_from_packet(tx, packet_ref=ref, factory_config_ref=factory, allow_model=False)
         _require(len(prepared["items"]) == 1, "one exact next experiment required")
-        source = tx.get_flow(prepared["items"][0]["flow_id"])
+        item = prepared["items"][0]
+        _require(item.get("status") != "attention",
+                 "next experiment factory rejected packet: " + str(item.get("reason", "unspecified factory failure")))
+        source = tx.get_flow(item["flow_id"])
         _check_source(definition, source)
         _require(source["definition"]["authorization"] == ref
                  and source["definition"].get("factory_config_ref") == factory,

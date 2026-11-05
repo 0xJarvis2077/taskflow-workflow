@@ -12,22 +12,29 @@ import trace
 import unittest
 from pathlib import Path
 
+from taskflow.task_directories import iter_task_packages
+
 
 def run_suite() -> unittest.TestResult:
     suite = unittest.defaultTestLoader.discover("tests")
     return unittest.TextTestRunner(verbosity=2).run(suite)
 
 
+def _source_files(root: Path) -> list[Path]:
+    return sorted(set(
+        list((root / "taskflow").glob("*.py"))
+        + list((root / "tests").glob("*.py"))
+        + list((root / "tools").glob("*.py"))
+        + [path for package in iter_task_packages(root / "tasks")
+           for path in (package / "checks").glob("*.py")]
+    ))
+
+
 def main() -> int:
     root = Path.cwd()
     output = root / ".local-validation" / "coverage"
     output.mkdir(parents=True, exist_ok=True)
-    sources = sorted(set(
-        list((root / "taskflow").glob("*.py"))
-        + list((root / "tests").glob("*.py"))
-        + list((root / "tools").glob("*.py"))
-        + list((root / "tasks").glob("*/checks/*.py"))
-    ))
+    sources = _source_files(root)
     def hashes() -> dict[str, str]:
         return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
     source_hashes = hashes()

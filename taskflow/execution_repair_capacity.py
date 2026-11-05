@@ -669,6 +669,9 @@ def retry_claim_guard(store, worker_id, work_ids):
                 binding = store._capacity_binding_for_work(db, work["work_id"])
                 _require(work.get("repair_capacity_binding") == binding,
                          "ready work lost or changed its immutable retry issuing binding")
+                from taskflow.execution_legacy_guard import assert_legacy_dispatch_allowed
+
+                assert_legacy_dispatch_allowed(db, work)
                 if binding is not None:
                     _require(work.get("role") == binding["role"] and work.get("task_id") == binding["task_id"]
                              and work.get("candidate_id") == binding["candidate_id"]

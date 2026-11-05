@@ -1,6 +1,6 @@
 """Transport sealed independent reviews without judging or changing their scores."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 import copy
 from functools import wraps
 import json
@@ -18,6 +18,7 @@ from taskflow.execution_runner import (
     _relative, RunnerError,
     archive_full_attempt,
 )
+from taskflow.execution_codex_provider import provider_references_equal
 from taskflow.execution_store import evidence_ref, validate_evidence
 from taskflow.packages import verify_snapshot
 from taskflow.records import (
@@ -266,6 +267,11 @@ def _locators(row: dict, score: dict) -> list[tuple[str, str | dict]]:
 
 
 def _project(score: dict, context: dict, config: dict, run: dict, snapshot: dict) -> tuple[dict, list[dict]]:
+    supplement = context.get("eligibility_correction")
+    if supplement is not None:
+        from taskflow.execution_review_supplement import validate_output
+
+        validate_output(score, supplement)
     criteria = score.get("criteria", score.get("items"))
     if not isinstance(criteria, list):
         raise TaskflowError("signed first score has no criterion list")
@@ -274,8 +280,13 @@ def _project(score: dict, context: dict, config: dict, run: dict, snapshot: dict
         raise TaskflowError("signed score criterion IDs differ from the frozen rubric")
     if score.get("max_score") != snapshot["scoring"]["total"]:
         raise TaskflowError("signed score maximum differs from the frozen rubric")
+    teacher_sources = context["plan"]["stage2_teacher"]
+    if supplement is not None:
+        parent_root = Path(supplement["document"]["parent_score_attempt"])
+        teacher_sources = [{**item, "destination": str(parent_root / "inputs" / item["target"])}
+                           for item in supplement["parent_manifest"]["inputs"] if item["kind"] == "teacher"]
     for source in score.get("frozen_sources", []):
-        matching = [item for item in context["plan"]["stage2_teacher"] if item["destination"] == source.get("path")]
+        matching = [item for item in teacher_sources if item["destination"] == source.get("path")]
         if len(matching) != 1:
             raise TaskflowError("signed frozen source is not part of the locked standards")
         _expect(Path(source["path"]), source)
@@ -338,6 +349,10 @@ def _project(score: dict, context: dict, config: dict, run: dict, snapshot: dict
               "review_status": "reviewed", "evaluator": config.get("evaluator_description", "Independent gpt-6.1-sol/xhigh same-SID two-stage signed original " + config["expected_sid"]),
               "items": items, "total": score.get("total_score"), "local_result_only": True,
               "signed_original_score": score, "source_sha256": context["seal"]["score"]["sha256"]}
+    if supplement is not None:
+        record.update(kind="correction", parent_evaluation_id=supplement["document"]["parent_evaluation_id"],
+                      correction_scope="eligibility_only_unchanged_score",
+                      supplemental_trace_manifest=supplement["reference"])
     issues = _evaluation_issues(record, snapshot, run)
     if issues:
         raise TaskflowError("original score transport validation: " + "; ".join(issues))
@@ -348,6 +363,8 @@ def ingest_signed_evaluation(*, config: dict, destination: Path) -> dict:
     """Receive a terminal legacy two-stage score once, preserving its judgment."""
     if isinstance(config, dict) and config.get("mode") == "managed_two_stage":
         return _ingest_managed(config=config, destination=destination)
+    if config.get("eligibility_correction") is not None:
+        raise TaskflowError("eligibility correction requires the managed same-SID score handoff")
     if not isinstance(config, dict) or config.get("schema_version", 1) != 1:
         raise TaskflowError("signed evaluation config schema is invalid")
     for key in ("review_directory", "run_directory", "snapshot_directory", "evaluation_id", "expected_sid"):
@@ -608,7 +625,8 @@ def _profile_definition(store: object, config: dict, run: dict, snapshot: dict,
     if (policy.get("required_model") != solver["model"]
             or scoped.get("formal", {}).get("model") != solver["model"]
             or policy.get("required_client_reasoning") != reasoning
-            or not all(isinstance(value, str) and value for value in reasoning.values())):
+            or (not all(isinstance(value, str) and value for value in reasoning.values())
+                and not (solver.get("reasoning_selection") == "explicit" and reasoning["context"] is None))):
         raise TaskflowError("local profile policy differs from the registered target model/client configuration")
     actual = [item for item in run["artifacts"] if item["id"] == "actual_configuration"]
     if len(actual) != 1:
@@ -625,6 +643,12 @@ def _profile_definition(store: object, config: dict, run: dict, snapshot: dict,
         "judgment": {"local_profile": "current_registered_local_profile", "local_eligible_values": [True, False, "unknown"],
             "instruction": "Judge the measured local configuration, frozen input/reference binding, captured actual work and visible process evidence. Sign true only when these requirements are supported and no substantive dispute remains; use false for a demonstrated mismatch and unknown for an unresolved requirement, with actual reasons and locators.",
             "limits": "Served identity may remain unknown and must be disclosed. Local parser/probe observations are not official provider identity or a complete outbound production payload capture. Complete capture concerns the retained ordinary final work/scratch, declared delivery, visible trace/request and recorded file-change evidence; deleted transient bytes are not reconstructed. These execution rules add no task grading obligations."}}
+    if solver.get("reasoning_selection") == "explicit":
+        document["requirements"].update(reasoning_selection="explicit",
+            required_request_reasoning_override=solver["reasoning_effort"])
+        document["judgment"]["limits"] += (" This profile uses an explicit reasoning request. Check the actual "
+            "requested model/effort, locked command and retained local capture; client-default resolution "
+            "may remain unknown and is not inferred. Served identity remains separate.")
     document["judgment"]["artifact_completeness"] = "Completeness concerns the run and retained evidence collection, not whether every business delivery or answer is correct. Judge business correctness only under the unchanged task rubric."
     document["judgment"]["input_reference_match"] = "Match means that the supplied and captured input/reference bytes agree with the frozen version and are readable under the registered profile. The model choosing to read less, omit a business delivery or make a business error is a scoring fact, not by itself an invalid experiment. A real provision failure, permission mismatch or environment/capture break may separately support false or unknown with actual evidence."
     path = directory / "local-profile-definition.json"
@@ -633,10 +657,100 @@ def _profile_definition(store: object, config: dict, run: dict, snapshot: dict,
             "authority": authority, "policy_sha256": sha256(canonical(policy))}
 
 
+
+LOCAL_EXECUTION_TARGET = "local-profile-execution-evidence.json"
+
+
+def _validate_local_execution_evidence(reference: dict, *, manifest: dict, run: dict,
+                                       run_directory: Path, snapshot: dict, facts: dict,
+                                       source_manifest: dict | None = None) -> dict:
+    from taskflow.execution_eligibility_evidence import first_score_evidence
+
+    def _require(value, message):
+        if not value:
+            raise TaskflowError(message)
+    _require(isinstance(reference, dict) and set(reference) == {"path", "sha256", "size", "target"}
+             and reference["target"] == LOCAL_EXECUTION_TARGET and isinstance(reference["path"], str)
+             and isinstance(reference["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", reference["sha256"])
+             and type(reference["size"]) is int and reference["size"] >= 0,
+             "local execution evidence reference differs")
+    path = Path(reference["path"])
+    _require(path.is_absolute() and type(reference["size"]) is int, "local execution evidence needs an absolute original and integer size")
+    _require(run["snapshot_digest"] == snapshot["snapshot_digest"], "local execution evidence frozen version differs")
+    _expect(path, reference)
+    document = _read(path)
+    current = document.get("current_reference_comparison")
+    _require(isinstance(current, dict), "local execution evidence current readback object required")
+    observed = current.get("observed_at")
+    origin = source_manifest if source_manifest is not None else manifest
+    _require(isinstance(observed, str) and _time(facts["at"]) <= _time(observed) <= _time(origin["created_at"]),
+             "local execution evidence current-readback time differs")
+    expected = first_score_evidence(run=run, run_directory=run_directory,
+        snapshot=Path(run["snapshot_path"]), inputs=origin["inputs"], input_root=None,
+        scoring_source_allowlist=origin["scoring_source_allowlist"], observed_at=observed)
+    _require(canonical(document) == canonical(expected), "local execution observations differ from exact retained sources")
+    entries = [item for item in manifest["inputs"]
+               if item["source"] == str(path) or item["target"] == LOCAL_EXECUTION_TARGET]
+    _require(len(entries) == 1 and entries[0]["source"] == str(path)
+             and entries[0]["target"] == LOCAL_EXECUTION_TARGET and entries[0]["kind"] == "trace"
+             and all(entries[0][k] == reference[k] for k in ("sha256", "size")),
+             "local execution evidence input binding differs")
+    return document
+
+
+def _local_execution_trace(*, run: dict, config: dict, runner: dict, binding: dict,
+                           clean: Path, runtime: Path, facts: dict) -> dict:
+    from taskflow.execution_eligibility_evidence import first_score_evidence
+
+    # Prepared legacy originals cannot acquire new input or a new request on reentry.
+    old_binding = _read(runtime.parent / (runtime.name + "-review") / "review-binding.json") if (
+        runtime.parent / (runtime.name + "-review") / "review-binding.json").exists() else {}
+    previous = old_binding.get("local_execution_evidence")
+    if runtime.exists() and previous is None:
+        return binding
+    path = clean / LOCAL_EXECUTION_TARGET
+    retained = _read(path) if path.exists() else None
+    current = retained.get("current_reference_comparison") if retained is not None else None
+    if retained is not None and not isinstance(current, dict):
+        raise TaskflowError("partial local execution evidence has no current-readback object")
+    observed = current.get("observed_at") if current is not None else datetime.now(timezone.utc).isoformat()
+    if not isinstance(observed, str) or not _time(facts["at"]) <= _time(observed) <= datetime.now(timezone.utc):
+        raise TaskflowError("partial local execution evidence time differs from the original facts")
+    sources = [{"source": item["path"], **item, **_info(Path(item["path"]))}
+               for item in runner["inputs"] if item["kind"] == "teacher"]
+    document = first_score_evidence(run=run, run_directory=Path(config["run_directory"]),
+        snapshot=Path(run["snapshot_path"]), inputs=sources, input_root=None,
+        scoring_source_allowlist=runner["scoring_source_allowlist"], observed_at=observed)
+    if previous is not None:
+        if previous.get("path") != str(path) or previous.get("target") != LOCAL_EXECUTION_TARGET:
+            raise TaskflowError("prepared local execution evidence original path differs")
+        _expect(path, previous)
+    if retained is not None:
+        if canonical(retained) != canonical(document):
+            raise TaskflowError("prepared local execution observations changed on reentry")
+    else:
+        _publish(path, document)
+    reference = {"path": str(path), **_info(path), "target": LOCAL_EXECUTION_TARGET}
+    runner["inputs"].append({"path": str(path), "kind": "trace", "target": LOCAL_EXECUTION_TARGET})
+    runner["dependencies"] = [*runner.get("dependencies", []),
+        *[item["source"]["path"] for item in document["retained_execution"]],
+        document["frozen_public_input"]["manifest"]["path"]]
+    runner["request_sections"].append({"kind":"operation", "text":
+        "Use local-profile-execution-evidence.json only for experiment_validity/artifact_status local-profile evidence. "
+        "It contains bounded retained launch/input observations and an explicitly current selected-source/frozen comparison, "
+        "not a historical independent witness or a production payload capture. The safe command view redacts opaque configuration; "
+        "missing observations stay missing. Keep actual_configuration as the capture/model/reasoning source; do not infer served identity. "
+        "Do not cite this qualification trace as a grading criterion or change task obligations. Sign true, false or unknown independently."})
+    return {**binding, "local_execution_evidence": reference}
+
 def _review_batch_pair(facts_manifest: dict, score: dict, *, manifest: bool = True) -> bool:
     """Keep both stages on their original confirmed reviewer snapshot."""
     from taskflow.execution_batch_binding import validate_batch_runner
 
+    first_provider = facts_manifest.get("model", {}).get("native_provider_ref")
+    second_provider = score.get("model", {}).get("native_provider_ref") if manifest else score.get("native_provider")
+    if not provider_references_equal(first_provider, second_provider):
+        raise TaskflowError("facts and score must retain the same actual provider/profile reference")
     first = validate_batch_runner(facts_manifest, manifest=True)
     second = validate_batch_runner(score, manifest=manifest)
     if first is None and second is None:
@@ -646,7 +760,7 @@ def _review_batch_pair(facts_manifest: dict, score: dict, *, manifest: bool = Tr
             or first["model_slot"] != "reviewer" or second["model_slot"] != "reviewer"
             or canonical({key: first[key] for key in keys}) != canonical({key: second[key] for key in keys})):
         raise TaskflowError("review stages require the same original batch policy and reviewer slot")
-    for key in ("model", "reasoning_effort", "reasoning_selection", "reasoning_context", "cli"):
+    for key in ("model", "reasoning_effort", "reasoning_selection", "reasoning_context", "cli", "native_provider"):
         if first["setting"].get(key) != second["setting"].get(key):
             raise TaskflowError("review stages changed the original confirmed reviewer configuration")
     return True
@@ -663,6 +777,8 @@ def _prepare_review(*, store: object, config: dict, runtime: Path, role: str) ->
         raise TaskflowError("review preparation needs the exact native factual/scoring role")
     if runner.get("inputs"):
         raise TaskflowError("review inputs come only from the exact sealed source handoff")
+    if role != "review-score" and config.get("eligibility_correction") is not None:
+        raise TaskflowError("supplemental eligibility evidence is only for an original reviewer's score correction")
     run, snapshot, candidate = _review_run(config, store)
     supplied_slots = {value for value in (work.get("model_slot"), runner.get("model_slot")) if value is not None}
     if len(supplied_slots) > 1:
@@ -712,6 +828,12 @@ def _prepare_review(*, store: object, config: dict, runtime: Path, role: str) ->
                 or not _dependency_read(resolved, runner, permissions)):
             raise TaskflowError("runtime reads cannot expose the real project or review metadata")
         filesystem[str(resolved)] = "read"
+    if runner.get("native_provider") is not None:
+        from taskflow.execution_codex_provider import _checked
+
+        provider = _read(_checked(runner["native_provider"]))
+        filesystem["/private/tmp"] = "deny"
+        filesystem[str(Path(provider["codex_home"]).resolve())] = "deny"
     permissions.update(repository=str(clean), scratch=str(scratch), filesystem=filesystem,
                        readonly_probe=str(probe), probe_sources=[str(probe)])
     runner.update(cwd=str(cwd), native_permissions=permissions)
@@ -804,6 +926,53 @@ def _prepare_review(*, store: object, config: dict, runtime: Path, role: str) ->
             binding["local_profile_definition"] = definition
             runner["request_sections"] = [*runner.get("request_sections", []), {"kind": "operation", "text":
                 "Use local-profile-definition.json only for the explicit local execution eligibility judgment. It binds this actual run and frozen standard; preserve unknown when evidence is unresolved and do not turn these execution requirements into task grading criteria."}]
+        if definition is not None and config.get("eligibility_correction") is None:
+            binding = _local_execution_trace(run=run, config=config, runner=runner,
+                binding=binding, clean=clean, runtime=runtime, facts=sealed["seal"])
+        if config.get("eligibility_correction") is not None:
+            from taskflow.execution_review_supplement import validate_supplement
+
+            supplement = validate_supplement(reference=config["eligibility_correction"], run=run,
+                run_directory=Path(config["run_directory"]), snapshot=snapshot, facts=sealed["seal"],
+                facts_root=Path(config["facts_attempt"]).absolute(), candidate_binding=binding["candidate_binding"])
+            _review_batch_pair(facts_manifest, supplement["parent_manifest"])
+            parent_manifest = supplement["parent_manifest"]
+            if (runner["model"] != parent_manifest["model"]["requested"]
+                    or runner["reasoning_effort"] != parent_manifest["model"]["reasoning_effort"]
+                    or runner["timeout_seconds"] != parent_manifest["timeout_seconds"]
+                    or not provider_references_equal(runner.get("native_provider"), parent_manifest["model"].get("native_provider_ref"))):
+                raise TaskflowError("eligibility correction must retain the original reviewer configuration")
+            correction = supplement["document"]["correction"]
+            if (correction["work_id"] != work["work_id"] or correction["intent_id"] != work["intent_id"]
+                    or correction["runtime"] != str(runtime)
+                    or definition is None or _info(Path(definition["path"])) !=
+                    {key: supplement["original_profile"][key] for key in ("sha256", "size")}
+                    or binding["scoring_source_allowlist"] != supplement["parent_binding"]["scoring_source_allowlist"]
+                    or binding["scoring_sources"] != supplement["parent_binding"]["scoring_sources"]
+                    or runner["scoring_projection"].get("normative_certification") !=
+                    supplement["parent_manifest"]["scoring_projection"].get("normative_certification")):
+                raise TaskflowError("eligibility correction cannot replace the original profile or normative selection")
+            runner["inputs"].extend(supplement["inputs"])
+            parent_local = supplement["parent_binding"].get("local_execution_evidence")
+            if parent_local is not None:
+                _validate_local_execution_evidence(parent_local, manifest=parent_manifest, run=run,
+                    run_directory=Path(config["run_directory"]), snapshot=snapshot, facts=sealed["seal"])
+                runner["inputs"].append({"path":parent_local["path"], "kind":"trace", "target":LOCAL_EXECUTION_TARGET})
+                binding["local_execution_evidence"] = parent_local
+            binding["eligibility_correction"] = config["eligibility_correction"]
+            binding["supplemental_trace_inputs"] = supplement["inputs"]
+            runner["request_sections"].append({"kind": "operation", "text":
+                "This is one eligibility-only correction to the original parent named in supplemental-trace/manifest.json. "
+                "Read supplemental-trace/parent-score.json and the unchanged local-profile-definition.json; "
+                "interpret its original requirements and capture limits independently. Supplemental members are trace evidence, "
+                "not new facts, references, rules or grading criteria. Distinguish retained original records from comparisons "
+                "performed now; they do not create historical independent observations or complete outbound captures. "
+                "Copy the parent's complete score JSON unchanged except experiment_validity. Preserve every criterion, reason, "
+                "evidence, numeric score, total, artifact_status and all other fields exactly. Sign local_eligible true, false "
+                "or unknown with typed evidence locators and remaining limits; within experiment_validity only local_eligible, "
+                "reason and evidence may change. Preserve the original profile, scope and served-identity disclosure; "
+                "no desired conclusion is supplied. "
+                "Do not run a solver/provider probe or repeat this correction. The original score and facts remain sealed."})
     _publish(binding_path, binding)
     runner["dependencies"] = [*runner.get("dependencies", []), str(binding_path)]
     work["evidence"] = [*work.get("evidence", []), evidence_ref(binding_path, "immutable same-run review source handoff")]
@@ -995,6 +1164,29 @@ def _review_source_alias(path: str, locator: str | dict, context: dict, run: dic
                "sealed/facts.json": "sealed_review_facts",
                "local-profile-definition.json": "registered_local_profile_definition"}
     manifest = context["manifest"]
+    if path == LOCAL_EXECUTION_TARGET:
+        reference = context.get("local_execution_evidence")
+        if reference is None:
+            raise TaskflowError("local execution evidence was not bound to this scoring handoff")
+        entries = [item for item in manifest["inputs"] if item["target"] == path]
+        if len(entries) != 1 or entries[0]["kind"] != "trace" or entries[0]["source"] != reference["path"]:
+            raise TaskflowError("local execution evidence alias differs from its actual trace")
+        target = context["cwd"] / path
+        observed = _expect(target, reference)
+        location = _review_locator(target, signed_locator, raw=_regular(target))
+        return {"source_type":"local_execution_qualification_observations", "review_source":path,
+                "path":str(target), "locator":locator, **location, **observed}
+    supplement = context.get("eligibility_correction")
+    if supplement is not None and path.startswith("supplemental-trace/"):
+        entries = [item for item in manifest["inputs"] if item["target"] == path]
+        expected = [item for item in supplement["inputs"] if item["target"] == path]
+        if len(entries) != 1 or len(expected) != 1 or entries[0]["kind"] != "trace" or entries[0]["source"] != expected[0]["path"]:
+            raise TaskflowError("supplemental citation is outside the exact correction manifest")
+        target = context["cwd"] / path
+        observed = _expect(target, entries[0])
+        location = _review_locator(target, signed_locator, raw=_regular(target))
+        return {"source_type": "same_run_supplemental_trace", "review_source": path,
+                "path": str(target), "locator": locator, **location, **observed}
     package_path = path.removeprefix("normative/") if path.startswith("normative/") else None
     selected_normative = package_path in manifest.get("scoring_source_allowlist", [])
     if selected_normative:
@@ -1150,7 +1342,7 @@ def _managed_projection_context(score_root: Path, manifest: dict, binding: dict,
         target = str(score_root / "inputs" / item["target"])
         if item["kind"] == "teacher":
             teacher.append({**item, "destination": target})
-        elif item["source"] != facts["path"]:
+        elif item["source"] != facts["path"] and item["target"] != LOCAL_EXECUTION_TARGET:
             row = {"source": item["source"], "destination": target, "sha256": item["sha256"], "size": item["size"]}
             if item["source"] in selected:
                 row["artifact_id"] = selected[item["source"]]["id"]
@@ -1162,6 +1354,7 @@ def _managed_projection_context(score_root: Path, manifest: dict, binding: dict,
             sources.append(row)
     return {"cwd": score_root / "inputs", "seal": seal, "manifest": manifest, "facts_seal": facts,
             "local_profile_definition": binding.get("local_profile_definition"),
+            "local_execution_evidence": binding.get("local_execution_evidence"),
             "plan": {"sources": sources, "stage2_teacher": teacher}}
 
 
@@ -1232,7 +1425,8 @@ def _received_source_map_config(config: dict, received: dict, receipt: dict, des
 def _managed_projection_config(config: dict, sid: str, manifest: dict, run: dict) -> dict:
     return {**config, "expected_sid": sid, "evaluator_description": (
         "Independent " + str(manifest["model"]["requested"]) + "/" + str(manifest["model"]["reasoning_effort"])
-        + " same-SID two-stage original " + sid + "; nature=" + run["nature"])}
+        + (" same-SID eligibility-only correction " if config.get("eligibility_correction") else " same-SID two-stage original ")
+        + sid + "; nature=" + run["nature"])}
 
 
 @_preparation_errors
@@ -1256,6 +1450,29 @@ def _ingest_managed(*, config: dict, destination: Path) -> dict:
     collection = _validated_collection(score_root, manifest)
     run = verify_run(Path(config["run_directory"]))
     snapshot = verify_snapshot(Path(config["snapshot_directory"]))
+    supplement = None
+    reference = config.get("eligibility_correction")
+    if reference != score_binding.get("eligibility_correction"):
+        raise TaskflowError("managed eligibility correction differs from its locked supplemental handoff")
+    if reference is not None:
+        from taskflow.execution_review_supplement import validate_supplement
+
+        supplement = validate_supplement(reference=reference, run=run,
+            run_directory=Path(config["run_directory"]), snapshot=snapshot, facts=facts,
+            facts_root=facts_root, candidate_binding=manifest["candidate_binding"])
+        _review_batch_pair(facts_manifest, supplement["parent_manifest"])
+        correction = supplement["document"]["correction"]
+        if (correction["evaluation_id"] != config["evaluation_id"]
+                or correction["runtime"] != str(score_root) or correction["intent_id"] != manifest["intent_id"]
+                or score_root == Path(supplement["document"]["parent_score_attempt"])
+                or config["evaluation_id"] == supplement["document"]["parent_evaluation_id"]
+                or score_binding.get("supplemental_trace_inputs") != supplement["inputs"]
+                or score_binding.get("scoring_sources") != supplement["parent_binding"]["scoring_sources"]
+                or score_binding.get("scoring_source_allowlist") != supplement["parent_binding"]["scoring_source_allowlist"]
+                or score_binding.get("local_profile_definition", {}).get("sha256") != supplement["original_profile"]["sha256"]
+                or manifest["scoring_projection"].get("normative_certification") !=
+                supplement["parent_manifest"]["scoring_projection"].get("normative_certification")):
+            raise TaskflowError("eligibility correction cannot overwrite parent or change profile/normative sources")
     models = [(item.get("model", {}).get("requested"), item.get("model", {}).get("reasoning_effort"))
               for item in (facts_manifest, manifest)]
     if models[0] != models[1]:
@@ -1291,6 +1508,28 @@ def _ingest_managed(*, config: dict, destination: Path) -> dict:
     if score_binding.get("local_profile_definition"):
         definition = score_binding["local_profile_definition"]
         expected_inputs.add((definition["path"], "trace", definition["sha256"]))
+    local_execution = score_binding.get("local_execution_evidence")
+    if local_execution is not None:
+        origin = None
+        if supplement is not None:
+            if local_execution != supplement["parent_binding"].get("local_execution_evidence"):
+                raise TaskflowError("eligibility correction cannot replace original local execution evidence")
+            origin = supplement["parent_manifest"]
+        _validate_local_execution_evidence(local_execution, manifest=manifest, run=run,
+            run_directory=Path(config["run_directory"]), snapshot=snapshot, facts=facts,
+            source_manifest=origin)
+        expected_inputs.add((local_execution["path"], "trace", local_execution["sha256"]))
+    elif any(item["target"] == LOCAL_EXECUTION_TARGET for item in manifest["inputs"]):
+        raise TaskflowError("undeclared local execution evidence input")
+    if supplement is not None:
+        expected_inputs.update((item["path"], "trace", _info(Path(item["path"]))["sha256"])
+                              for item in supplement["inputs"])
+        expected_extra = {(item["path"], "trace", item["target"]) for item in supplement["inputs"]}
+        extra_sources = {item["path"] for item in supplement["inputs"]}
+        actual_extra = [(item["source"], item["kind"], item["target"]) for item in manifest["inputs"]
+                        if item["source"] in extra_sources or item["target"].startswith("supplemental-trace/")]
+        if len(actual_extra) != len(expected_extra) or set(actual_extra) != expected_extra:
+            raise TaskflowError("managed supplemental input namespace differs from its independent manifest")
     if {(item["source"], item["kind"], item["sha256"]) for item in manifest["inputs"]} != expected_inputs:
         raise TaskflowError("managed scoring inputs differ from the exact facts/run/normative handoff")
     # Reconstruct provenance from the actual frozen declaration and bytes, not
@@ -1333,11 +1572,15 @@ def _ingest_managed(*, config: dict, destination: Path) -> dict:
             "score": {"path": str(score_path), **_info(score_path)},
             "explanation": {"path": str(explanation_path), **_info(explanation_path)},
             "manifest": _info(score_root / "manifest.json"), "collection": _info(score_root / "collection.json")}
+    if supplement is not None:
+        seal["nature"] = "same_sid_eligibility_correction_after_original_score"
     _publish(score_root / "first-score-seal.json", seal)
     rows = _read(Path(binding["selector"]["path"]))["allowed_direct_artifacts"]
     _expect(Path(binding["selector"]["path"]), binding["selector"])
     context = _managed_projection_context(score_root, manifest,
         {**score_binding, "selector": binding["selector"]}, facts, seal, rows)
+    if supplement is not None:
+        context["eligibility_correction"] = supplement
     projected_config = _managed_projection_config(config, facts["sid"], manifest, run)
     raw = _regular(score_path)
     if {"sha256": sha256(raw), "size": len(raw)} != collection["artifacts"][score_name]:
@@ -1348,6 +1591,11 @@ def _ingest_managed(*, config: dict, destination: Path) -> dict:
         _validate_named_source_map(config, score, facts_manifest, manifest, score_binding, declaration, rows, run,
             {"bindings": locators, "all_signed_original_reasons_preserved": True, "root_business_rereview": False})
     local_assessment = _local_assessment(score, context, run, snapshot)
+    if supplement is not None:
+        local_assessment["authority"] = "same-SID eligibility-only correction; no program validity judgment"
+        if not local_assessment["signed_binding_valid"]:
+            raise TaskflowError("eligibility correction has unbound qualification evidence: "
+                                + ", ".join(local_assessment["structural_reasons"]))
     archive_root = destination / "full-archive"
     facts_archive = archive_full_attempt(facts_root, archive_root / "facts")
     score_archive = archive_full_attempt(score_root, archive_root / "score")
@@ -1375,10 +1623,10 @@ def _ingest_managed(*, config: dict, destination: Path) -> dict:
                 raise TaskflowError("fixed evaluation identity already contains different managed score transport")
         else:
             for path in (Path(config["run_directory"]) / "evaluations").glob("*/evaluation.json"):
-                if verify_evaluation(path.parent)["kind"] == "original":
+                if record["kind"] == "original" and verify_evaluation(path.parent)["kind"] == "original":
                     raise TaskflowError("another original judgment already exists")
             evaluation = _import_evaluation_locked(Path(config["run_directory"]), destination / "evaluation.original.json")
-    if (evaluation["validation_issues"] or evaluation["kind"] != "original"
+    if (evaluation["validation_issues"] or evaluation["kind"] != record["kind"]
             or evaluation["run_digest"] != run["run_digest"] or evaluation["evaluation_digest"] != snapshot["evaluation_digest"]):
         raise TaskflowError("managed original evaluation did not pass exact-run/frozen-standard validation")
     result = {"accepted": True, "state": "accepted", "receipt": str(destination / "receipt.json"),
@@ -1389,5 +1637,8 @@ def _ingest_managed(*, config: dict, destination: Path) -> dict:
               "nature": run["nature"], "model_validity": run["model_validity"], "run_classification": run["classification"],
               "local_profile_assessment": local_assessment,
               "local_result_only": True, "primary_rerating": False}
+    if supplement is not None:
+        result.update(kind="correction", parent_evaluation_id=record["parent_evaluation_id"],
+                      correction_scope="eligibility_only_unchanged_score")
     _publish(destination / "receipt.json", result)
     return result

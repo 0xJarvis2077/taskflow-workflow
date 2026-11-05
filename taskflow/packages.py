@@ -48,6 +48,23 @@ def init_task(destination: Path, task_id: str) -> dict:
                 "# 待填写\n\n尚未完成设计、核算或业务审查。\n", encoding="utf-8"
             )
         write_json(stage / "task.json", task)
+        (stage / "README.md").write_text(
+            "# " + task_id + "\n\n"
+            "这是教师侧题包工作目录。草稿尚未完成，不代表质量通过或已有成绩。\n\n"
+            "| 目录 | 用途 |\n| --- | --- |\n"
+            "| `draft/input/` | 题面与公开业务材料 |\n"
+            "| `draft/evaluation/` | 私有参考与评分 |\n"
+            "| `checks/` | 本题核算脚本 |\n"
+            "| `reports/` | 结构、业务与交付审查报告 |\n"
+            "| `versions/<版本>/` | 不覆盖的冻结题包 |\n"
+            "| `exports/<版本>-<受众>/` | 明确分离的公开或评阅导出 |\n"
+            "| `runs/<运行ID>/` | 原卷及其 `evaluations/` 原评、纠错或复判 |\n\n"
+            "研究与试作保存到题目根的 `research/`、`prototypes/`。"
+            "执行工作目录、scratch 和临时副本按执行任务目录管理，"
+            "不要作为新的审查报告混入 `reports/`。"
+            "正式作答只接收显式导出的公开材料。\n",
+            encoding="utf-8",
+        )
     return {"path": str(destination), "task_id": task_id, "state": "draft"}
 
 

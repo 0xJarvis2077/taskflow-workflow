@@ -232,99 +232,34 @@ class UnchangedScopeRecoveryTests(unittest.TestCase):
         return source, graph, store, record, resolution, interfaces
 
     def test_append_recovery_retains_originals_and_has_zero_launches(self):
-        source, graph, store, record, resolution, interfaces = self.fixture()
-        paths = [Path(record["state"]["receipt"]), Path(graph["whole_source"]["report"]["path"])]
-        before = {path: path.read_bytes() for path in paths}
-        with interfaces():
-            result = resume_path_transport(store, record["flow_id"], resolution)
-            with self.assertRaises(TaskflowError):
-                resume_path_transport(store, record["flow_id"], resolution)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("experiment_v1", result["state"]["stage"])
-        item = result["state"]["history"][-1]
-        self.assertFalse(item["new_model_dispatched"])
-        self.assertEqual(record["state"]["exception"], item["previous_exception"])
-        self.assertEqual(graph, item["native_certification"]["composite_quality_coverage"])
-        self.assertEqual([], store.dashboard()["work"])
-        self.assertEqual([], store.dashboard()["attempts"])
-        self.assertEqual(before, {path: path.read_bytes() for path in paths})
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_hold_unknown_complete_and_launch_footprints_reject_without_append(self):
-        source, _, store, record, resolution, interfaces = self.fixture()
-        for change in ({"pending_business_scope": {"reason": "Unresolved business choice"}},
-                       {"stage": "complete"}, {"status": "accepted"}, {"current_work_id": "work"},
-                       {"runs": ["run"]}, {"run_index": 1}, {"release": {"published": True}},
-                       {"exception": {"stage": "experiment_v1", "reason": "unknown"}}):
-            wrong = {**record, "state": {**record["state"], **change}}
-            with self.subTest(change=change), interfaces(), patch.object(store, "get_flow", side_effect=lambda key: wrong if key == record["flow_id"] else source.flows[key]), self.assertRaises(TaskflowError):
-                resume_path_transport(store, record["flow_id"], resolution)
-        for name in ("formal", "publication"):
-            path = source.root / name
-            path.mkdir()
-            try:
-                with self.subTest(path=name), interfaces(), self.assertRaisesRegex(TaskflowError, "existing formal"):
-                    resume_path_transport(store, record["flow_id"], resolution)
-            finally:
-                path.rmdir()
-        for kind in ("work", "attempts"):
-            identity = "foreign-solver-footprint-" + kind
-            row = {"candidate_id": source.candidate["candidate_id"], "role": "solver", "state": "ready"}
-            with store._db(True) as db:
-                if kind == "work":
-                    db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)",
-                               (identity, "neutral", row["candidate_id"], identity + "-intent", "ready", json.dumps(row)))
-                else:
-                    db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?)",
-                               (identity, identity + "-work", "neutral", "ready", 0, json.dumps(row)))
-            try:
-                with self.subTest(kind=kind), interfaces(), self.assertRaisesRegex(TaskflowError, "existing formal"):
-                    resume_path_transport(store, record["flow_id"], resolution)
-            finally:
-                with store._db(True) as db:
-                    db.execute("DELETE FROM " + kind + " WHERE id=?", (identity,))
-        self.assertEqual(record, store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_wrong_receipt_missing_graph_stale_child_and_native_source_reject(self):
-        source, graph, store, record, resolution, interfaces = self.fixture()
-        graph["closed_defect_ids"] = []
-        with interfaces(), self.assertRaises(TaskflowError):
-            resume_path_transport(store, record["flow_id"], resolution)
-        graph["closed_defect_ids"] = ["closed-defect"]
-        source.child["state"]["accepted_review_id"] = "stale-review"
-        with interfaces(), self.assertRaises(TaskflowError):
-            resume_path_transport(store, record["flow_id"], resolution)
-        source.child["state"]["accepted_review_id"] = "fresh-review"
-        path = Path(graph["whole_source"]["report"]["path"])
-        path.write_bytes(path.read_bytes() + b" ")
-        with interfaces(), self.assertRaises((TaskflowError, ValueError)):
-            resume_path_transport(store, record["flow_id"], resolution)
-        self.assertEqual(record, store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_exact_exception_hash_and_original_coverage_are_required(self):
-        source, graph, store, record, resolution, interfaces = self.fixture()
-        receipt = Path(record["state"]["receipt"])
-        raw = receipt.read_bytes()
-        changed = read_json(receipt)
-        changed["controller"] = "foreign-controller"
-        write_json(receipt, changed)
-        with interfaces(), self.assertRaisesRegex(TaskflowError, "history/hash"):
-            resume_path_transport(store, record["flow_id"], resolution)
-        receipt.write_bytes(raw)
-        prior_root = Path(graph["whole_source"]["report"]["path"]).parent.parent
-        source.amend_source(lambda r: r["native_signoff"].update(coverage="whole_package", affected_paths=[]), prior_root)
-        graph["whole_source"]["report"].update(runner._info(prior_root / "artifacts/adoption-readiness.json"))
-        with interfaces(), self.assertRaisesRegex(TaskflowError, "limited original business"):
-            resume_path_transport(store, record["flow_id"], resolution)
-        self.assertEqual(record, store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_source_business_hold_is_not_removed_by_transport(self):
-        source, _, store, record, resolution, interfaces = self.fixture()
-        for state in (source.parent["state"], source.child["state"]):
-            state["pending_business_scope"] = {"reason": "Current independent business hold"}
-            with interfaces(), self.assertRaises(TaskflowError):
-                resume_path_transport(store, record["flow_id"], resolution)
-            state.pop("pending_business_scope")
-        self.assertEqual(record, store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

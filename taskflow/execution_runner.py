@@ -192,12 +192,84 @@ def _verified_client_default(plan: dict, runtime: Path, config: dict) -> dict:
             "client_resolution_scope": "Local zero-inference fixed-responder parser capture under the same argv; production payload and served identity unobserved."}
 
 
+def _role_session_module():
+    if __package__:
+        from taskflow import execution_role_session
+    else:
+        import role_session as execution_role_session
+    return execution_role_session
+
+
+def _role_session_call(name: str, *args, **kwargs):
+    module = _role_session_module()
+    try:
+        return getattr(module, name)(*args, **kwargs)
+    except module.RoleSessionError as error:
+        raise RunnerError(str(error)) from error
+
+
+def _role_session_source(reference: dict) -> dict:
+    """Read the exact completed source, without locating native session files."""
+    if (not isinstance(reference, dict) or not {"path", "sha256", "size"}.issubset(reference)
+            or set(reference) - {"path", "sha256", "size", "location"}
+            or not isinstance(reference["path"], str) or type(reference["size"]) is not int):
+        raise RunnerError("role session previous must reference the exact original collection")
+    path = Path(reference["path"])
+    if (not path.is_absolute() or reference["path"] != str(path.resolve()) or path.name != "collection.json"
+            or _info(path) != {key: reference[key] for key in ("sha256", "size")}):
+        raise RunnerError("role session original collection reference changed")
+    root = path.parent
+    manifest = _read(root / "manifest.json")
+    if (_read(root / "manifest-lock.json") != _info(root / "manifest.json")
+            or manifest["request"] != _info(root / "request.md")):
+        raise RunnerError("role session source manifest or request changed")
+    if manifest.get("role_session") is not None:
+        invocation = manifest.get("role_session_binding", {}).get("invocation", {})
+        if invocation.get("runtime") != str(root) or invocation.get("intent_id") != manifest["intent_id"]:
+            raise RunnerError("role session source is not its bound original invocation runtime")
+    collected = _validated_collection(root, manifest)
+    trace = _trace(root / "trace.jsonl", collected.get("sid"))
+    termination = collected.get("termination") or {}
+    if (collected.get("status") != "completed" or collected.get("technical_accepted") is not True
+            or collected.get("model_completed") is not True or not trace["model_completed"]
+            or not collected.get("sid") or trace["sid"] != collected["sid"]
+            or termination.get("returncode") != 0 or termination.get("timed_out") is not False):
+        raise RunnerError("role session requires the original technically completed collection")
+    dependencies = [str(root / name) for name in collected["evidence_files"]]
+    dependencies.extend([str(path), str(root / "collection-lock.json")])
+    for name, expected in manifest.get("dependencies", {}).items():
+        dependency = Path(name)
+        if dependency.is_relative_to(root):
+            if _info(dependency) != expected:
+                raise RunnerError("role session original runtime dependency changed")
+            dependencies.append(name)
+    for item in manifest["inputs"]:
+        source = root / "inputs" / _relative(item["target"])
+        if _info(source) != {key: item[key] for key in ("sha256", "size")}:
+            raise RunnerError("role session original staged input changed")
+        dependencies.append(str(source))
+    source = {"root": str(root), "manifest": manifest, "collection": collected}
+    if manifest.get("role") == "review-facts" and manifest.get("role_session") is not None:
+        if (root / "facts-seal.json").exists():
+            source["facts_seal"] = _validated_facts_seal(root)
+            source["facts_attempt"] = str(root)
+            dependencies.append(str(root / "facts-seal.json"))
+    if manifest.get("role") == "review-score" and manifest.get("role_session") is not None:
+        facts_root = Path(manifest["facts_attempt"])
+        facts = _validated_facts_seal(facts_root)
+        if facts != manifest.get("facts_seal"):
+            raise RunnerError("score source does not retain its original facts seal")
+        source.update(facts_seal=facts, facts_attempt=str(facts_root))
+        dependencies.append(str(facts_root / "facts-seal.json"))
+    source["dependencies"] = sorted(set(dependencies))
+    return source
+
+
 def _native_command(config: dict, root: Path) -> tuple[list[str], dict, dict]:
     # Shared settings are used by both actual tools and the no-model probe.
     from tools.isolated_quality import capture_cli_evidence, inline_table, selection_metadata
     cli = str(Path(config["cli"]).resolve())
     evidence = capture_cli_evidence(root, cli)
-    model, version = selection_metadata({**config, "cli": cli}, evidence)
     permissions = config.get("native_permissions")
     if not isinstance(permissions, dict):
         raise RunnerError("Native roles require an explicit versioned permissions profile")
@@ -235,6 +307,27 @@ def _native_command(config: dict, root: Path) -> tuple[list[str], dict, dict]:
                 "shell_environment_policy.set=" + inline_table(environment),
                 "allow_login_shell=false", "apps._default.enabled=false", "agents.enabled=false",
                 "model_reasoning_effort=" + json.dumps(config["reasoning_effort"])]
+    from taskflow.execution_codex_retry import provider_settings_with_retry
+    provider_options, provider = provider_settings_with_retry(config, filesystem)
+    settings.extend(provider_options)
+    if provider:
+        from taskflow.execution_codex_provider import selection_metadata as custom_metadata
+
+        model, version = custom_metadata({**config, "cli": cli}, evidence, provider)
+    else:
+        model, version = selection_metadata({**config, "cli": cli}, evidence)
+    text_delivery = config.get("text_only_delivery")
+    if text_delivery:
+        from taskflow.execution_codex_provider import _checked, text_only_catalog
+
+        if provider is None:
+            raise RunnerError("text-only business role requires its explicit role-local provider")
+        catalog = _read(_checked(provider["catalog"]))
+        catalog_path = root / "text-only-catalog.json"
+        _publish(catalog_path, text_only_catalog(catalog, config["model"]))
+        settings.append("model_catalog_json=" + json.dumps(str(catalog_path)))
+        settings.extend(['features.network_proxy=false', 'web_search="disabled"',
+                         'tools.update_plan.enabled=false', 'tools.experimental_request_user_input.enabled=false'])
     disabled = config.get("disabled_skill_files", [])
     if not isinstance(disabled, list) or any(not isinstance(name, str) for name in disabled):
         raise RunnerError("disabled_skill_files must list exact local skill sources")
@@ -246,29 +339,186 @@ def _native_command(config: dict, root: Path) -> tuple[list[str], dict, dict]:
     options = [part for setting in settings for part in ("-c", setting)]
     for feature in ("multi_agent", "apps", "plugins", "memories", "hooks", "skill_search"):
         options += ["--disable", feature]
+    if text_delivery:
+        from taskflow.execution_codex_provider import TEXT_ONLY_DISABLED_FEATURES
+        for feature in TEXT_ONLY_DISABLED_FEATURES:
+            options += ["--disable", feature]
     options += ["--enable", "skip_host_skill_discovery"]
     argv = [cli, "--no-daemon", "-a", "never", *options, "-C", str(cwd), "exec"]
-    if config["role"] == "review-score":
+    quality_session = config.get("quality_session")
+    role_session = config.get("role_session")
+    if (config["role"] == "review-score" or (quality_session and config.get("resume_sid"))
+            or (role_session and role_session["mode"] == "resume_existing")):
         argv += ["resume", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
                  "--json", "-m", config["model"], config["resume_sid"], "-"]
     else:
         argv += ["--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
                  "--json", "-m", config["model"]]
-        if config["role"] != "review-facts":
+        if (role_session and role_session["mode"] == "fresh_ephemeral") or (
+                role_session is None and config["role"] != "review-facts" and quality_session is None):
             argv += ["--ephemeral"]
         argv += ["-"]
+    if text_delivery:
+        argv[-1:-1] = ["--output-schema", str(root / "response-schema.json"),
+                       "-o", str(cwd / text_delivery["output"])]
     direct = permissions.get("direct_network", {"tcp": "deny", "unix": "deny"})
     if (not isinstance(direct, dict) or set(direct) != {"tcp", "unix"}
             or any(value not in {"allow", "deny"} for value in direct.values())):
         raise RunnerError("Native direct-network probe expectations must be explicit allow/deny observations")
-    native = {"profile": profile, "filesystem": filesystem, "repository": str(repository),
+    native = {"provider": provider, "profile": profile, "filesystem": filesystem, "repository": str(repository),
               "scratch": str(scratch), "python": python, "probe_sources": sources,
               "readonly_probe": str(readonly), "network": {"enabled": True, "domains": {"*": "allow"}},
               "web_search": "live", "network_proxy": True, "direct_network": direct,
               "sandbox_argv": [cli, "sandbox", "-P", profile, "--include-managed-config",
                                *options, "-C", str(cwd)]}
-    return argv, {**model, "cli_version": version,
+    if provider:
+        native.update(network={"enabled": False, "domains": {}}, network_proxy=False, web_search="disabled")
+    return argv, {**model, "native_provider_ref": config.get("native_provider"), "cli_version": version,
                   "catalog_evidence": _info(root / "cli-evidence.json")}, native
+
+
+def _quality_initial_listing(config: dict) -> dict | None:
+    value = config.get("public_first_initial_listing")
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {"scope", "index", "checkpoint"}
+            or value.get("scope") not in ("whole_package", "affected")
+            or value != {"scope": value["scope"], "index": "execution/public-inputs.json",
+                         "checkpoint": "public-responsibility-first.json"}
+            or config.get("role") != "quality" or config.get("mode", "native_role") not in ("native_role", "test_fixture")
+            or config.get("quality_session") is not None or config.get("resume_sid")
+            or not isinstance(config.get("candidate_binding"), dict)):
+        raise RunnerError("neutral initial listing requires an explicit fresh quality public-first contract")
+    return value
+
+
+MODEL_LOCATIONS = "inputs/execution/role-inputs.md"
+MODEL_QUALITY_INSTRUCTIONS = "inputs/execution/quality-instructions.md"
+
+
+def _model_locations(inputs: list[dict]) -> bytes:
+    """Expose original targets without repeating the manager's evidence manifest."""
+    lines = ["Complete current input locations, relative to this input directory.",
+             "Read the necessary complete business units and their associated originals.",
+             "The manager retains exact source paths, hashes and sizes separately.", ""]
+    lines += [entry["kind"] + "\t" + entry["target"] for entry in inputs]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _model_quality_instructions(value: dict) -> bytes:
+    texts = [entry["text"] for entry in value["request_sections"]]
+    if value.get("request_text"):
+        texts.append(value["request_text"])
+    texts.append("Required output files: " + ", ".join(value["outputs"]))
+    if value["output_trees"]:
+        texts.append("Required output directories: " + ", ".join(value["output_trees"]))
+    return ("\n\n".join(texts) + "\n").encode("utf-8")
+
+
+def _model_view(root: Path, inputs: list[dict], declaration: dict | None = None) -> dict:
+    """Freeze a small model projection while retaining every machine original."""
+    bodies = {"locations": (MODEL_LOCATIONS, _model_locations(inputs))}
+    if declaration is not None:
+        bodies["instructions"] = (MODEL_QUALITY_INSTRUCTIONS, _model_quality_instructions(declaration))
+    result = {}
+    for key, (name, raw) in bodies.items():
+        path = root / name
+        if path.exists():
+            raise RunnerError("derived model view cannot replace an input: " + name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as handle:
+            handle.write(raw)
+        path.chmod(0o444)
+        result[key] = {"file": name, **_info(path)}
+    return result
+
+
+def _validate_model_view(root: Path, manifest: dict) -> None:
+    view = manifest.get("model_input_view")
+    if view is None:
+        return
+    expected = {"locations": (MODEL_LOCATIONS, _model_locations(manifest["inputs"]))}
+    if manifest.get("public_first_initial_listing") is not None:
+        value = _read(root / "quality-later-inputs.v1.json")
+        expected["instructions"] = (MODEL_QUALITY_INSTRUCTIONS, _model_quality_instructions(value))
+    if not isinstance(view, dict) or set(view) != set(expected):
+        raise RunnerError("model input view differs from its locked role presentation")
+    for key, (name, raw) in expected.items():
+        if (view[key] != {"file": name, "sha256": _digest(raw), "size": len(raw)}
+                or _regular(root / name) != raw):
+            raise RunnerError("model input view differs from its complete machine original")
+
+
+def _render_quality_initial(root: Path, config: dict, inputs: list[dict], listing: dict) -> list[str]:
+    """Defer informed instructions and non-public membership without changing access."""
+    cwd = Path(config["cwd"]).absolute()
+    if root.name != "runtime" or cwd.name != "work" or root.parent != cwd.parent:
+        raise RunnerError("neutral initial listing requires sibling runtime/work directories")
+    candidates = [entry for entry in inputs if entry["target"] == listing["index"] and entry["kind"] == "source_metadata"]
+    if len(candidates) != 1:
+        raise RunnerError("neutral initial listing requires its one locked public index")
+    index = _read(root / "inputs" / listing["index"])
+    if (set(index) != {"schema_version", "input_digest", "files"} or type(index["schema_version"]) is not int
+            or index["schema_version"] != 1 or index["input_digest"] != config["candidate_binding"]["input_digest"]
+            or not isinstance(index["files"], list) or not index["files"]):
+        raise RunnerError("neutral initial listing public index has private metadata or a different binding")
+    public = []
+    seen = set()
+    for row in index["files"]:
+        if (not isinstance(row, dict) or set(row) != {"path", "role", "sha256", "size"}
+                or row["role"] not in {"prompt", "input", "template"}):
+            raise RunnerError("neutral initial listing index must contain only declared public members")
+        name = _relative(row["path"])
+        matches = [entry for entry in inputs if entry["target"] == name and entry["kind"] == "public"]
+        if (name in seen or len(matches) != 1
+                or any(matches[0][key] != row[key] for key in ("sha256", "size"))):
+            raise RunnerError("neutral initial listing index differs from its complete locked public inputs")
+        seen.add(name)
+        public.append("Public input: ../runtime/inputs/" + name)
+    declaration = {"schema_version": 1, "listing": listing, "inputs": inputs,
+                   "request_sections": config.get("request_sections", []), "request_text": config.get("request_text"),
+                   "outputs": config.get("outputs", []), "output_trees": config.get("output_trees", [])}
+    _publish(root / "quality-later-inputs.v1.json", declaration)
+    reading = ("先仅依据中性公开索引定位相关责任，再读取完整必要业务单元及其上下游原件；完整公开原件仍可按需读取，"
+               "保留实际阅读范围，不把未读的继承范围冒称重新通读。读取教师后如需扩大关联，须再回读实际原件。"
+               if listing["scope"] == "affected" else "先仅依据中性公开索引逐件读取全部公开原件；")
+    return ["Role: quality.", "Public index: ../runtime/inputs/" + listing["index"],
+            *(public if listing["scope"] == "whole_package" else []),
+            "Runtime limit (seconds): " + str(config.get("timeout_seconds", 3600)),
+            reading + "依据实际公开来源/SHA/位置，独立判断来源适用性、"
+            "上游已完成工作、剩余关系或选择、业务后果、必要条件及合法分支，保留缺证与不确定。"
+            "先不读取完整声明、知情材料、旧结论或其他目录。将公开判断保存到当前work中的 "
+            + listing["checkpoint"] + "。随后用真实工具重新读取该文件并计算SHA256，在可见工具响应打印 "
+            "PUBLIC_RESPONSIBILITY_FIRST_SHA256=<实际SHA256>，保留可定位工具响应。"
+            "只有完成保存和实际SHA读回后，才通过真实工具读取 ../runtime/inputs/execution/quality-instructions.md "
+            "及 ../runtime/inputs/execution/role-inputs.md；它们提供完整后续操作和原件位置。"
+            "检查点此后保持原字节；不要重复该阶段或改写检查点来追认顺序。"
+            "按后续操作从 ../runtime/inputs/ 读取必要完整材料、对照并完成原报告与签发要求，"
+            "在同一实际上下文继续。不要从来源路径绕过当前权限。"
+            "这仅规定同一角色的先读后读顺序，未晚交物理文件；若此前已见知情信息或顺序证据不足，"
+            "须如实披露实际范围，不得事后把它写成未受影响的公开阶段。"]
+
+
+def _quality_locked_request(root: Path, manifest: dict) -> bytes:
+    """Read the original protocol bytes from either supported locked presentation."""
+    request = _regular(root / "request.md")
+    listing = manifest.get("public_first_initial_listing")
+    if listing is None:
+        return request
+    ref = manifest.get("quality_later_declaration")
+    if (not isinstance(ref, dict) or ref.get("file") != "quality-later-inputs.v1.json"
+            or _info(root / ref["file"]) != {key: ref[key] for key in ("sha256", "size")}):
+        raise RunnerError("locked deferred quality declaration changed")
+    value = _read(root / ref["file"])
+    if (type(value.get("schema_version")) is not int or value["schema_version"] != 1
+            or value.get("listing") != listing or value.get("inputs") != manifest["inputs"]
+            or value.get("outputs") != manifest["outputs"] or value.get("output_trees") != manifest["output_trees"]):
+        raise RunnerError("locked deferred quality declaration differs from its original manifest")
+    _validate_model_view(root, manifest)
+    texts = [entry["text"] for entry in value["request_sections"]]
+    if value.get("request_text"):
+        texts.append(value["request_text"])
+    return request + b"\n" + "\n\n".join(texts).encode("utf-8")
 
 
 def prepare_attempt(root: Path, config: dict) -> dict:
@@ -281,11 +531,20 @@ def prepare_attempt(root: Path, config: dict) -> dict:
     from taskflow.execution_batch_binding import validate_batch_runner
 
     root = Path(root).absolute()
+    preparation_config_digest = _digest(_bytes(config))
+    role_session = _role_session_call("declaration", config, _role_session_source)
+    if role_session is not None:
+        config = {**config, "resume_sid": role_session["resume_sid"]}
+        if config.get("role") == "review-score":
+            original = role_session["source"]["facts_attempt"]
+            if config.get("facts_attempt") not in (None, original):
+                raise RunnerError("facts attempt differs from the precise original role collection")
+            config["facts_attempt"] = original
     validate_batch_runner(config)
     _selection(config)
     role = config.get("role")
     roles = {"research", "author", "repair", "quality", "code-review",
-             "calibration", "solver", "review-facts", "review-score"}
+             "calibration", "solver", "review-facts", "review-score", "content-inspector"}
     if role not in roles:
         raise RunnerError("Unknown execution role")
     mode = config.get("mode", "native_role")
@@ -296,8 +555,12 @@ def prepare_attempt(root: Path, config: dict) -> dict:
         raise RunnerError("Verified client defaults are only supported by the existing formal runner")
     if mode not in {"test_fixture", "native_role", "existing_isolated"}:
         raise RunnerError("Unknown runner mode")
-    if role == "solver" and mode == "native_role":
-        raise RunnerError("Solver requires the existing isolated runner and actual probe")
+    if config.get("quality_session") is not None:
+        from taskflow.execution_quality_session import validate_session
+
+        validate_session(config)
+    if role == "solver" and mode == "native_role" and role_session is None:
+        raise RunnerError("Native solver requires an explicit fresh role session and actual probe")
     candidate_binding = config.get("candidate_binding")
     if candidate_binding is not None and not isinstance(candidate_binding, dict):
         raise RunnerError("candidate_binding must be an object when supplied")
@@ -309,10 +572,11 @@ def prepare_attempt(root: Path, config: dict) -> dict:
             raise RunnerError("Scoring requires sealed facts in the same review SID and candidate binding")
     elif config.get("scoring_source_allowlist") is not None or config.get("scoring_projection") is not None:
         raise RunnerError("Only review-score can select normative scoring sources")
-    allowed = ({"public", "operation"} if role == "solver" else
+    allowed = ({"public", "operation", "skill", "knowledge"} if role == "content-inspector" else
+               {"public", "operation"} if role == "solver" else
                {"public", "submission", "trace", "operation", "teacher"} if role == "review-score" else
                {"public", "submission", "trace", "operation"})
-    constrained = role in {"solver", "review-facts", "review-score"}
+    constrained = role in {"solver", "review-facts", "review-score", "content-inspector"}
     inputs = config.get("inputs", [])
     sections = config.get("request_sections", [])
     if not isinstance(inputs, list) or not isinstance(sections, list):
@@ -325,12 +589,31 @@ def prepare_attempt(root: Path, config: dict) -> dict:
     # Arbitrary text is only supported for teacher-informed roles.
     if constrained and config.get("request_text"):
         raise RunnerError("Solver and review requests require typed operation sections")
+    text_delivery = config.get("text_only_delivery")
+    if text_delivery is not None:
+        from taskflow.execution_codex_provider import _checked
+
+        if (role != "content-inspector" or mode != "native_role" or not config.get("native_provider")
+                or not isinstance(text_delivery, dict) or set(text_delivery) != {"schema", "output"}
+                or config.get("output_trees") or config.get("outputs") != [text_delivery["output"]]):
+            raise RunnerError("text-only delivery is limited to explicit read-only content inspection")
+        _relative(text_delivery["output"])
+        schema_bytes = _regular(_checked(text_delivery["schema"]))
+        schema = json.loads(schema_bytes)
+        if not isinstance(schema, dict) or schema.get("type") != "object":
+            raise RunnerError("text-only result requires an explicit object JSON schema")
+    initial_listing = _quality_initial_listing(config)
     root.mkdir(parents=True, exist_ok=False)
     (root / "inputs").mkdir()
+    inline_index = []
+    if text_delivery:
+        (root / "response-schema.json").write_bytes(schema_bytes)
+        (Path(config["cwd"]) / text_delivery["output"]).parent.mkdir(parents=True, exist_ok=True)
     # Dispatch identifiers may encode teacher-side experiment intent. Keep them
     # in the manifest rather than the solver or first factual review request.
     request = ([f"Role: {role}."] if constrained else
                [f"Role: {role}. Intent: {config['intent_id']}."])
+    compact_inputs = role_session is not None and role_session["source"] is not None and not text_delivery
     locked_inputs = []
     for index, entry in enumerate(inputs):
         source = Path(entry["path"]).absolute()
@@ -340,18 +623,57 @@ def prepare_attempt(root: Path, config: dict) -> dict:
         with destination.open("xb") as handle:
             handle.write(_regular(source))
         destination.chmod(0o444)
+        if text_delivery:
+            raw = _regular(destination)
+            content = raw.decode("utf-8")
+            lines = content.splitlines(keepends=True)
+            numbered = "".join(str(number) + "|" + line for number, line in enumerate(lines, 1))
+            request.append("BEGIN COMPLETE INPUT " + target + "\n"
+                           + numbered + "\nEND COMPLETE INPUT " + target)
+            inline_index.append({"target": target, "source": str(source), "kind": entry["kind"],
+                                 "line_count": len(lines), **_info(destination)})
         locked_inputs.append({"source": str(source), "kind": entry["kind"],
                               "target": target, **_info(destination)})
-        request.append(f"Input ({entry['kind']}): {destination}")
+        if (initial_listing is None and not compact_inputs
+                and (not config.get("quality_session") or config["quality_session"]["index"] == 0)):
+            request.append(f"Input ({entry['kind']}): {destination}")
+    model_view = None
+    if compact_inputs:
+        model_view = _model_view(root, locked_inputs)
+        request.append("Continue this precise role context. Current originals: " + str(root / "inputs")
+                       + "; complete input locations: " + str(root / MODEL_LOCATIONS)
+                       + ". Read the current affected business units and changed evidence; retained originals remain available.")
     for entry in sections:
         if not isinstance(entry.get("text"), str):
             raise RunnerError("Request section text must be a string")
         request.append(entry["text"])
     if config.get("request_text"):
         request.append(config["request_text"])
+    if initial_listing is not None:
+        request = _render_quality_initial(root, config, locked_inputs, initial_listing)
+        model_view = _model_view(root, locked_inputs, _read(root / "quality-later-inputs.v1.json"))
+    if text_delivery:
+        _publish(root / "inline-input-index.json", {"kind": "complete_text_only_role_input_index", "inputs": inline_index,
+                 "input_count": len(inline_index), "truncated": False})
+        request.append("Read every complete inline source above. File and command tools are disabled. "
+                       "Return only the structured result defined by the response schema; Codex saves it through its trusted output capture.")
     (root / "request.md").write_text("\n\n".join(request) + "\n", encoding="utf-8")
     worker = root / "worker.py"
     worker.write_bytes(Path(__file__).read_bytes())
+    if config.get("quality_session") is not None:
+        (root / "execution_quality_capture.py").write_bytes(
+            Path(__file__).with_name("execution_quality_capture.py").read_bytes())
+        from taskflow.execution_quality_progress_contract import make_context
+
+        (root / "execution_quality_progress_contract.py").write_bytes(
+            Path(__file__).with_name("execution_quality_progress_contract.py").read_bytes())
+        index = root / "inputs/execution/public-inputs.json"
+        public_files = _read(index).get("files", []) if index.exists() else []
+        contract_manifest = {**config, "candidate_binding": candidate_binding,
+                             "cwd": str(Path(config.get("cwd", root)).absolute())}
+        contract_plan = _read(Path(config["quality_session"]["plan"]["path"]))
+        _publish(root / "quality-output-contract.json", make_context(
+            contract_manifest, contract_plan, public_files, (root / "request.md").read_text(encoding="utf-8")))
     native = None
     if mode == "native_role":
         argv, model, native = _native_command(config, root)
@@ -371,7 +693,10 @@ def prepare_attempt(root: Path, config: dict) -> dict:
     if len(set(output_trees)) != len(output_trees) or any(
             left != right and right.startswith(left + "/") for left in output_trees for right in output_trees):
         raise RunnerError("Required output directories cannot duplicate or nest")
-    if any((cwd / name).exists() or (cwd / name).is_symlink() for name in [*outputs, *output_trees]):
+    seeds = config.get("seeded_output_trees", {})
+    _check_seeded_outputs(cwd, output_trees, seeds, role, locked_inputs)
+    if any((cwd / name).exists() or (cwd / name).is_symlink()
+           for name in [*outputs, *(name for name in output_trees if name not in seeds)]):
         raise RunnerError("Required outputs must be new attempt-specific delivery paths")
     bridge = config.get("isolated", {})
     if mode == "existing_isolated":
@@ -438,6 +763,7 @@ def prepare_attempt(root: Path, config: dict) -> dict:
                      "reasoning_selection": reasoning_selection,
                      "request_reasoning_override": None if reasoning_selection == "verified_client_default" else config["reasoning_effort"],
                      **client, "served": None, "revision": None}
+            model["native_provider_ref"] = plan.get("native_provider_ref")
             lock_names = ["execute_diagnostic.py", "runtime_gate.py", "file_evidence.py",
                           "execution-plan.json", "plan-lock.json", "source-lock.json",
                           "baseline-plan.json", "shell-probes.json", "exec-context.json",
@@ -462,6 +788,10 @@ def prepare_attempt(root: Path, config: dict) -> dict:
                                      "input_digest": plan.get("input_digest"),
                                      "source_binding": plan.get("source_binding")}}
     dependencies = [Path(argv[0]).resolve(), Path(sys.executable).resolve(), worker]
+    if initial_listing is not None:
+        dependencies.append(root / "quality-later-inputs.v1.json")
+    if model_view is not None:
+        dependencies.extend(root / item["file"] for item in model_view.values())
     dependencies += [Path(name).absolute() for name in config.get("dependencies", [])]
     dependencies += [Path(name).absolute() for name in config.get("disabled_skill_files", [])]
     if config.get("batch_binding") is not None:
@@ -471,23 +801,58 @@ def prepare_attempt(root: Path, config: dict) -> dict:
         confirmed = load_batch_snapshot(reference)
         snapshot = Path(reference["path"])
         dependencies += [snapshot, *[snapshot.parent / item["relative_path"] for item in confirmed["evidence_copies"]]]
+    if config.get("native_provider") or role_session is not None:
+        environment_source = Path(__file__).with_name("execution_codex_environment.py")
+        (root / "codex_environment.py").write_bytes(environment_source.read_bytes())
+        dependencies.append(root / "codex_environment.py")
+    if role_session is not None:
+        source = Path(__file__).with_name("execution_role_session.py")
+        (root / "role_session.py").write_bytes(source.read_bytes())
+        dependencies.append(root / "role_session.py")
+        dependencies.extend(Path(name) for name in role_session["run_dependencies"])
+        if role_session["source"]:
+            dependencies.extend(Path(name) for name in role_session["source"]["dependencies"])
+    if config.get("native_provider"):
+        from taskflow.execution_codex_provider import _checked
+
+        ref=config["native_provider"]; path=_checked(ref); selected=_read(path)
+        dependencies.extend([path, _checked(selected["catalog"]), Path(__file__).with_name("execution_codex_provider.py"),
+                             Path(__file__).with_name("execution_codex_retry.py")])
+        dependencies.extend(_checked(item) for item in selected["documentation"])
+    if text_delivery:
+        dependencies += [root / "response-schema.json", root / "text-only-catalog.json", root / "inline-input-index.json"]
     if native:
         dependencies.append(Path(native["python"]))
+    if config.get("quality_session") is not None:
+        from taskflow.execution_quality_session import validate_plan
+
+        quality_session = config["quality_session"]
+        plan_ref, reading_plan = validate_plan(quality_session["plan"], candidate_binding)
+        dependencies += [root / "execution_quality_capture.py", root / "execution_quality_progress_contract.py",
+                         root / "quality-output-contract.json", Path(plan_ref["path"]),
+                         Path(reading_plan["direct_user_authority"]["path"])]
+        dependencies += [Path(ref["path"]) for ref in reading_plan["source_refs"]]
+        dependencies += [Path(page["path"]) for page in reading_plan["pages"]]
+        if quality_session["previous"]:
+            previous = Path(quality_session["previous"]["path"])
+            dependencies += [previous, previous.parent / "session-prefix.jsonl"]
     if mode == "existing_isolated":
         dependencies += [Path(bridge["runtime"]) / name for name in bridge["lock_names"]]
     manifest = {"schema_version": 1, "created_at": _now(), "intent_id": config["intent_id"],
-                "preparation_config_digest": _digest(_bytes(config)),
+                "preparation_config_digest": preparation_config_digest,
                 "policy_version": config["policy_version"], "role": role, "mode": mode,
                 "candidate_binding": candidate_binding,
                 "nature": "test_fixture" if mode == "test_fixture" else "real_cli_attempt",
                 "model": model, "argv": argv, "cwd": str(cwd), "inputs": locked_inputs,
                 "outputs": outputs, "output_trees": output_trees,
+                "seeded_output_trees": seeds,
                 "output_tree_contract_version": 2 if output_trees else 1,
                 "request": _info(root / "request.md"),
                 "dependencies": {str(path): _info(path) for path in dependencies},
                 "timeout_seconds": config.get("timeout_seconds", 3600),
                 "reasoning_selection": reasoning_selection,
                 "reasoning_context": config.get("reasoning_context"),
+                "text_only_delivery": text_delivery,
                 "automatic_retry": False, "isolated": bridge, "native": native,
                 "resume_sid": config.get("resume_sid"),
                 "facts_seal": seal if role == "review-score" else None,
@@ -498,28 +863,119 @@ def prepare_attempt(root: Path, config: dict) -> dict:
                 "limitations": ["Type/provenance checks do not prove absence of semantic leakage.",
                                 "No exactly-once guarantee across external process launch.",
                                 "Business quality, formal validity and difficulty remain separate."]}
+    if model_view is not None:
+        manifest["model_input_view"] = model_view
+    if initial_listing is not None:
+        manifest["public_first_initial_listing"] = initial_listing
+        manifest["quality_later_declaration"] = {"file": "quality-later-inputs.v1.json",
+                                                  **_info(root / "quality-later-inputs.v1.json")}
+        _quality_locked_request(root, manifest)
     if config.get("batch_binding") is not None:
         manifest["batch_binding"] = config["batch_binding"]
         manifest["model_slot"] = config["model_slot"]
         validate_batch_runner(manifest, manifest=True)
+    if config.get("quality_session") is not None:
+        from taskflow.execution_quality_session import validate_session
+
+        manifest["quality_session"] = config["quality_session"]
+        validate_session(manifest, root=root, before_run=True)
+    if role_session is not None:
+        manifest["role_session"] = role_session["declaration"]
+        for key in ("role_lineage", "role_transition"):
+            if config.get(key) is not None:
+                manifest[key] = config[key]
+        if config.get("run_binding") is not None:
+            manifest["run_binding"] = config["run_binding"]
+        manifest["role_session_binding"] = _role_session_call("bind", root, manifest, role_session)
+        _publish(root / "role-session-invocation.json", manifest["role_session_binding"]["invocation"])
+        manifest["dependencies"][str(root / "role-session-invocation.json")] = _info(root / "role-session-invocation.json")
     _publish(root / "manifest.json", manifest)
     _publish(root / "manifest-lock.json", _info(root / "manifest.json"))
+    if text_delivery:
+        _publish(root / "text-only-ready.json", _text_only_contract(root, manifest))
     return manifest
 
 
-def _validate(root: Path, before_run: bool = False) -> dict:
+def _text_only_contract(root: Path, manifest: dict) -> dict:
+    """Check declared no-tool configuration and complete frozen inline inputs."""
+    delivery = manifest.get("text_only_delivery")
+    if manifest["role"] != "content-inspector" or manifest["mode"] != "native_role":
+        raise RunnerError("text-only capability is not an execution/solver substitute")
+    catalog = _read(root / "text-only-catalog.json")
+    if len(catalog["models"]) != 1:
+        raise RunnerError("text-only model catalog is ambiguous")
+    model = catalog["models"][0]
+    if (model["slug"] != manifest["model"]["requested"] or model.get("shell_type") != "disabled"
+            or model.get("apply_patch_tool_type") is not None or model.get("tool_mode") != "direct"
+            or model.get("experimental_supported_tools") or model.get("use_responses_lite") is not False):
+        raise RunnerError("text-only catalog exposes unsupported capabilities")
+    argv = manifest["argv"]
+    for feature in ("shell_tool", "view_image", "code_mode", "code_mode_host", "code_mode_only",
+                    "apps", "plugins", "hooks", "memories", "multi_agent", "skill_search",
+                    "image_generation", "browser_use", "computer_use"):
+        if not any(argv[i:i+2] == ["--disable", feature] for i in range(len(argv)-1)):
+            raise RunnerError("text-only feature closure missing: " + feature)
+    if any(setting not in argv for setting in ("tools.update_plan.enabled=false", "tools.experimental_request_user_input.enabled=false")):
+        raise RunnerError("text-only auxiliary tools must also be disabled")
+    if (manifest["outputs"] != [delivery["output"]] or manifest["output_trees"]
+            or argv.count("--output-schema") != 1 or argv[argv.index("--output-schema")+1] != str(root / "response-schema.json")
+            or argv.count("-o") != 1 or argv[argv.index("-o")+1] != str(Path(manifest["cwd"]) / delivery["output"])):
+        raise RunnerError("text-only structured result capture differs")
+    index = _read(root / "inline-input-index.json")
+    request = _regular(root / "request.md").decode("utf-8")
+    expected = []
+    for item in manifest["inputs"]:
+        path = root / "inputs" / item["target"]
+        lines = _regular(path).decode("utf-8").splitlines(keepends=True)
+        block = ("BEGIN COMPLETE INPUT " + item["target"] + "\n"
+                 + "".join(str(n)+"|"+line for n,line in enumerate(lines,1))
+                 + "\nEND COMPLETE INPUT " + item["target"])
+        if block not in request:
+            raise RunnerError("frozen text-only input is not fully inlined")
+        expected.append({"target": item["target"], "source": item["source"], "kind": item["kind"],
+                         "line_count": len(lines), "sha256": item["sha256"], "size": item["size"]})
+    if index != {"kind": "complete_text_only_role_input_index", "inputs": expected,
+                  "input_count": len(expected), "truncated": False}:
+        raise RunnerError("text-only source membership differs")
+    return {"kind": "text_only_configuration_readiness", "model_calls": 0,
+            "manifest": _info(root / "manifest.json"), "inputs": len(expected),
+            "execution_tool_isolation_claimed": False}
+
+
+def _validate(root: Path, before_run: bool = False, *, received_dependencies: dict | None = None) -> dict:
     manifest = _read(root / "manifest.json")
     if _read(root / "manifest-lock.json") != _info(root / "manifest.json"):
         raise RunnerError("Manifest changed after preparation")
     if manifest["request"] != _info(root / "request.md"):
         raise RunnerError("Actual request changed after preparation")
+    if before_run and manifest.get("seeded_output_trees"):
+        _check_seeded_outputs(Path(manifest["cwd"]), manifest.get("output_trees", []),
+                              manifest.get("seeded_output_trees", {}), manifest["role"], manifest["inputs"])
     for entry in manifest["inputs"]:
         observed = _info(root / "inputs" / entry["target"])
         if observed != {key: entry[key] for key in ("sha256", "size")}:
             raise RunnerError("Locked input changed after preparation")
+    if received_dependencies is not None:
+        if before_run:
+            raise RunnerError("Historical host observations cannot authorize a launch")
+        collection = _validated_collection(root, manifest)
+        termination = _read(root / "termination.json")
+        if collection.get("status") != "completed" or collection.get("technical_accepted") is not True:
+            _recovered_author_collection(root, manifest, collection)
+            if not set(received_dependencies).issubset(_author_host_executables(manifest)):
+                raise RunnerError("Recovered author host changes may cover only original CLI/runtime executables")
+        if (termination.get("intent_id") != manifest["intent_id"]
+                or termination.get("returncode") != 0 or termination.get("timed_out") is not False):
+            raise RunnerError("Historical host observations require a sealed successful terminal attempt")
+    changed = {}
     for name, expected in manifest["dependencies"].items():
-        if _info(Path(name)) != expected:
+        observed = _info(Path(name))
+        if observed != expected:
+            changed[name] = {"before": expected, "after": observed}
+        if observed != expected and (received_dependencies or {}).get(name) != changed[name]:
             raise RunnerError(f"Locked executable/dependency changed: {name}")
+    if received_dependencies is not None and changed != received_dependencies:
+        raise RunnerError("Historical host observations do not match the exact current dependency changes")
     if manifest.get("facts_seal"):
         source = Path(manifest["facts_attempt"])
         seal = _validated_facts_seal(source)
@@ -529,7 +985,19 @@ def _validate(root: Path, before_run: bool = False) -> dict:
     if manifest["mode"] == "native_role":
         if manifest["model"]["catalog_evidence"] != _info(root / "cli-evidence.json"):
             raise RunnerError("Native model catalog/version evidence changed")
-    if manifest["mode"] == "native_role" and (before_run or (root / "native-probe-ready.json").exists()):
+    if manifest.get("public_first_initial_listing") is not None:
+        _quality_initial_listing(manifest)
+        _quality_locked_request(root, manifest)
+    _validate_model_view(root, manifest)
+    if manifest.get("text_only_delivery"):
+        if _read(root / "text-only-ready.json") != _text_only_contract(root, manifest):
+            raise RunnerError("text-only role configuration readiness changed")
+        if before_run:
+            home = Path(manifest["native"]["provider"]["codex_home"])
+            if any(home.iterdir()):
+                raise RunnerError("new text-only role requires an empty independent Codex home")
+    if (manifest["mode"] == "native_role" and not manifest.get("text_only_delivery")
+            and (before_run or (root / "native-probe-ready.json").exists())):
         ready = _read(root / "native-probe-ready.json")
         if ready.get("manifest") != _info(root / "manifest.json"):
             raise RunnerError("Native probe belongs to another request or permissions profile")
@@ -553,6 +1021,24 @@ def _validate(root: Path, before_run: bool = False) -> dict:
                                 capture_output=True, timeout=30, check=False)
         if result.returncode:
             raise RunnerError("Existing isolated runner validation rejected launch")
+    if manifest.get("quality_session") is not None:
+        if __package__:
+            from taskflow.execution_quality_session import validate_session
+
+            validate_session(manifest, root=root, before_run=before_run)
+        elif manifest["quality_session"].get("previous"):
+            # The standalone supervisor has no repository imports. Its parent
+            # validated the policy/flow; immutable dependencies above bind the
+            # seal. Recheck the actual persisted prefix at the spawn boundary.
+            previous = _read(Path(manifest["quality_session"]["previous"]["path"]))
+            prefix = _regular(Path(manifest["quality_session"]["previous"]["path"]).parent / "session-prefix.jsonl",
+                              limit=256 * 1024 * 1024)
+            current = _regular(Path(previous["session_file"]), limit=256 * 1024 * 1024)
+            if (previous["sid"] != manifest.get("resume_sid") or not current.startswith(prefix)
+                    or (before_run and current != prefix)):
+                raise RunnerError("Persisted quality reading context changed before its bound resume")
+    if manifest.get("role_session") is not None:
+        _role_session_call("validate", root, manifest, _role_session_source, before_run=before_run)
     return manifest
 
 
@@ -562,6 +1048,8 @@ def probe_native_attempt(root: Path) -> dict:
 
     root = Path(root).absolute()
     manifest = _validate(root)
+    if manifest.get("text_only_delivery"):
+        raise RunnerError("text-only role has configuration readiness, not execution-tool probe qualification")
     native = manifest.get("native")
     if manifest["mode"] != "native_role" or not native:
         raise RunnerError("Only a native role uses this probe")
@@ -728,8 +1216,27 @@ def _identity(pid: int) -> dict:
     return result
 
 
+def _process_environment(native: dict | None, session: dict | None = None) -> dict | None:
+    selected = (native or {}).get("provider")
+    if not selected and session is None:
+        return None
+    if __package__:
+        from taskflow.execution_codex_environment import process_environment
+    else:
+        from codex_environment import process_environment
+    return process_environment(selected, role_home=session["home"] if session else None)
+
+
 def _worker(root: Path) -> None:
     manifest = _validate(root)
+    if manifest.get("role_session") is not None:
+        with _role_session_module().execution_lock(manifest):
+            _worker_process(root, manifest)
+    else:
+        _worker_process(root, manifest)
+
+
+def _worker_process(root: Path, manifest: dict) -> None:
     _publish(root / "supervisor.json", {**_identity(os.getpid()), "intent_id": manifest["intent_id"]})
     termination = {"intent_id": manifest["intent_id"], "started_at": _now(),
                    "returncode": None, "exception": None, "timed_out": False,
@@ -740,6 +1247,7 @@ def _worker(root: Path) -> None:
             spawn_entered = True
             process = subprocess.Popen(manifest["argv"], cwd=manifest["cwd"],
                                        stdin=subprocess.PIPE, stdout=stdout, stderr=stderr,
+                                       env=_process_environment(manifest.get("native"), manifest.get("role_session")),
                                        start_new_session=True)
             termination["spawn_state"] = "started"
             _publish(root / "process.json", {**_identity(process.pid),
@@ -762,7 +1270,41 @@ def _worker(root: Path) -> None:
         if spawn_entered and process is None:
             termination.update(spawn_state="not_started", spawn_failure_origin="cli_popen")
     termination["ended_at"] = _now()
+    if manifest.get("quality_session") is not None and termination["returncode"] == 0 and not termination["timed_out"]:
+        try:
+            termination["quality_session_capture"] = _capture_quality_context(root, manifest)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            termination["quality_session_capture_error"] = {"type":type(error).__name__, "message":str(error)}
     _publish(root / "termination.json", termination)
+
+
+def _capture_quality_context(root: Path, manifest: dict) -> dict:
+    """Snapshot the owned increment at process exit, before any collection seal."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("bound_quality_capture", root / "execution_quality_capture.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    trace = _trace(root / "trace.jsonl", manifest.get("resume_sid"))
+    if not trace["model_completed"]:
+        raise RunnerError("Quality context capture requires this exact complete visible turn")
+    session = manifest["quality_session"]
+    files = list(Path(session["session_store"]).rglob("*" + trace["sid"] + "*.jsonl"))
+    if len(files) != 1:
+        raise RunnerError("Quality context capture requires one retained native session original")
+    previous = (Path(session["previous"]["path"]).parent / "session-prefix.jsonl") if session["previous"] else None
+    prefix = _regular(previous, limit=256 * 1024 * 1024) if previous else b""
+    source = files[0]
+    data = _regular(source, limit=256 * 1024 * 1024)
+    observed = module.bind_increment(data, prefix, _regular(root / "request.md"),
+                                     _regular(root / "trace.jsonl", limit=128 * 1024 * 1024), trace["sid"])
+    _publish_bytes(root / "quality-session-observed.jsonl", data)
+    observed.update(intent_id=manifest["intent_id"], session_file=str(source),
+                    snapshot=_info(root / "quality-session-observed.jsonl"), captured_by="original_supervisor_at_process_exit")
+    _publish(root / "quality-session-observation.json", observed)
+    if _info(source) != observed["snapshot"]:
+        raise RunnerError("Persisted context changed during its owned-turn capture")
+    return {"observation":_info(root / "quality-session-observation.json"), "snapshot":observed["snapshot"]}
 
 
 def run_attempt(root: Path, fault: str | None = None,
@@ -774,6 +1316,8 @@ def run_attempt(root: Path, fault: str | None = None,
     if b"<taskflow_bounded_original_round_v1>" in _regular(root / "request.md") and launch_guard is None:
         raise RunnerError("bounded round requires its guarded consumer launch")
     with launch_guard() if launch_guard is not None else nullcontext():
+        if manifest.get("role_session") is not None:
+            _role_session_call("claim", root, manifest)
         _publish(root / "dispatch.json", {"intent_id": manifest["intent_id"], "at": _now(),
                                           "manifest": _info(root / "manifest.json")})
         if fault == "before_start":
@@ -809,8 +1353,66 @@ def run_attempt(root: Path, fault: str | None = None,
     return reconcile_attempt(root, fault="collecting" if fault == "collecting" else None)
 
 
+def _reconnect_progress(event: dict) -> dict | None:
+    """Recognize numbered transport progress, never a terminal failure waiver."""
+    import re
+
+    if event.get("type") != "error" or not isinstance(event.get("message"), str):
+        return None
+    if event["message"] == "Reconnecting... waiting for network (Connection failed: error sending request)":
+        return {"attempt": None, "limit": None, "message": event["message"]}
+    match = re.fullmatch(r"Reconnecting\.\.\. ([1-9][0-9]*)/([1-9][0-9]*) \((.+)\)", event["message"])
+    if match is None or int(match[1]) > int(match[2]):
+        return None
+    return {"attempt": int(match[1]), "limit": int(match[2]), "message": event["message"]}
+
+
+def _author_host_executables(manifest: dict) -> set[str]:
+    """Identify the captured CLI and native runtime binaries, excluding data/code."""
+    allowed = {manifest["argv"][0]}
+    native = manifest.get("native") or {}
+    if native.get("python"):
+        allowed.add(native["python"])
+    # Native configurations pin the Node binary separately and grant its
+    # runtime dependency tree read-only. Do not accept arbitrary changed files
+    # merely because they lie in a readable repository or evidence directory.
+    python = Path(native.get("python", "/"))
+    for name in manifest["dependencies"]:
+        path = Path(name)
+        if (path.name == "node" and path.parent.name == "bin"
+                and python.name.startswith("python")
+                and path.parent.parent.parent == python.parent.parent.parent
+                and native.get("filesystem", {}).get(str(path.parent.parent.parent)) == "read"):
+            allowed.add(name)
+    return allowed
+
+
+def _recovered_author_collection(root: Path, manifest: dict, collection: dict) -> dict:
+    """Interpret one sealed transport-progress misclassification without rewriting it."""
+    termination = _read(root / "termination.json")
+    trace = _trace(root / "trace.jsonl", collection.get("sid"))
+    if (manifest.get("role") != "author" or manifest.get("mode") not in ("native_role", "test_fixture")
+            or collection.get("intent_id") != manifest["intent_id"]
+            or collection.get("status") != "incomplete" or collection.get("model_completed") is not False
+            or collection.get("technical_accepted") is not False
+            or collection.get("delivery_complete") is not True or collection.get("process_ended") is not True
+            or collection.get("errors") != ["missing_or_failed_turn"]
+            or collection.get("artifact_errors") != []
+            or termination.get("intent_id") != manifest["intent_id"]
+            or termination.get("returncode") != 0 or termination.get("spawn_state") != "started"
+            or termination.get("timed_out") is not False or termination.get("exception") is not None
+            or collection.get("termination") != termination
+            or trace.get("model_completed") is not True or not trace.get("reconnect_progress")
+            or collection.get("terminal_events") != ["error"] * len(trace["reconnect_progress"]) + ["turn.completed"]
+            or collection.get("final_response") != trace.get("final_response")):
+        raise RunnerError("Not a sealed author transport-progress completion misclassification")
+    return {**collection, **trace, "status": "completed", "technical_accepted": True,
+            "interpretation": "same_attempt_transport_completion_v1",
+            "original_collection": _info(root / "collection.json")}
+
+
 def _trace(path: Path, expected_sid: str | None = None) -> dict:
-    ids, terminals, messages, errors = [], [], [], []
+    ids, terminals, messages, errors, reconnects = [], [], [], [], []
     if not path.exists():
         return {"model_completed": False, "sid": None, "errors": ["missing_trace"]}
     try:
@@ -824,7 +1426,11 @@ def _trace(path: Path, expected_sid: str | None = None) -> dict:
             if event.get("type") == "thread.started":
                 ids.append(event.get("thread_id"))
             if event.get("type") in {"turn.completed", "turn.failed", "error"}:
-                terminals.append(event["type"])
+                progress = _reconnect_progress(event)
+                if progress is not None and not terminals:
+                    reconnects.append({"line": number, **progress})
+                else:
+                    terminals.append(event["type"])
             item = event.get("item", {})
             if event.get("type") == "item.completed" and item.get("type") == "agent_message":
                 messages.append(item.get("text", ""))
@@ -843,7 +1449,37 @@ def _trace(path: Path, expected_sid: str | None = None) -> dict:
     if not messages or not messages[-1].strip():
         errors.append("missing_final_response")
     return {"model_completed": not errors, "sid": sid, "terminal_events": terminals,
-            "errors": errors, "final_response": messages[-1] if messages else None}
+            "errors": errors, "final_response": messages[-1] if messages else None,
+            "reconnect_progress": reconnects}
+
+
+def _check_seeded_outputs(cwd: Path, trees: list[str], seeds: dict, role: str, inputs: list[dict]) -> None:
+    """Permit only complete independent repair copies of locked input originals."""
+    if not isinstance(seeds, dict) or (seeds and (role != "repair" or not set(seeds).issubset(trees))):
+        raise RunnerError("seeded output trees require explicit repair output directories")
+    source = {row["target"]: row for row in inputs}
+    for tree, rows in seeds.items():
+        if not isinstance(rows, list) or not rows:
+            raise RunnerError("seeded output tree requires its complete initial member manifest")
+        members, _, errors = _output_tree_files(cwd, [tree])
+        if errors:
+            raise RunnerError("unsafe seeded output tree: " + str(errors))
+        expected = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RunnerError("seeded output members must identify locked input originals")
+            name = _relative(row.get("path", ""))
+            original = source.get(row.get("input_target"))
+            info = {key: row.get(key) for key in ("sha256", "size")}
+            if (name in expected or not name.startswith(tree + "/") or original is None
+                    or info != {key: original[key] for key in ("sha256", "size")}):
+                raise RunnerError("seeded output member differs from its exact locked source")
+            path = cwd / name
+            if path.stat().st_nlink != 1 or _info(path) != info:
+                raise RunnerError("seeded output member must be an independent byte-identical ordinary copy")
+            expected[name] = info
+        if set(expected) != set(members[tree]):
+            raise RunnerError("seeded output manifest omits or adds actual initial members")
 
 
 def _output_tree_files(cwd: Path, trees: list[str]) -> tuple[dict, dict, list[dict]]:
@@ -917,6 +1553,15 @@ def _collection_files(root: Path) -> dict:
              "trace.jsonl", "stderr.txt", "collection-sources.json",
              "observed-trace.jsonl", "observed-request.md", "observed-attempt.json",
              "observed-input-readback.json"]
+    if (root / "quality-later-inputs.v1.json").exists():
+        names.append("quality-later-inputs.v1.json")
+    names.extend(name for name in (MODEL_LOCATIONS, MODEL_QUALITY_INSTRUCTIONS) if (root / name).exists())
+    if (root / "quality-session-observation.json").exists():
+        names += ["quality-session-observation.json", "quality-session-observed.jsonl"]
+    if (root / "role-session-invocation.json").exists():
+        names.append("role-session-invocation.json")
+    if (root / "text-only-ready.json").exists():
+        names += ["text-only-ready.json", "inline-input-index.json", "text-only-catalog.json", "response-schema.json"]
     if (root / "native-probe-ready.json").exists():
         names += ["native-probe-ready.json", _relative(_read(root / "native-probe-ready.json")["report_file"])]
     if (root / "cli-evidence.json").exists():
@@ -964,10 +1609,10 @@ def _validated_collection(root: Path, manifest: dict) -> dict:
     return result
 
 
-def reconcile_attempt(root: Path, fault: str | None = None) -> dict:
+def reconcile_attempt(root: Path, fault: str | None = None, *, received_dependencies: dict | None = None) -> dict:
     """Observe original process and artifacts. Never starts any process/model."""
     root = Path(root).absolute()
-    manifest = _validate(root)
+    manifest = _validate(root, received_dependencies=received_dependencies)
     detached = _DETACHED.get(str(root))
     if detached is not None and detached.poll() is not None:
         detached.wait()
@@ -1076,6 +1721,38 @@ def reconcile_attempt(root: Path, fault: str | None = None) -> dict:
             partial.unlink()
     trace_path = root / ("observed-trace.jsonl" if manifest["mode"] == "existing_isolated" else "trace.jsonl")
     trace = _trace(trace_path, manifest.get("resume_sid"))
+    if manifest.get("quality_session") is not None:
+        captured = termination.get("quality_session_capture")
+        try:
+            capture_valid = (isinstance(captured, dict)
+                and captured.get("observation") == _info(root / "quality-session-observation.json")
+                and captured.get("snapshot") == _info(root / "quality-session-observed.jsonl"))
+        except (OSError, RunnerError):
+            capture_valid = False
+        if not capture_valid:
+            errors.append({"path":"quality_session", "error":"Original supervisor owned-turn capture missing or changed",
+                           "capture_error":termination.get("quality_session_capture_error")})
+    if manifest.get("text_only_delivery"):
+        try:
+            output = _read(root / "artifacts" / manifest["text_only_delivery"]["output"])
+            final = json.loads(trace["final_response"])
+            if not isinstance(output, dict) or output != final:
+                raise RunnerError("structured capture differs from original final response")
+            turn_started = False
+            for line in _regular(root / "trace.jsonl", limit=128*1024*1024).decode("utf-8").splitlines():
+                event = json.loads(line)
+                if event.get("type") == "turn.started":
+                    turn_started = True
+                if event.get("type") not in {"item.started", "item.completed"}:
+                    continue
+                item = event.get("item", {})
+                if (item.get("type") == "error" and not turn_started
+                        and item.get("message", "").startswith("Under-development features enabled:")):
+                    continue
+                if item.get("type") not in {"agent_message", "reasoning"}:
+                    raise RunnerError("text-only role returned an error or unexpected tool event")
+        except (OSError, ValueError, TypeError, RunnerError) as error:
+            errors.append({"path": "text_only_delivery", "error": str(error)})
     isolated_receipt = None
     if manifest["mode"] == "existing_isolated":
         try:
@@ -1122,6 +1799,8 @@ def _validated_facts_seal(root: Path) -> dict:
             or seal.get("collection") != _info(root / "collection.json")
             or seal.get("manifest") != _info(root / "manifest.json")):
         raise RunnerError("Facts seal is not bound to the collected CLI facts and source attempt")
+    if manifest.get("run_binding") is not None and seal.get("run_binding") != manifest["run_binding"]:
+        raise RunnerError("Facts seal belongs to a different frozen formal run")
     return seal
 
 
@@ -1142,19 +1821,26 @@ def seal_facts(root: Path, facts_path: Path) -> dict:
             or _info(facts_path) != collected["artifacts"][name]
             or not _regular(facts_path)):
         raise RunnerError("Facts are not bound to the actual collected CLI output")
+    if (root / "facts-seal.json").exists():
+        existing = _validated_facts_seal(root)
+        if existing["path"] != str(facts_path) or existing["output_name"] != name:
+            raise RunnerError("Existing facts seal belongs to a different collected output")
+        return existing
     seal = {"at": _now(), "sid": collected["sid"], "path": str(facts_path),
             "output_name": name, "facts": collected["artifacts"][name],
             "collection": _info(root / "collection.json"),
             "manifest": _info(root / "manifest.json"), "intent_id": manifest["intent_id"],
             "candidate_binding": manifest.get("candidate_binding")}
+    if manifest.get("run_binding") is not None:
+        seal["run_binding"] = manifest["run_binding"]
     _publish(root / "facts-seal.json", seal)
     return seal
 
 
-def archive_attempt(root: Path, destination: Path, fault: str | None = None) -> dict:
+def archive_attempt(root: Path, destination: Path, fault: str | None = None, *, received_dependencies: dict | None = None) -> dict:
     """Resume each atomic copy; source or published evidence is never overwritten."""
     root, destination = Path(root).absolute(), Path(destination).absolute()
-    result = reconcile_attempt(root)
+    result = reconcile_attempt(root, received_dependencies=received_dependencies)
     if not (root / "collection.json").exists():
         raise RunnerError("Uncertain/running attempt cannot be archived as complete evidence")
     files = {str(source.relative_to(root)): _info(source) for source in root.rglob("*")
@@ -1166,6 +1852,23 @@ def archive_attempt(root: Path, destination: Path, fault: str | None = None) -> 
                "files": files, "directories": directories}
     if destination.exists():
         existing = _read(destination / "archive-binding.json")
+        appendix = None
+        manifest = _read(root / "manifest.json")
+        if (manifest.get("role") == "review-facts" and manifest.get("role_session") is not None
+                and manifest.get("run_binding") is not None
+                and "facts-seal.json" in files and "facts-seal.json" not in existing.get("files", {})):
+            # Facts are explicitly sealed after collection. The original core
+            # archive stays immutable; only this independently validated seal
+            # may be appended to its runtime, never an arbitrary new member.
+            _validated_facts_seal(root)
+            tree = _full_tree(root)
+            if (tree["special"] or set(tree["files"]) != set(existing.get("files", {})) | {"facts-seal.json"}
+                    or {name.rstrip("/") for name in tree["directories"] if name != "."}
+                    != set(existing.get("directories", []))):
+                raise RunnerError("Facts seal must be the only addition to its original runtime archive")
+            appendix = {"path": str(root / "facts-seal.json"), **files["facts-seal.json"]}
+            files = {name: value for name, value in files.items() if name != "facts-seal.json"}
+            binding = {**binding, "files": files}
         expected_binding = binding
         if "directories" not in existing and _read(root / "manifest.json").get("output_tree_contract_version", 1) < 2:
             expected_binding = {key: value for key, value in binding.items() if key != "directories"}
@@ -1185,6 +1888,11 @@ def archive_attempt(root: Path, destination: Path, fault: str | None = None) -> 
         for name, expected in files.items():
             if _info(destination / name) != expected:
                 raise RunnerError("Published archive evidence changed")
+        if appendix is not None:
+            if _info(root / "facts-seal.json") != {key: appendix[key] for key in ("sha256", "size")}:
+                raise RunnerError("Facts seal appendix changed while verifying its original archive")
+            return {"archived": True, "path": str(destination), **binding,
+                    "facts_seal_appendix": appendix}
         return {"archived": True, "path": str(destination), **binding}
     destination.parent.mkdir(parents=True, exist_ok=True)
     stage = destination.with_name(destination.name + ".staging")
@@ -1380,7 +2088,7 @@ def _full_verify(location: Path, intent: dict, require_receipt: bool) -> dict:
     return receipt
 
 
-def archive_full_attempt(root: Path, destination: Path) -> dict:
+def archive_full_attempt(root: Path, destination: Path, *, received_dependencies: dict | None = None) -> dict:
     """Seal terminal work/scratch/inner originals, then use the normal archive.
 
     A durable source index is the recovery identity. It is never regenerated to
@@ -1391,8 +2099,8 @@ def archive_full_attempt(root: Path, destination: Path) -> dict:
     root, destination = Path(root).absolute(), Path(destination).absolute()
     if ".." in root.parts or ".." in destination.parts:
         raise RunnerError("Archive roots cannot contain parent traversal")
-    manifest = _validate(root)
-    result = reconcile_attempt(root)
+    manifest = _validate(root, received_dependencies=received_dependencies)
+    result = reconcile_attempt(root, received_dependencies=received_dependencies)
     if not result.get("process_ended") or not (root / "collection.json").exists():
         raise RunnerError("Full archive requires proved termination and a sealed collection")
     _validated_collection(root, manifest)
@@ -1483,12 +2191,12 @@ def archive_full_attempt(root: Path, destination: Path) -> dict:
     if pending.is_symlink():
         raise RunnerError("Full archive pending destination must not be a symlink")
     if destination.exists() or destination.is_symlink():
-        archived = archive_attempt(root, destination)
+        archived = archive_attempt(root, destination, received_dependencies=received_dependencies)
         if intent["snapshot"] != {key: _full_tree(path) for key, path in sources.items()}:
             raise RunnerError("Original sources changed while verifying the completed full archive")
         _full_verify(final, intent, True)
     else:
-        archived = archive_attempt(root, pending)
+        archived = archive_attempt(root, pending, received_dependencies=received_dependencies)
         if intent["snapshot"] != {key: _full_tree(path) for key, path in sources.items()}:
             raise RunnerError("Original sources changed during final archive copying")
         _full_verify(final, intent, True)

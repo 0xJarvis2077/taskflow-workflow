@@ -1,96 +1,78 @@
-# Taskflow：专业业务任务出题与评测工作流
+# Taskflow：专业业务任务与模型执行管理
 
-一套可在本地使用的工作方法、角色协作规范和 Python 工具，用于设计有真实业务价值的任务、审查公开材料是否提前完成关键判断、保存独立作答与评阅证据，并按实际结果返修。
+用于设计专业业务任务、保存独立作答与评阅原件，并通过 Codex 执行相互隔离的角色任务。
 
-难度来自证据关系、业务约束与可观察后果。材料数量、文件哈希、调度成功或低分都不能单独证明题目质量。
+Python 管理明确任务的准备、唯一领取、启动、采集和必要校验；Codex 负责阅读、推理、工具、上下文和角色内纠错。题目质量与评分由真实业务角色签发，调度成功或结构检查通过均不等于业务通过。
 
-## 知识库
+## 入口
 
-[知识库总入口](knowledge/index.md)包含完整方法、角色与单题模板、来源经验笔记、规则适用范围和材料入库方法。可复用知识随仓库分享；具体题目、附件、答案、真实答卷和成绩留在本地。
-
-## 从这里开始
-
-| 你要做什么 | 入口 |
+| 工作 | 文档 |
 | --- | --- |
-| 理解出题、增难、读卷与返修 | [工作方法](docs/workflow-methods.md) |
-| 组织角色、命名会话、确认每个角色的模型 | [协作架构](docs/task-collaboration-architecture.md) |
-| 派发作者、审查、返修和评阅任务 | [角色交接](docs/role-handoffs.md) |
-| 给 agent 加载工作方法 | [主 skill](skills/high-value-task-workflow/SKILL.md) |
-| 建档、检查、冻结与分包 | [单题契约](docs/task-contract.md) |
-| 保存答卷、原评与纠错记录 | [记录示例](docs/record-examples.md) |
-| 独立角色、依赖与自动接续 | [执行层](docs/execution-layer.md) |
-| 首次配置本机真实角色与正式适配器 | [配置说明与空模板](docs/runtime-configuration.md) |
-| 准备只见公开材料的独立质量求解 | [隔离运行](docs/isolated-quality.md) |
-| 分享流程与知识库、同步已验证迭代 | [GitHub 同步](docs/github-sync.md) |
+| 设计与审查专业任务 | [工作方法](docs/workflow-methods.md) / [主 Skill](skills/high-value-task-workflow/SKILL.md) |
+| Python 与 Codex 的职责 | [执行层重设计](docs/python-execution-redesign.md) |
+| 独立质检任务与同会话纠错 | [质检执行](docs/quality-tasks.md) |
+| 冻结父材料继承、针对性修订与受影响复检 | [材料修订](docs/material-revisions.md) |
+| 完整复盘、主控接收与下一投入、离线决策回放 | [迭代接收](docs/iteration-intake.md) |
+| 正式作答、全卷事实封存与同会话评分 | [正式与评阅](docs/formal-review-tasks.md) |
+| 每轮压测计量、逐项原分与证据报告 | [压测报告](docs/stress-reports.md) |
+| 角色与资料边界 | [协作架构](docs/task-collaboration-architecture.md) / [角色交接](docs/role-handoffs.md) |
+| 任务建档、冻结与分包 | [单题契约](docs/task-contract.md) |
+| 一题一目录、生成物归属与分类索引 | [目录规范](docs/task-layout.md) |
+| 模型/provider/CLI 配置 | [运行配置](docs/runtime-configuration.md) / [Codex 角色管理](docs/codex-role-management.md) |
+| 执行原语、正式作答和评阅 | [执行层](docs/execution-layer.md) / [隔离运行](docs/isolated-quality.md) |
+| 答卷、原分与修订证据 | [记录示例](docs/record-examples.md) |
+| 知识库 | [知识库入口](knowledge/index.md) |
 
-## 协作方式
+## 质检链路
 
-主控负责业务目标、投入选择和研发接续；作者设计完整业务任务和私有参考；独立角色分别进行公开重建、质量检查、正式作答与评阅。内容检查者专注公开预解题及材料声明清理，工程只在具体技术问题发生时介入。Python 负责状态、互斥、依赖和已授权节点的接续。
+材料迭代使用 `revision submit/prepare/run/collect/status`：从冻结父版建立独立副本，只改需要变化的内容，程序保留未变文件并核对完整实际差异。公开成员、角色及字节完全相同可显式复用原公开重建；新版质量可由独立签发的继承范围、受影响业务单元复检和关联检查组成，solver同步消费有效来源。旧签保留旧身份，未闭阻断项仍阻止准入。详见[修订委托与合同](docs/material-revisions.md)。
 
-原卷、全卷事实和评分接收后，主控可用明确的教师后继绑定登记下一研究作者，按同一意图自动接续；已在途作者只接收其原身份。作者真实返回 `research_ended` 后，主控若选择继续检查已捕获基线，可用 `batch-baseline-quality-start` 登记独立用途，再走新的公开重建及整包质量；原作者结果保留。新正式实验仍需独立的具体用途与授权。绑定、恢复与执行入口见[执行层](docs/execution-layer.md)。
+同题作者修订默认沿精确父子链续接同一逻辑作者的持久会话；原 QA 可对修后子版继续受影响复检，包括原结论为 revision_required 的合法审查。版本迁移绑定原 collection、SID、owner、模型/provider/home、真实差异和资料权限；通用 resume 仍校验同版身份。不能恢复时明确记录 fresh 原因。各次调用均有独立 work/attempt 及封存记录，角色之间继续隔离。
 
-有界多轮计划使用 `bounded_original_rounds_v1`，固定目标轮数、批次与用户授权。首轮保持原流程；主控逐轮给出通过质量门的具体投入，Python 接收独立原分、幂等接续并在目标轮数停止。缺少业务绑定时等待，模拟原分不计真实成绩。见[有界原分轮次](docs/execution-layer.md#有界原分轮次)。
-
-新批次先建立[角色模型表](knowledge/templates/task-batch-plan.template.json)。所有模型初始为空，缺项必须问用户。用户可以分别指定，也可以明确“作答用 X，其余全部用 Y”。同一已确认批次内正常迭代不反复询问；换模型、新增角色或超出确认范围时补问。
-
-新批次使用有模型确认门的 `batch-*` 入口。可先检查空模板；退出码 2 和 `awaiting_user_models` 表示仍需用户选择，不是可调用模型的配置：
+质检是一项明确提交的角色任务。管理层分别记录执行状态、交付有效性和原角色业务结论；交付错误提供给同一 Codex 角色处理。可用的持久会话和明确纠错额度是追加调用的条件。
 
 ```sh
-python3 -m taskflow execution batch-check --plan knowledge/templates/task-batch-plan.template.json
+python3 -m taskflow execution --db /absolute/state.sqlite3 quality submit --spec /absolute/quality-task.json
+python3 -m taskflow execution --db /absolute/state.sqlite3 quality prepare quality-id
+python3 -m taskflow execution --db /absolute/state.sqlite3 quality run quality-id --allow-model
+python3 -m taskflow execution --db /absolute/state.sqlite3 quality collect quality-id --brief
+python3 -m taskflow execution --db /absolute/state.sqlite3 quality status quality-id --brief
 ```
 
-补齐本批范围、用户模型选择、实际 CLI 支持及聊天配置证据后，再按[执行层说明](docs/execution-layer.md#新批次模型确认入口)冻结确认并生成本批工厂。检查与配置编译不访问执行库、不调用模型。
+登记、准备和采集不启动模型；真实执行须明确 `--allow-model`。只有原技术成功、交付不合法且会话和额度均有效，才能通过 `quality correct` 准备同审查者的下一次纠错调用。公开先行、独立性、资料权限和原签仍按质检合同核验。
 
-会话可命名为 `出题·项目或批次·研发主控`、`出题·项目或批次·内容检查`。真实身份由角色与 thread/work/attempt/SID 的绑定确定，不能靠标题猜路由。逻辑角色不要求各自常驻一个聊天。
+`revision_required` 和 `inconclusive` 返回协调者，Python 不自动选择返修、公开重建、复检或新一轮研究。旧 author/lifecycle、`flow-*` 质量/返修循环与事故型接续命令已退出执行CLI；旧任务不做运行兼容，历史原件继续保留。
 
-## 本地使用
+主控通过既有 `record_decision` 接收质量结论、难度证据与下一投入；新正式作答须提供重要未知及不同结果的后续选择，管理侧决定锁入调用依赖并与公开输入隔离。完整历史按来源索引提供，资料缺失保持未知；责任分析随真实作者交付接收。离线决策回放使用 `tools.execution_replay --decisions`，不启动模型。
 
-需要 Python 3.10+。核心工具使用标准库，可直接在仓库根目录运行，无需配置模型账号即可建档、检查和执行中性模拟。
+正式作答与评阅也采用明确任务，按 `solver submit/run/collect`、`review run --stage facts`、`review seal`、`review run --stage score` 分别操作。solver 只见公开输入；reviewer 在全卷事实封存后，沿同一实际 reviewer/model/provider/home/SID 追加冻结标准评分。共享结构预检交回 Codex 自己纠错，Python不代分、不自动启动后续阶段。旧自动 experiment/round CLI 已退役。详见[正式与评阅](docs/formal-review-tasks.md)。
+
+代码、文件哈希和分包本身不证明模型隔离或业务质量。
+
+作答及评分终态收件会附带教师侧 `report.json/report.md` 路径，汇总实际运行计量、原评阅事实、逐项得分与明确未知项。可用 `python3 -m tools.stress_report --db /absolute/state.sqlite3 --solver solver-id --output /absolute/private-reports` 只读补生成；不重新调用模型或改变原分。
+
+## 本地使用与验证
+
+Python 3.10+，核心只用标准库。
 
 ```sh
 python3 -m taskflow --help
-python3 -m taskflow init my-task
-python3 -m taskflow check tasks/my-task --no-write
-```
-
-新建草稿有意留空业务内容和评分依据，首次检查可能失败；按[单题契约](docs/task-contract.md)补齐后，完成真实业务审查，再冻结与导出。
-
-```sh
-python3 -m taskflow freeze tasks/my-task --version v1
-python3 -m taskflow export tasks/my-task/versions/v1 --audience solver
-python3 -m taskflow export tasks/my-task/versions/v1 --audience evaluator
-python3 -m taskflow status tasks/my-task
-```
-
-以下只运行中性模拟和离线测试，不调用真实模型：
-
-```sh
-python3 -m taskflow execution simulate --output /tmp/taskflow-demo-new
+python3 -m taskflow init my-task --topic my-topic
+python3 -m taskflow check tasks/my-topic/packages/my-task --no-write
 python3 -m unittest discover -s tests
-python3 -m tools.validate_local
 ```
 
-输出目录必须尚不存在。本机可选集成测试需要显式提供对应 adapter 或 CLI；例如 `TASKFLOW_TEST_FORMAL_ADAPTER=/path/to/adapter`。未启用时明确跳过，显式配置无效会失败。`tools.validate_local` 使用标准库 trace，报告可执行行覆盖率，不是分支覆盖率。
+测试使用中性任务、受控事件和临时目录。真实外部模型联调需要明确用途及授权，不能把模拟报告为真实调用。角色模型、档位与资料范围来自本批显式选择，不从其他批次或 CLI 默认推测。
 
-真实模型执行另需配置本机 CLI、权限探针、角色模型、策略和运行适配器。先完成用户模型确认、[本机配置](docs/runtime-configuration.md)及[执行层契约](docs/execution-layer.md)要求，不能把模拟运行、字段齐全或文件分包当成真实隔离、实际成绩或平台通过。
-
-## 仓库结构
+## 目录
 
 ```text
-taskflow/       单题契约、冻结分包、执行状态与角色接续
-tools/         中性模拟、回放、库存检查与离线验收
-tests/         标准库测试与中性夹具
-docs/          方法、角色和命令契约
-skills/        可供 agent 使用的工作流 skill
-knowledge/
-  methods/       设计、增难、质检、压测与复盘
-  experience/    来源经验与采用范围
-  policy-notes/  历史规则的适用边界
-  templates/     角色、单题和空白模型配置
+taskflow/   任务、执行原语、Codex 载体和领域合同
+tools/      离线检查、模拟与受控适配
+tests/      标准库测试与中性夹具
+docs/       架构、合同及使用方式
+skills/     角色工作方法
+knowledge/  可复用方法、经验和空模板
 ```
 
-工作中的题包、真实答卷、数据库、配置和来源材料保存在本机，并由忽略规则排除提交。仓库不附带个人历史案例或现成的私人服务配置。
-
-用户明确授权持续发布后，可配置 `tools.github_sync`，通过私有镜像同步已验证的公开文件；默认只做本地预览。具体配置、检查和失败恢复见 [GitHub 同步](docs/github-sync.md)。
-
-目录发布与文件权限涉及操作系统能力；具体已支持的行为和限制以契约及实际探针为准。模型请求值、可证客户端配置和服务端实际身份分别记录，未知保持未知。
+题包、私有参考、真实答卷、成绩、配置、数据库、凭据及运行痕迹保留在本机，不进入公开提交。[GitHub 同步](docs/github-sync.md)只在明确授权和配置下发布经过检查的公共文件。

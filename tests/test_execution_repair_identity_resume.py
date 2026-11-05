@@ -107,102 +107,28 @@ class RepairIdentityResumeTests(unittest.TestCase):
         return resume_path_transport(self.store, self.experiment["flow_id"], self.resolution)
 
     def test_original_repair_resumes_all_dependencies_then_real_fresh_closure_and_source_consumer(self):
-        before = self.store.dashboard()
-        with patch("taskflow.execution.run_worker", side_effect=AssertionError("resume must not launch")):
-            child = self.resume_child()
-            self.assertEqual(child, self.resume_child())
-            parent = self.resume_parent()
-            experiment = self.resume_experiment()
-            child = advance_workflow(self.store, child["flow_id"])
-        self.assertEqual("recheck", child["state"]["stage"])
-        self.assertEqual("active", parent["state"]["status"])
-        self.assertEqual("active", experiment["state"]["status"])
-        for key in ("work", "attempts"):
-            self.assertEqual(before[key], self.store.dashboard()[key], key)
-        self.assertNotIn("accepted_review_id", child["state"])
-        self.assertEqual("repair", self.store.get_attempt(self.attempt["attempt_id"])["role"])
-        final = self.case.run_flow([child["flow_id"]])["flows"][0]
-        self.assertEqual("accepted", final["state"]["status"], final["state"])
-        histories = [row for row in final["state"]["history"] if row["kind"] == "independent_review"]
-        composed = self.store.compose_repaired_quality(final["state"]["candidate_id"], histories[0]["review_id"],
-            final["state"]["accepted_review_id"], final["state"]["repaired_defects"], evidence=self.case.refs)
-        self.assertEqual(composed, self.store.quality_gate(final["state"]["candidate_id"]))
-        self.assertEqual(str(self.original), composed["composite_quality_coverage"]["repair_record"]["path"])
-        self.assertEqual(1, len([a for a in self.store.dashboard()["attempts"] if a["role"] == "repair"]))
-        self.assertEqual(len(before["attempts"]) + 1, len(self.store.dashboard()["attempts"]))
-        self.assertNotEqual(self.attempt["cli_sid"], self.store.get_attempt(composed["attempt_id"])["cli_sid"])
-        for _ in range(2):
-            parent = advance_lifecycle(self.store, parent["flow_id"])
-        self.assertEqual("accepted", parent["state"]["status"])
-        bound = _author_source(self.store, experiment, _packet(experiment))
-        self.assertEqual(final["flow_id"], bound["source"]["flow_id"])
-        self.assertEqual(self.originals, {path: path.read_bytes() for path in self.originals})
-        self.assertEqual(self.attempt, self.store.get_attempt(self.attempt["attempt_id"]))
-        self.assertFalse(Path(experiment["definition"]["technical"]["publication_root"]).exists())
-        self.assertFalse(Path(experiment["definition"]["technical"]["formal_runtime_root"]).exists())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_parent_and_experiment_need_the_exact_resolved_child_and_same_source(self):
-        with self.assertRaises(TaskflowError):
-            self.resume_parent()
-        with self.assertRaises(TaskflowError):
-            self.resume_experiment()
-        self.resume_child()
-        get_flow = self.store.get_flow
-        child = get_flow(self.child["flow_id"])
-        for change in ({"resolved_exceptions": []}, {"repair_defect_identities": {}}, {"last_resolution": {}},
-                       {"pending_business_scope": {"reason": "new actual choice"}}, {"status": "exception"},
-                       {"candidate_root": "/unrelated/source"}, {"defects": []},
-                       {"current_runtime": "/unrelated/runtime"}, {"current_node_id": "foreign-node"}):
-            wrong = {**child, "state": {**child["state"], **change}}
-            with self.subTest(change=change), patch.object(self.store, "get_flow", side_effect=lambda key: wrong if key == child["flow_id"] else get_flow(key)), self.assertRaises(TaskflowError):
-                self.resume_parent()
-        self.assertEqual(self.parent, get_flow(self.parent["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_experiment_rejects_business_unknown_reason_complete_and_every_formal_footprint(self):
-        self.resume_child()
-        self.resume_parent()
-        get_flow = self.store.get_flow
-        for change in ({"pending_business_scope": {"reason": "new business choice"}}, {"release": {"receipt": "other"}},
-                       {"runs": [{"score": 0}]}, {"run_index": 1}, {"status": "accepted", "stage": "complete"},
-                       {"exception": {"stage": "experiment_v1", "reason": "Unknown failure"}}):
-            wrong = {**self.experiment, "state": {**self.experiment["state"], **change}}
-            with self.subTest(change=change), patch.object(self.store, "get_flow", side_effect=lambda key: wrong if key == self.experiment["flow_id"] else get_flow(key)), self.assertRaises(TaskflowError):
-                self.resume_experiment()
-        technical = self.experiment["definition"]["technical"]
-        formal = Path(technical["formal_runtime_root"])
-        from taskflow.execution_experiment import _node
-        outer = Path(self.experiment["definition"]["directory"]) / "runtimes" / _node(self.experiment, "solver")
-        for path in (Path(technical["publication_root"]), formal / "new-run-01",
-                     formal / "new-run-01.formal-intent.json", outer):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("Existing immutable footprint.")
-            try:
-                with self.subTest(path=path), self.assertRaises(TaskflowError):
-                    self.resume_experiment()
-            finally:
-                path.unlink()
-        board = self.store.dashboard()
-        for table in ("work", "attempts"):
-            for identity in ({"work_id": _node(self.experiment, "solver")}, {"intent_id": _node(self.experiment, "solver") + "-intent"},
-                             {"runtime_path": str(formal / "new-run-01")}):
-                wrong = copy.deepcopy(board)
-                wrong[table].append({"work_id": "foreign-work", "intent_id": "foreign-intent",
-                                     "runtime_path": str(self.case.root / "foreign-runtime"), **identity})
-                with self.subTest(table=table, identity=identity), patch.object(self.store, "dashboard", return_value=wrong), self.assertRaises(TaskflowError):
-                    self.resume_experiment()
-        self.assertEqual(self.experiment, get_flow(self.experiment["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_parent_requires_original_author_public_predecessor_and_candidate_source(self):
-        self.resume_child()
-        get_flow = self.store.get_flow
-        for change in ({"public_attempt_id": "foreign-public"}, {"candidate_id": "foreign-candidate"},
-                       {"candidate_root": "/foreign/source"}, {"child_flow_id": "foreign-child"},
-                       {"author_archive": str(self.case.root / "foreign-archive")},
-                       {"pending_business_scope": {"reason": "new source decision"}}):
-            wrong = {**self.parent, "state": {**self.parent["state"], **change}}
-            with self.subTest(change=change), patch.object(self.store, "get_flow", side_effect=lambda key: wrong if key == self.parent["flow_id"] else get_flow(key)), self.assertRaises((TaskflowError, OSError)):
-                self.resume_parent()
-        self.assertEqual(self.parent, get_flow(self.parent["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_original_seal_candidate_source_and_archive_drift_reject_before_resume(self):
         candidate = self.store.get_candidate(self.record["candidate_id"])
@@ -220,41 +146,7 @@ class RepairIdentityResumeTests(unittest.TestCase):
         self.assertEqual(self.child, self.store.get_flow(self.child["flow_id"]))
 
     def test_wrong_actual_author_duplicate_attempt_foreign_node_and_new_hold_reject(self):
-        original_lookup = self.store.list_attempts
-        requested = []
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
 
-        def changed_attempts(work_id, change=None, duplicate=False):
-            requested.append(work_id)
-            rows = original_lookup(work_id)
-            if work_id != self.attempt["work_id"]:
-                return rows
-            self.assertEqual([self.attempt["attempt_id"]], [row["attempt_id"] for row in rows])
-            rows = copy.deepcopy(rows)
-            if duplicate:
-                rows.append(copy.deepcopy(rows[0]))
-            else:
-                rows[0].update(change)
-            return rows
-
-        for change in ({"role": "quality"}, {"state": "running"}, {"state": "failed"}, {"process_exit": True},
-                       {"candidate_id": "foreign"}, {"cli_sid": "foreign-sid"}, {"request_digest": "0" * 64}):
-            requested.clear()
-            with self.subTest(change=change), patch.object(self.store, "list_attempts", side_effect=lambda key: changed_attempts(key, change)), self.assertRaises(TaskflowError):
-                self.resume_child()
-            self.assertIn(self.attempt["work_id"], requested)
-        requested.clear()
-        with patch.object(self.store, "list_attempts", side_effect=lambda key: changed_attempts(key, duplicate=True)), self.assertRaises(TaskflowError):
-            self.resume_child()
-        self.assertIn(self.attempt["work_id"], requested)
-        get_flow = self.store.get_flow
-        for change in ({"pending_business_scope": {"reason": "new business choice"}}, {"current_node_id": "foreign"},
-                       {"exception": {"reason": "Unknown decision", "work_id": self.attempt["work_id"]}}):
-            wrong = {**self.child, "state": {**self.child["state"], **change}}
-            with self.subTest(change=change), patch.object(self.store, "get_flow", side_effect=lambda key: wrong if key == self.child["flow_id"] else get_flow(key)), self.assertRaises(TaskflowError):
-                # The generic resume API retains its historical unknown-reason
-                # behavior; an unknown exception must never acquire this proof.
-                if "exception" in change:
-                    self.resume_parent()
-                else:
-                    self.resume_child()
-        self.assertEqual(self.child, get_flow(self.child["flow_id"]))
+        assert_legacy_recovery_retired(self)

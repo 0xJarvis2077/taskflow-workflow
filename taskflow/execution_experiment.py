@@ -2,8 +2,10 @@
 
 import copy
 from pathlib import Path
+
 import re
 
+from taskflow.execution_completion_observation import author_technically_complete
 from taskflow.contracts import PUBLIC_ROLES, REVIEW_KINDS, TaskflowError, canonical, relative_path, sha256
 from taskflow.execution import enqueue_spec
 from taskflow.execution_flow import _get_or_none, _identity
@@ -40,6 +42,13 @@ def _node(record: dict, role: str) -> str:
     return _identity(record["flow_id"], role + "-" + str(record["state"].get("run_index", 0)))
 
 
+def _native_source_flow(definition: dict) -> str | None:
+    from taskflow.execution_engineering_source import KIND
+
+    return (definition.get("source_flow_id") if definition.get("source_kind") == KIND
+            else definition.get("source_author_flow_id"))
+
+
 def _packet(record: dict) -> dict:
     definition = record["definition"]
     reference = validate_evidence([definition["business_packet_ref"]])[0]
@@ -47,6 +56,10 @@ def _packet(record: dict) -> dict:
     if reference["path"] != authorization["path"] or reference["sha256"] != authorization["sha256"]:
         raise TaskflowError("experiment business packet differs from immutable lifecycle authorization")
     packet = _read(Path(reference["path"]))
+    from taskflow.execution_engineering_source import KIND, engineering_packet
+
+    if definition.get("source_kind") == KIND:
+        return engineering_packet(definition, packet)
     if definition.get("source_author_flow_id"):
         selector = definition.get("business_packet_item")
         expected = {"task_id": definition["task_id"],
@@ -94,6 +107,8 @@ def _author_source(store: object, record: dict, packet: dict, *, require_candida
     definition = record["definition"]
     author_flow = store.get_flow(definition["source_author_flow_id"])
     author_definition, state = author_flow["definition"], author_flow["state"]
+    from taskflow.execution_solver_profile import source_policy_id
+    source_policy = source_policy_id(store, definition)
     if packet.get("source_author_flow_kind") not in (None, author_definition.get("kind")):
         raise TaskflowError("experiment source kind differs from its explicitly selected lifecycle")
     if author_definition.get("kind") == "baseline_quality_v1":
@@ -106,7 +121,8 @@ def _author_source(store: object, record: dict, packet: dict, *, require_candida
         raise TaskflowError("release recovery requires the same accepted candidate source without waiting or decisions")
     original_authority = validate_evidence([author_definition["authorization"]])[0]
     if (author_definition.get("kind") != "author_quality_v1"
-            or any(author_definition.get(key) != definition[key] for key in ("task_id", "owner", "policy_id"))
+            or any(author_definition.get(key) != definition[key] for key in ("task_id", "owner"))
+            or author_definition.get("policy_id") != source_policy
             or author_definition.get("source_author_attempt") != packet["source_author_attempt"]
             or not author_packet_matches(store, parent=author_flow, packet=packet,
                 authorization=definition["authorization"],
@@ -129,7 +145,7 @@ def _author_source(store: object, record: dict, packet: dict, *, require_candida
     if (received.get("flow_id") != author_flow["flow_id"] or received.get("status") != "accepted"
             or received.get("controller") != definition["owner"] or received.get("result") != state.get("result")):
         raise TaskflowError("source author-quality receipt differs from its actual terminal result")
-    if author["state"] != "completed" or not state.get("author_archive"):
+    if not author_technically_complete(author) or not state.get("author_archive"):
         raise TaskflowError("accepted author outcome lacks its original completed author archive")
     handoff = _handoff(Path(state["author_archive"]), author_definition, author)
     result = state.get("result") or {}
@@ -151,7 +167,8 @@ def _author_source(store: object, record: dict, packet: dict, *, require_candida
         raise TaskflowError("author result does not identify its exact registered quality child")
     child = store.get_flow(child_id)
     child_definition, child_state = child["definition"], child["state"]
-    if (any(child_definition.get(key) != definition[key] for key in ("task_id", "owner", "policy_id"))
+    if (any(child_definition.get(key) != definition[key] for key in ("task_id", "owner"))
+            or child_definition.get("policy_id") != source_policy
             or child_state.get("status") != "accepted" or not child_state.get("receipt")
             or any(result.get(key) != child_state.get(key) for key in ("candidate_id", "candidate_root", "accepted_review_id"))
             or result.get("child_receipt") != child_state["receipt"]):
@@ -187,7 +204,7 @@ def _native_handoff(store: object, record: dict, candidate_id: str) -> dict:
 
     value = native_quality_handoff(store, candidate_id=candidate_id,
         authorization=record["definition"]["authorization"],
-        source_flow_id=record["definition"]["source_author_flow_id"],
+        source_flow_id=_native_source_flow(record["definition"]),
         packet_transport=record["state"].get("source_business_packet_transport"))
     if (record["state"].get("native_quality_handoff") is not None
             and value != record["state"]["native_quality_handoff"]):
@@ -246,6 +263,12 @@ def _local_configuration_reasons(record: dict, result: dict, observed: dict) -> 
     original = _read(Path(result["run"]) / "record.original.json")
     requested, local = original.get("requested_config", {}), original.get("observed_config", {})
     config = record["definition"]["technical"]["formal_config_base"]
+    if config.get("reasoning_selection") == "explicit":
+        if (requested.get("model") != config["model"]
+                or requested.get("reasoning_selection") != "explicit"
+                or requested.get("request_reasoning_override") != config["reasoning_effort"]):
+            reasons.append("actual_explicit_request_configuration_differs_from_registered_profile")
+        return reasons
     if (requested.get("model") != config["model"]
             or requested.get("reasoning_selection") != config.get("reasoning_selection", "verified_client_default")
             or requested.get("request_reasoning_override") is not None
@@ -336,7 +359,12 @@ def _source_composite(review: dict, coverage: dict, candidate: dict, coverage_ba
 
 def _source(store: object, record: dict, packet: dict) -> dict:
     bound = None
-    if record["definition"].get("source_author_flow_id"):
+    from taskflow.execution_engineering_source import KIND, engineering_source
+
+    if record["definition"].get("source_kind") == KIND:
+        bound = engineering_source(store, record["definition"], packet)
+        source, initial = bound["source"], bound["initial"]
+    elif record["definition"].get("source_author_flow_id"):
         bound = _author_source(store, record, packet)
         if "record" in bound:
             return bound["record"]
@@ -354,7 +382,7 @@ def _source(store: object, record: dict, packet: dict) -> dict:
         if any(initial[key] != value for key, value in packet["initial_expected_digests"].items()):
             raise TaskflowError("authorized initial candidate version changed")
     ancestor = candidate
-    authors = set(bound["author_sids"]) if bound else set()
+    authors = set(bound.get("excluded_sids", bound.get("author_sids", []))) if bound else set()
     seen = set()
     while ancestor["candidate_id"] != initial["candidate_id"]:
         authors.update(ancestor.get("external_author_sids", []))
@@ -453,7 +481,8 @@ def _source(store: object, record: dict, packet: dict) -> dict:
              "quality_sources": sources, "run_index": 0, "runs": [], "waiting": None,
              "excluded_sids": sorted({*authors, signer["cli_sid"], *[item["cli_sid"] for item in source["state"].get("history", []) if item.get("cli_sid")]})}
     if bound:
-        state["author_source_binding"] = bound["binding"]
+        source_field = "engineering_source_binding" if record["definition"].get("source_kind") == KIND else "author_source_binding"
+        state[source_field] = bound["binding"]
         state["native_quality_handoff"] = _native_handoff(store, record, candidate_id)
         state["quality_sources"] = state["native_quality_handoff"]["source_refs"]
     state["history"] = [*state["history"], {"kind": "accepted_source_bound", "source_flow_id": source["flow_id"],
@@ -587,7 +616,7 @@ def _advance(store: object, record: dict) -> dict:
     candidate = store.get_candidate(state["candidate_id"])
     run_id = _run_id(record, packet)
     if stage == "release":
-        native = _native_handoff(store, record, state["candidate_id"]) if definition.get("source_author_flow_id") else None
+        native = _native_handoff(store, record, state["candidate_id"]) if _native_source_flow(definition) else None
         reports = projected_quality_reports(store, candidate_id=state["candidate_id"], source_refs=state["quality_sources"],
                     protocol_map=native["protocol_map"] if native else technical["quality_projection_map"],
                     destination=directory / "quality-projection")
@@ -610,7 +639,7 @@ def _advance(store: object, record: dict) -> dict:
         elif any(decisions[0][key] != value for key, value in {"candidate_id": state["candidate_id"], "action": "experiment", "experiment_purpose": purpose, "authorized": True}.items()):
             raise TaskflowError("existing experiment decision differs from the single authorized purpose")
         config = {**technical["formal_config_base"], "run_id": run_id, "intent_id": work["intent_id"], "policy_version": definition["policy_id"]}
-        if definition.get("source_author_flow_id"):
+        if _native_source_flow(definition):
             config["authorization_item"] = definition["business_packet_item"]
         inner = Path(technical["formal_runtime_root"]) / run_id
         preparation = {"config": config, "release": state["release"], "candidate": candidate, "runtime": inner}
@@ -663,7 +692,7 @@ def _advance(store: object, record: dict) -> dict:
             state.update(stage="facts_wait", current_work_id=work["work_id"], facts_prepared=prepared, waiting=None)
         else:
             declaration = _read(Path(state["release"]["snapshot"]["path"]) / "task.json")
-            if definition.get("source_author_flow_id"):
+            if _native_source_flow(definition):
                 native = _native_handoff(store, record, state["candidate_id"])
                 normative = _native_normative(Path(state["release"]["snapshot"]["path"]), declaration, native)
             else:
@@ -673,12 +702,13 @@ def _advance(store: object, record: dict) -> dict:
             runner["request_sections"] = _score_request_sections(imported, candidate)
             config.update(facts_attempt=state["facts_attempt"]["runtime_path"], facts_binding=state["facts_prepared"]["review_binding"],
                           scoring_source_allowlist=normative)
-            if definition.get("source_author_flow_id"):
+            if _native_source_flow(definition):
                 config["normative_certification"] = {
                     "schema_version": 1, "kind": "native_quality_handoff",
                     "candidate_binding": {key: candidate[key] for key in (
                         "candidate_id", "task_id", "content_digest", "input_digest", "evaluation_digest")},
-                    "source_author_flow_id": definition["source_author_flow_id"],
+                    ("source_quality_flow_id" if definition.get("source_kind") == "engineering_candidate_quality_v1"
+                      else "source_author_flow_id"): _native_source_flow(definition),
                     "authorization": definition["authorization"], "native_quality_handoff": native}
             if "local_profile_policy" in technical:
                 config["local_profile_policy"] = technical["local_profile_policy"]

@@ -133,21 +133,10 @@ def make_confirmation_recovery_fixture(owner):
 
 class ConfirmationPreparationResumeTests(unittest.TestCase):
     def test_only_actual_completed_original_is_excluded_and_this_confirmation_own_proof_resumes_once(self):
-        f,record,packet,resolution=make_confirmation_recovery_fixture(self)
-        from taskflow.execution_formal import validate_formal_public_probe_recovery
-        proof=validate_formal_public_probe_recovery(config=f.config,release=f.release,candidate=f.candidate,runtime=f.runtime,recovery=f.recovery)
-        original={str(p):p.read_bytes() for p in [Path(record["state"]["receipt"]),f.proof_path,
-            Path(record["state"]["formal_attempt"]["runtime_path"])/"collection.json"]}
-        with patch("taskflow.execution_experiment._packet",return_value=packet):
-            result=resume_path_transport(f.store,record["flow_id"],resolution)
-            with self.assertRaises(TaskflowError):resume_path_transport(f.store,record["flow_id"],resolution)
-        self.assertEqual("active",result["state"]["status"])
-        self.assertEqual(1,result["state"]["run_index"])
-        self.assertEqual(f.recovery,result["state"]["formal_preparation_recovery"])
-        exclusion=result["state"]["history"][-1]["completed_first_run_exclusion"]
-        self.assertEqual(record["state"]["runs"][0]["solver_attempt_id"],exclusion["attempt_id"])
-        self.assertNotEqual(proof["run_id"],packet["formal"]["first_run_id"])
-        for name,raw in original.items():self.assertEqual(raw,Path(name).read_bytes())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
     def test_authorization_or_first_identity_changes_never_admit_a_confirmation(self):
@@ -186,76 +175,22 @@ class ConfirmationPreparationResumeTests(unittest.TestCase):
         self.assertEqual(record,f.store.get_flow(record["flow_id"]))
 
     def test_unsealed_receipt_native_record_score_or_archive_drift_preserves_the_exception(self):
-        f,record,packet,resolution=make_confirmation_recovery_fixture(self)
-        row=record["state"]["runs"][0]
-        intake=Path(row["receipt"])
-        targets=[Path(record["state"]["formal_attempt"]["runtime_path"])/"collection-lock.json",
-                 Path(record["state"]["facts_attempt"]["runtime_path"])/"facts-seal.json",
-                 Path(record["state"]["score_attempt"]["runtime_path"])/"artifacts/score.json",
-                 Path(row["evaluation"])/"record.original.json",intake,
-                 Path(row["review_archive"]["score"]["path"])/"artifacts/score.json"]
-        for path in targets:
-            raw=path.read_bytes()
-            if path == intake:
-                changed=read_json(path);changed["score"]+=1;write_json(path,changed)
-            else:path.write_bytes(raw+b" ")
-            try:
-                with self.subTest(path=path.name),patch("taskflow.execution_experiment._packet",return_value=packet),self.assertRaises(TaskflowError):
-                    resume_path_transport(f.store,record["flow_id"],resolution)
-            finally:path.write_bytes(raw)
-            self.assertEqual(record,f.store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_foreign_or_current_solver_footprints_including_same_data_alias_are_never_excluded(self):
-        f,record,packet,resolution=make_confirmation_recovery_fixture(self)
-        first=record["state"]["runs"][0];attempt=f.store.get_attempt(first["solver_attempt_id"])
-        original=f.store.get_work(attempt["work_id"])
-        for table in ("work","attempts"):
-            for status in ("ready","running","uncertain","failed","completed"):
-                row=copy.deepcopy(original if table=="work" else attempt)
-                row.update(work_id="foreign-solver",intent_id="foreign-intent",state=status,purpose="another purpose")
-                # The SQL identity is foreign even when its JSON claims the
-                # exact old ID; exclusion must use the actual primary key.
-                if status=="completed":row=copy.deepcopy(original if table=="work" else attempt)
-                with f.store._db(True) as db:
-                    if table=="work":db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)",("foreign-row","neutral",f.candidate["candidate_id"],"foreign-row-intent",status,json.dumps(row)))
-                    else:db.execute("INSERT INTO attempts VALUES(?,?,?,?,?,?)",("foreign-row","foreign-row-work","neutral",status,0,json.dumps(row)))
-                try:
-                    with self.subTest(table=table,status=status),patch("taskflow.execution_experiment._packet",return_value=packet),self.assertRaisesRegex(TaskflowError,"related work/attempt"):
-                        resume_path_transport(f.store,record["flow_id"],resolution)
-                finally:
-                    with f.store._db(True) as db:db.execute("DELETE FROM "+table+" WHERE id='foreign-row'")
-        current=_node(record,"solver")
-        current_outer=Path(record["definition"]["directory"])/"runtimes"/current;current_outer.mkdir()
-        try:
-            with patch("taskflow.execution_experiment._packet",return_value=packet),self.assertRaisesRegex(TaskflowError,"related work/attempt"):
-                resume_path_transport(f.store,record["flow_id"],resolution)
-        finally:current_outer.rmdir()
-        marker=f.runtime/"execution-claim.json";marker.write_text("{}")
-        try:
-            with patch("taskflow.execution_experiment._packet",return_value=packet),self.assertRaisesRegex(TaskflowError,"execution evidence"):
-                resume_path_transport(f.store,record["flow_id"],resolution)
-        finally:marker.unlink()
-        self.assertEqual(record,f.store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_old_host_action_remains_strict_and_confirmation_recovery_cas_is_real(self):
-        f,record,packet,resolution=make_confirmation_recovery_fixture(self)
-        old={**resolution,"action":"resume_validated_host_formal_preparation"}
-        # The public route is the only new exception. The old action's candidate
-        # footprint guard remains unchanged and never calls the new helper.
-        with patch("taskflow.execution_experiment._packet",return_value=packet), \
-             patch("taskflow.execution_lifecycle._confirmation_first_run_footprint",side_effect=AssertionError("old host path is unchanged")), \
-             self.assertRaisesRegex(TaskflowError,"related work/attempt"):
-            resume_path_transport(f.store,record["flow_id"],old)
-        actual=f.store.update_flow
-        def conflict(flow_id,revision,state,event):
-            if event.get("kind")=="lifecycle_validated_public_probe_preparation_resumed":
-                current=f.store.get_flow(flow_id);actual(flow_id,revision,current["state"],{"kind":"concurrent-neutral-revision"})
-            return actual(flow_id,revision,state,event)
-        with patch("taskflow.execution_experiment._packet",return_value=packet),patch.object(f.store,"update_flow",side_effect=conflict),self.assertRaises(TaskflowError):
-            resume_path_transport(f.store,record["flow_id"],resolution)
-        current=f.store.get_flow(record["flow_id"])
-        self.assertEqual(record["revision"]+1,current["revision"])
-        self.assertEqual(record["state"],current["state"])
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":unittest.main()

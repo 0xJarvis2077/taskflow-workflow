@@ -6,8 +6,9 @@ import sys
 from pathlib import Path
 
 from taskflow import __version__
-from taskflow.contracts import TaskflowError
+from taskflow.contracts import TaskflowError, safe_path, validate_id
 from taskflow.packages import check_task, export_snapshot, freeze_task, init_task
+from taskflow.task_directories import grouped_tasks_root
 
 
 def parser() -> argparse.ArgumentParser:
@@ -20,6 +21,7 @@ def parser() -> argparse.ArgumentParser:
     init = commands.add_parser("init", help="create a draft; never overwrite")
     init.add_argument("task_id")
     init.add_argument("--root", type=Path, default=Path("tasks"))
+    init.add_argument("--topic", help="topic folder; create ROOT/TOPIC/packages/TASK_ID")
     check = commands.add_parser("check", help="check structure, bytes and report binding")
     check.add_argument("task", type=Path)
     check.add_argument("--no-write", action="store_true")
@@ -54,7 +56,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         if args.command == "init":
-            output = init_task(args.root / args.task_id, args.task_id)
+            validate_id(args.task_id, "task_id")
+            if args.topic is not None:
+                validate_id(args.topic, "topic")
+                destination = safe_path(args.root, args.topic + "/packages/" + args.task_id)
+            else:
+                topic_packages = safe_path(args.root, "packages")
+                if grouped_tasks_root(args.root) or (
+                    topic_packages.is_dir() and not (topic_packages / "task.json").is_file()
+                ):
+                    raise TaskflowError(
+                        "grouped tasks root: specify --topic TOPIC, or --root TOPIC/packages"
+                    )
+                destination = args.root / args.task_id
+            output = init_task(destination, args.task_id)
+            if args.topic is not None:
+                output["topic"] = args.topic
         elif args.command == "check":
             output = check_task(args.task, write_report=not args.no_write)
         elif args.command == "freeze":

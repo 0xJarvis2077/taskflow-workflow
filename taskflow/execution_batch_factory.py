@@ -12,6 +12,7 @@ from taskflow.execution_batch import (
     check_batch_plan, freeze_batch_plan, load_batch_snapshot, role_config,
     validate_batch_policy,
 )
+from taskflow.execution_codex_provider import copy_provider_setting
 from taskflow.execution_flow import _publish_once
 from taskflow.execution_store import evidence_ref, validate_evidence
 
@@ -27,6 +28,8 @@ def _selected(target: dict, setting: dict) -> None:
             target[key] = copy.deepcopy(setting[key])
         elif key in {"reasoning_context", "cli"}:
             target.pop(key, None)
+
+    copy_provider_setting(target, setting)
 
 
 def compile_batch_configuration(plan: Path, infrastructure: Path, destination: Path) -> dict:

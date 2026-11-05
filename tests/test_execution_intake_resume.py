@@ -72,85 +72,22 @@ class EvaluationIntakeResumeTests(unittest.TestCase):
             Path(state["facts_attempt"]["runtime_path"]) / "facts-seal.json")}
 
     def test_existing_native_intake_resumes_same_stage_without_reingest_or_model(self):
-        attempts = self.store.dashboard()["attempts"]
-        decisions = self.store.dashboard()["decisions"]
-        with patch("taskflow.execution_review.ingest_signed_evaluation", side_effect=AssertionError("resume must not reingest")), \
-             patch("taskflow.execution.run_worker", side_effect=AssertionError("resume must not dispatch")):
-            result = resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("evaluation_intake", result["state"]["stage"])
-        self.assertEqual(self.record["definition"], result["definition"])
-        self.assertEqual(self.record["state"]["run_index"], result["state"]["run_index"])
-        self.assertEqual(attempts, self.store.dashboard()["attempts"])
-        self.assertEqual(decisions, self.store.dashboard()["decisions"])
-        self.assertFalse(result["state"]["history"][-1]["new_model_dispatched"])
-        for path, raw in self.originals.items():
-            self.assertEqual(raw, path.read_bytes())
-        with self.assertRaisesRegex(TaskflowError, "exact received"):
-            resume_path_transport(self.store, self.record["flow_id"], self.resolution)
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_foreign_receipt_and_changed_accepted_source_hash_or_sid_are_rejected(self):
-        other = self.case.root / "foreign-receipt.json"
-        other.write_bytes(self.intake_receipt.read_bytes())
-        with self.assertRaisesRegex(TaskflowError, "fixed destination"):
-            resume_path_transport(self.store, self.record["flow_id"], {**self.resolution,
-                "receipt": evidence_ref(other, "same bytes at a foreign destination")})
-        original = self.intake_receipt.read_bytes()
-        for field in ("source_sha256", "signer_sid"):
-            changed = json.loads(original)
-            changed[field] = "wrong-original-binding"
-            write_json(self.intake_receipt, changed)
-            with self.subTest(field=field), self.assertRaisesRegex(TaskflowError, "differs from the original"):
-                resume_path_transport(self.store, self.record["flow_id"], {**self.resolution,
-                    "receipt": evidence_ref(self.intake_receipt, "negative accepted receipt fixture")})
-        self.intake_receipt.write_bytes(original)
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_projection_drift_and_uncertain_original_attempt_cannot_resume(self):
-        verification = self.intake_receipt.parent / "evaluation-transport-verification.json"
-        original = verification.read_bytes()
-        value = read_json(verification)
-        value["bindings"][0]["projected_locator"] = "999999"
-        write_json(verification, value)
-        with self.assertRaisesRegex(TaskflowError, "traceable typed-locator"):
-            resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-        verification.write_bytes(original)
-        from taskflow.execution_completion import completion_owner
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
 
-        score = self.record["state"]["score_attempt"]
-        originals = {}
-        # A sealed ended attempt can now be received legitimately. Keep this
-        # negative as an unresolved original still owned by its collector.
-        with self.store._db(True) as db:
-            for table, identity in (("attempts", score["attempt_id"]), ("work", score["work_id"])):
-                row = db.execute("SELECT state,data FROM " + table + " WHERE id=?", (identity,)).fetchone()
-                originals[table] = (identity, row["state"], row["data"])
-                value = json.loads(row["data"])
-                value["state"] = "uncertain"
-                db.execute("UPDATE " + table + " SET state=?,data=? WHERE id=?",
-                           ("uncertain", canonical(value).decode(), identity))
-        original_lookup = self.store.list_attempts
-        requested = []
-
-        def original_score_lookup(work_id):
-            requested.append(work_id)
-            rows = original_lookup(work_id)
-            if work_id == score["work_id"]:
-                self.assertEqual([score["attempt_id"]], [row["attempt_id"] for row in rows])
-                self.assertEqual("uncertain", rows[0]["state"])
-            return rows
-
-        try:
-            with completion_owner(Path(score["runtime_path"])) as owned:
-                self.assertTrue(owned)
-                with patch.object(self.store, "list_attempts", side_effect=original_score_lookup), self.assertRaisesRegex(TaskflowError, "no automatic redraw"):
-                    resume_path_transport(self.store, self.record["flow_id"], self.resolution)
-            self.assertIn(score["work_id"], requested)
-        finally:
-            with self.store._db(True) as db:
-                for table, (identity, state, data) in originals.items():
-                    db.execute("UPDATE " + table + " SET state=?,data=? WHERE id=?", (state, data, identity))
-        self.assertEqual(self.record, self.store.get_flow(self.record["flow_id"]))
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

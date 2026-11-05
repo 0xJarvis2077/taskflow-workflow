@@ -43,86 +43,44 @@ class ReceiptReviewRegressions(unittest.TestCase):
                 self.assertEqual(before, self.store.events())
                 self.assertEqual(original, self.store.get_attempt(identity))
 
-    def test_another_ready_workflow_cannot_hide_a_pending_receipt(self):
-        with self.store._db(True) as db:
-            for identity, status in (("pending-flow", "running"), ("ready-flow", "ready")):
-                work_id = identity + "-work"
-                state = {"status": "active", "initialized": True, "current_work_id": work_id,
-                         "stage": "quality", "history": [], "archives": []}
-                definition = canonical({"policy_id": "neutral-policy"})
-                db.execute("INSERT INTO execution_flows VALUES(?,?,?,?,?,?,?)", (
-                    identity, definition.decode(), hashlib.sha256(definition).hexdigest(),
-                    canonical(state).decode(), 0, 0, "[]"))
-                work = {"work_id": work_id, "task_id": identity, "state": status}
-                db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)", (
-                    work_id, identity, "unused-candidate", work_id, status, canonical(work).decode()))
-        before = [self.store.get_flow(identity) for identity in ("pending-flow", "ready-flow")]
-        actual_advance = execution_flow.advance_workflow
+    def test_quality_cli_reports_pending_receipt_without_a_new_dispatch(self):
         note = {"path": str(self.root / "pending-original.json")}
         for signal in (execution.ReceiptWritePending(note),
                        execution.ReceiptEvidenceError(self.root / "resolution.json", OSError("disk busy"),
                                                       terminal_received=True)):
-            with self.subTest(signal=type(signal).__name__):
-                def advance_boundary(store, identity):
-                    if identity == "pending-flow":
-                        raise signal
-                    return actual_advance(store, identity)
+            before = self.store.events()
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with self.subTest(signal=type(signal).__name__), patch(
+                "taskflow.execution_quality.run_quality_task", side_effect=signal
+            ), patch.object(execution, "run_worker", side_effect=AssertionError("no dispatch")), \
+                    redirect_stdout(stdout), redirect_stderr(stderr):
+                code = execution.main(["--db", str(self.store.path), "quality", "run", "neutral"])
+            self.assertEqual(2, code)
+            self.assertEqual("", stdout.getvalue())
+            error = json.loads(stderr.getvalue())
+            self.assertFalse(error["automatic_retry"])
+            self.assertEqual(before, self.store.events())
+            if isinstance(signal, execution.ReceiptWritePending):
+                self.assertEqual("terminal_receipt_pending", error["state"])
+            else:
+                self.assertEqual("terminal_receipt_evidence_error", error["state"])
+                self.assertTrue(error["terminal_received"])
 
-                stdout, stderr = io.StringIO(), io.StringIO()
-                with patch.object(execution_flow, "advance_workflow", side_effect=advance_boundary), \
-                        patch.object(execution, "run_worker", side_effect=AssertionError("no model permission")), \
-                        redirect_stdout(stdout), redirect_stderr(stderr):
-                    code = execution.main(["--db", str(self.store.path), "flow-run",
-                                           "--flow-id", "pending-flow", "--flow-id", "ready-flow"])
-                self.assertEqual(2, code)
-                self.assertEqual("", stdout.getvalue())
-                error = json.loads(stderr.getvalue())
-                self.assertFalse(error["automatic_retry"])
-                if isinstance(signal, execution.ReceiptWritePending):
-                    self.assertEqual("terminal_receipt_pending", error["state"])
-                    self.assertEqual(note, error["receipt"])
-                else:
-                    self.assertEqual("terminal_receipt_evidence_error", error["state"])
-                    self.assertTrue(error["terminal_received"])
-                self.assertEqual(before, [self.store.get_flow(identity)
-                                          for identity in ("pending-flow", "ready-flow")])
-                self.assertEqual("ready", self.store.get_work("ready-flow-work")["state"])
-                self.assertEqual([], self.store.list_attempts("ready-flow-work"))
-
-    def test_externally_running_workflow_cannot_hide_a_pending_receipt(self):
-        with self.store._db(True) as db:
-            for identity in ("pending-flow", "external-flow"):
-                work_id = identity + "-work"
-                state = {"status": "active", "initialized": True, "current_work_id": work_id,
-                         "stage": "quality", "history": [], "archives": []}
-                definition = canonical({"policy_id": "neutral-policy"})
-                db.execute("INSERT INTO execution_flows VALUES(?,?,?,?,?,?,?)", (
-                    identity, definition.decode(), hashlib.sha256(definition).hexdigest(),
-                    canonical(state).decode(), 0, 0, "[]"))
-                work = {"work_id": work_id, "task_id": identity, "state": "running"}
-                db.execute("INSERT INTO work VALUES(?,?,?,?,?,?)", (
-                    work_id, identity, "unused-candidate", work_id, "running", canonical(work).decode()))
-        before = [self.store.get_flow(identity) for identity in ("pending-flow", "external-flow")]
+    def test_quality_collection_reports_pending_receipt_without_running_a_model(self):
         note = {"path": str(self.root / "pending-original.json")}
-
-        def advance_boundary(store, identity):
-            if identity == "pending-flow":
-                raise execution.ReceiptWritePending(note)
-            return store.get_flow(identity)
-
+        before = self.store.events()
         stdout, stderr = io.StringIO(), io.StringIO()
-        with patch.object(execution_flow, "advance_workflow", side_effect=advance_boundary), \
-                patch.object(execution_flow.time, "sleep", side_effect=AssertionError("must report pending")), \
-                patch.object(execution, "run_worker", side_effect=AssertionError("no new process")), \
+        with patch("taskflow.execution_quality.collect_quality_task",
+                   side_effect=execution.ReceiptWritePending(note)), \
+                patch.object(execution, "run_worker", side_effect=AssertionError("no dispatch")), \
                 redirect_stdout(stdout), redirect_stderr(stderr):
-            code = execution.main(["--db", str(self.store.path), "flow-run", "--allow-model",
-                                   "--flow-id", "pending-flow", "--flow-id", "external-flow"])
+            code = execution.main(["--db", str(self.store.path), "quality", "collect", "neutral"])
         self.assertEqual(2, code)
         self.assertEqual("", stdout.getvalue())
         error = json.loads(stderr.getvalue())
         self.assertEqual("terminal_receipt_pending", error["state"])
         self.assertEqual(note, error["receipt"])
-        self.assertEqual(before, [self.store.get_flow(identity) for identity in ("pending-flow", "external-flow")])
+        self.assertEqual(before, self.store.events())
 
     def test_pending_receipt_reports_after_other_ready_work_cannot_be_claimed(self):
         with self.store._db(True) as db:

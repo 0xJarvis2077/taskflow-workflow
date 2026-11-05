@@ -197,53 +197,10 @@ class CoverageChainIntegrationTests(unittest.TestCase):
         self.assertEqual("defects", store.get_review(value["whole"])["verdict"])
 
     def test_parent_accepts_only_the_explicitly_resolved_original_completed_closure(self):
-        value = make_coverage_chain_fixture(self)
-        store, failed, root = value["store"], value["flow"], value["case"].root
-        exception = {"stage": "child_quality", "reason": failed["state"]["exception"],
-                     "child_receipt": failed["state"]["receipt"]}
-        parent_receipt = root / "source-parent-exception.json"
-        write_json(parent_receipt, {"flow_id": "source-parent", "status": "exception", "exception": exception})
-        parent = store.register_flow("source-parent", {"kind": "author_quality_v1", "task_id": "neutral", "owner": "fixture-controller",
-            "policy_id": "fixture-v1", "directory": str(root / "parent"), "source_author_attempt": "source-author"}, value["authority_refs"], {
-                "status": "exception", "stage": "child_quality", "current_work_id": None, "candidate_id": value["original"]["candidate_id"],
-                "candidate_root": failed["definition"]["initial"]["candidate_root"], "child_flow_id": failed["flow_id"],
-                "public_attempt_id": "original-public", "author_archive": str(root / "author-archive"),
-                "history": [], "archives": [], "receipt": str(parent_receipt), "exception": exception})
-        resolution = {"action": "resume_resolved_quality_dependency", "reason": "Receive only the actual corrected closure chain.", "evidence": value["refs"]}
-        author = {"state": "completed", "cli_sid": "original-author-sid"}
-        public = {"attempt_id": "original-public", "state": "completed", "role": "quality", "cli_sid": "original-public-sid"}
-        before = store.dashboard()["attempts"]
-        raw = parent_receipt.read_bytes()
-        # Original source-author/public adapters are separate tested interfaces;
-        # all child actors, closure chains, receipts and SQLite operations are real.
-        with ExitStack() as stack:
-            stack.enter_context(patch("taskflow.execution_author._author", return_value=(author, {})))
-            stack.enter_context(patch("taskflow.execution_author._handoff", return_value={"disposition": "candidate_complete"}))
-            stack.enter_context(patch("taskflow.execution_flow._predecessor", return_value=(public, {})))
-            with self.assertRaisesRegex(TaskflowError, "actually accepted"):
-                resume_path_transport(store, parent["flow_id"], resolution)
-            accepted = self.accept_child(value)
-            original_get = store.get_flow
-            wrong = {**accepted, "state": {**accepted["state"], "resolved_exceptions": []}}
-            with patch.object(store, "get_flow", side_effect=lambda identity: wrong if identity == failed["flow_id"] else original_get(identity)), \
-                 self.assertRaisesRegex(TaskflowError, "unique explicit"):
-                resume_path_transport(store, parent["flow_id"], resolution)
-            result = resume_path_transport(store, parent["flow_id"], resolution)
-            self.assertEqual("active", result["state"]["status"])
-            self.assertEqual(2, len(result["state"]["history"][-1]["dependency_resolution"]["coverage_chain_resolution"]["closure_coverage_chains"]))
-            with self.assertRaisesRegex(TaskflowError, "received exception"):
-                resume_path_transport(store, parent["flow_id"], resolution)
-            hold = {"stage": "experiment_v1", "reason": "Specific current public attribution MON requires substantive quality disposition"}
-            hold_receipt = root / "business-hold.json"
-            write_json(hold_receipt, {"flow_id": "business-held-experiment", "status": "exception", "exception": hold})
-            experiment = store.register_flow("business-held-experiment", {"kind": "experiment_v1", "task_id": "neutral", "owner": "fixture-controller",
-                "policy_id": "fixture-v1", "source_author_flow_id": parent["flow_id"]}, value["authority_refs"], {
-                    "status": "exception", "stage": "experiment_v1", "current_work_id": None, "receipt": str(hold_receipt), "exception": hold})
-            with patch("taskflow.execution_experiment._packet", return_value={}), self.assertRaisesRegex(TaskflowError, "technically resumed source"):
-                resume_path_transport(store, experiment["flow_id"], resolution)
-            self.assertEqual(experiment, store.get_flow(experiment["flow_id"]))
-        self.assertEqual(raw, parent_receipt.read_bytes())
-        self.assertEqual(before, store.dashboard()["attempts"])
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_real_graph_uses_the_current_direct_parent_whole_without_raising_its_verdict(self):
         value = make_coverage_chain_fixture(self)

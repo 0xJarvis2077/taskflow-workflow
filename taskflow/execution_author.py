@@ -20,7 +20,7 @@ from taskflow.execution_flow import (
     _binding, _get_or_none, _identity, _public_prepare, _publish_once, _render,
     advance_workflow, register_workflow,
 )
-from taskflow.execution_runner import _info, _publish, _read, _regular, _validated_collection, archive_full_attempt
+from taskflow.execution_runner import _info, _publish, _read, _regular, archive_full_attempt
 from taskflow.execution_store import ACTIVE, evidence_ref, validate_evidence
 from taskflow.packages import check_task
 
@@ -159,6 +159,9 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
     if (".." in directory.parts or any(path.is_symlink() for path in (directory, *directory.parents))
             or directory.is_relative_to(baseline) or baseline.is_relative_to(directory)):
         raise TaskflowError("author factory needs a new separate ordinary work root")
+    if not (directory / "factory-intent.json").exists():
+        _roles(store, {"role_template_ref": role_source, "policy_id": factory_config["policy_id"],
+                       "task_id": task_id})
     identity = {"schema_version": 1, "packet": packet_source, "template": template_source,
                 "factory_config_digest": sha256(canonical(factory_config)), "directory": str(directory),
                 "task_id": task_id, "intent_id": intent_id, "candidate_id": candidate_id}
@@ -180,11 +183,14 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
         raise TaskflowError("author lifecycle archives must be separate from original author/baseline roots")
     work.mkdir(exist_ok=True)
     scratch.mkdir(exist_ok=True)
+    from taskflow.execution_codex_provider import copy_provider_setting
+
     original = template["runner"]
     if original.get("mode") != "native_role" or original.get("role") != "author":
         raise TaskflowError("author factory requires the previously verified native author template")
     runner = {key: copy.deepcopy(original[key]) for key in
               ("mode", "cli", "model", "reasoning_effort", "timeout_seconds", "native_permissions")}
+    copy_provider_setting(runner, setting)
     runner["dependencies"] = copy.deepcopy(original.get("dependencies", []))
     runner["reasoning_selection"] = original.get("reasoning_selection", "explicit")
     runner["native_permissions"] = _factory_paths(runner["native_permissions"], {
@@ -269,6 +275,9 @@ def start_author_from_packet(store: object, *, packet_ref: dict, template_spec_r
     if not allow_model:
         return {**result, "state": queued["state"], "execution": "ready_requires_explicit_model_permission"
                 if queued["state"] == "ready" else "existing_intent_retained"}
+    from taskflow.execution_lifecycle import assert_legacy_simulation
+
+    assert_legacy_simulation(store, work_id)
     with ThreadPoolExecutor(max_workers=1) as pool:
         def initial_worker() -> dict:
             try:
@@ -379,7 +388,11 @@ def _validated_prepared_author(store: object, spec: dict, runtime: Path) -> tupl
     if (type(queued.get("evidence")) is not list or type(spec["work"].get("evidence")) is not list
             or canonical(queued["evidence"]) != canonical(validate_evidence(spec["work"]["evidence"]))):
         raise TaskflowError("prepared author evidence differs from its original queued sources")
-    manifest = _validate(runtime)
+    from taskflow.execution_completion_observation import received_dependencies
+
+    originals = store.list_attempts(queued["work_id"])
+    observation = (originals[0] if len(originals) == 1 else {})
+    manifest = _validate(runtime, received_dependencies=received_dependencies(observation))
     _check_work_binding(queued, candidate, manifest)
     if manifest["mode"] == "native_role":
         from taskflow.execution_batch_binding import make_batch_binding
@@ -561,8 +574,9 @@ def _author(store: object, definition: dict) -> tuple[dict, dict]:
 
 
 def _handoff(archive: Path, definition: dict, author: dict) -> dict:
-    manifest = _read(archive / "manifest.json")
-    collection = _validated_collection(archive, manifest)
+    from taskflow.execution_completion_observation import author_collection
+
+    collection = author_collection(author, archive)
     if (collection.get("technical_accepted") is not True or collection.get("process_ended") is not True
             or not author.get("cli_sid") or collection.get("sid") != author["cli_sid"]):
         raise TaskflowError("original author handoff lacks a completed same-SID technical collection")
@@ -592,7 +606,12 @@ def _template(definition: dict) -> dict:
     if sha256(raw) != reference["sha256"]:
         raise TaskflowError("registered author successor role template changed")
     value = parse_json(raw, "author successor template")
-    items = value.get("workflows", []) if isinstance(value, dict) else value
+    role_names = {"quality", "repair", "recheck", "public_rebuild", "recheck_public"}
+    if isinstance(value, dict) and set(value) == role_names and not reference.get("flow_id"):
+        # A locked role map has the same infrastructure as one wrapped workflow.
+        items = [{"roles": value}]
+    else:
+        items = value.get("workflows", []) if isinstance(value, dict) else value
     candidates = [item.get("definition", item) for item in items]
     chosen = [item for item in candidates if
               (item.get("flow_id") == reference["flow_id"] if reference.get("flow_id") else
@@ -612,6 +631,8 @@ def _roles(store: object, definition: dict) -> dict:
     task_id = definition["task_id"]
     policy = store.get_policy(definition["policy_id"])["config"]
     snapshot = validate_batch_policy(policy)
+    from taskflow.execution_codex_provider import copy_provider_setting
+
     for name in ("quality", "repair", "recheck", "public_rebuild", "recheck_public"):
         old = template["roles"][name]
         runner = copy.deepcopy(old["runner"])
@@ -623,6 +644,7 @@ def _roles(store: object, definition: dict) -> dict:
         if snapshot is not None:
             runner.update({key: setting[key] for key in ("cli", "reasoning_selection", "reasoning_context")})
             runner["model_slot"] = slot
+        copy_provider_setting(runner, setting)
         runner["inputs"] = []
         runner["request_sections"] = []
         role = {"runner": runner, "purpose": "Preauthorized current-candidate " + name + "; research-quality asset only, no target experiment"}
@@ -633,6 +655,7 @@ def _roles(store: object, definition: dict) -> dict:
             role["prepare"]["config"].update(model=setting["model"], reasoning_effort=setting["reasoning_effort"])
             if snapshot is not None:
                 role["prepare"]["config"].update({key: setting[key] for key in ("cli", "reasoning_selection", "reasoning_context")})
+            copy_provider_setting(role["prepare"]["config"], setting)
             runner["argv"] = [role["prepare"]["launcher_python"], "{{runtime}}.public/runner.py", "execute", "{{runtime}}.public"]
             runner["request_sections"] = [{"kind": "operation", "text":
                 "Carrier only. The existing isolated adapter sends its locked neutral current-public reconstruction request."}]
@@ -664,6 +687,302 @@ def _roles(store: object, definition: dict) -> dict:
             runner["dependencies"] = list(dict.fromkeys([*dependencies,
                 definition["authorization"]["path"], *[ref["path"] for ref in refs]]))
     return roles
+
+
+def validate_technical_quality_successor(store: object, definition: dict) -> dict:
+    """Bind one fresh whole review to a terminal initial stream failure."""
+    from taskflow.execution_batch import policy_setting, validate_batch_policy
+    from taskflow.execution_completion_observation import author_technically_complete
+    from taskflow.execution_flow import _predecessor
+    from taskflow.execution_runner import _validate, _validated_collection
+
+    def need(value, message):
+        if not value:
+            raise TaskflowError("quality technical successor: " + message)
+
+    technical = definition["technical_quality_successor"]
+    need(isinstance(technical, dict) and set(technical) == {"source_parent_flow_id", "source_parent_definition_digest",
+         "source_child_flow_id", "source_child_definition_digest", "failed_attempt_id", "authority"}, "exact source authority required")
+    source = store.get_flow(technical["source_parent_flow_id"])
+    old, state = source["definition"], source["state"]
+    authority_ref = validate_evidence([technical["authority"]])[0]
+    authority = _read(Path(authority_ref["path"]))
+    external_ref = authority.get("external_state_recovery")
+    external = None
+    previous_proof = None
+    direct_human = False
+    failed_delivery = False
+    if external_ref is not None:
+        external_ref = validate_evidence([external_ref])[0]
+        external = _read(Path(external_ref["path"]))
+        failed_delivery = isinstance(external, dict) and external.get("kind") == "direct_human_failed_complete_delivery_quality_recovery_v1"
+        expected_fields = {"schema_version", "kind", "external_state_event", "previous_technical_authority"}
+        if failed_delivery:
+            expected_fields.add("prior_data_and_cost_authorization")
+        need(isinstance(external, dict) and set(external) == expected_fields
+             and type(external["schema_version"]) is int and external["schema_version"] == 1
+             and external["kind"] in ("explicit_external_state_quality_recovery_v1", "direct_human_quality_recovery_v1",
+                                      "direct_human_failed_complete_delivery_quality_recovery_v1"),
+             "exact external-state recovery record required")
+        validate_evidence([external["external_state_event"], external["previous_technical_authority"]])
+        previous = old.get("technical_quality_successor")
+        need(isinstance(previous, dict), "external-state recovery requires the previous technical successor")
+        from taskflow.execution_store import same_original_ref
+
+        need(same_original_ref(previous["authority"], external["previous_technical_authority"])
+             and same_original_ref(authority["decision"], external["external_state_event"]),
+             "external-state event or previous allowance differs")
+        direct_human = external["kind"] == "direct_human_quality_recovery_v1"
+        previous_authority = _read(Path(previous["authority"]["path"]))
+        previous_external_ref = previous_authority.get("external_state_recovery")
+        if direct_human:
+            need(previous_external_ref is not None, "direct human successor requires a spent external-state predecessor")
+            previous_external_ref = validate_evidence([previous_external_ref])[0]
+            previous_external = _read(Path(previous_external_ref["path"]))
+            need(previous_external.get("kind") == "explicit_external_state_quality_recovery_v1"
+                 and previous_external["external_state_event"]["sha256"] != external["external_state_event"]["sha256"],
+                 "direct human authorization must be new and cannot be inherited")
+        if failed_delivery:
+            need(previous_external_ref is not None, "failed delivery requires a spent direct-human predecessor")
+            previous_external_ref = validate_evidence([previous_external_ref])[0]
+            previous_external = _read(Path(previous_external_ref["path"]))
+            cost_ref = validate_evidence([external["prior_data_and_cost_authorization"]])[0]
+            need(previous_external.get("kind") == "direct_human_quality_recovery_v1"
+                 and previous_external["external_state_event"]["sha256"] != external["external_state_event"]["sha256"]
+                 and same_original_ref(previous_authority["decision"], cost_ref),
+                 "failed delivery needs a new human instruction and the spent data/cost authority")
+            # Recursive validation below establishes each earlier proof; the new
+            # source cannot be any ancestor's previously consumed human event.
+        need(direct_human or failed_delivery or previous_authority.get("external_state_recovery") is None,
+             "external-state allowance cannot be inherited again")
+        previous_proof = validate_technical_quality_successor(store, old)
+        if failed_delivery:
+            cursor = source
+            seen = set()
+            while cursor["definition"].get("technical_quality_successor"):
+                link = cursor["definition"]["technical_quality_successor"]
+                need(cursor["flow_id"] not in seen, "quality authorization lineage contains a cycle")
+                seen.add(cursor["flow_id"])
+                earlier = _read(Path(validate_evidence([link["authority"]])[0]["path"]))
+                need(earlier["decision"]["sha256"] != external["external_state_event"]["sha256"],
+                     "new human authorization cannot reuse an ancestor decision")
+                cursor = store.get_flow(link["source_parent_flow_id"])
+        need(state.get("technical_quality_binding") == previous_proof,
+             "previous technical lineage differs from its received proof")
+    need(old.get("kind") == "author_quality_v1" and (external is not None or not old.get("technical_quality_successor"))
+         and state.get("status") == "exception" and state.get("stage") == "child_quality"
+         and state.get("receipt") and source["definition_digest"] == technical["source_parent_definition_digest"],
+         "original terminal author-quality exception required; no recursive successor")
+    child = store.get_flow(technical["source_child_flow_id"])
+    child_spec, child_state = child["definition"], child["state"]
+    need(state.get("child_flow_id") == child["flow_id"] and child["definition_digest"] == technical["source_child_definition_digest"]
+         and child_state.get("status") == "exception" and child_state.get("stage") == "quality"
+         and child_state.get("step") == 0 and child_state.get("receipt")
+         and child_spec["roles"]["quality"].get("scope") == "whole_package", "terminal initial whole-quality child required")
+    need(all(child_spec.get(key) == old.get(key) for key in ("task_id", "owner", "policy_id")), "source child policy/owner differs")
+    need(state.get("exception", {}).get("child_receipt") == child_state["receipt"]
+         and state.get("exception", {}).get("reason") == child_state.get("exception"), "original exception propagation differs")
+    for original in (source, child):
+        receipt = _read(Path(original["state"]["receipt"]))
+        need(receipt.get("flow_id") == original["flow_id"] and receipt.get("status") == "exception"
+             and receipt.get("exception") == original["state"]["exception"]
+             and receipt.get("history") == original["state"]["history"], "original exception receipt changed")
+    failed = store.get_attempt(technical["failed_attempt_id"])
+    identity_suffix = ("quality-human-" + external["external_state_event"]["sha256"] if direct_human or failed_delivery
+                       else "quality-technical-" + failed["attempt_id"])
+    need(definition["flow_id"] == _identity(old["task_id"], identity_suffix),
+         "one deterministic authorization or failure successor identity required")
+    need(failed.get("state") == "failed" and failed.get("role") == "quality"
+         and failed["work_id"] == child_state.get("exception", {}).get("work_id")
+         and failed["candidate_id"] == state["candidate_id"], "exact failed original quality attempt required")
+    root = Path(failed["runtime_path"])
+    manifest = _validate(root)
+    collection = _validated_collection(root, manifest)
+    work = store.get_work(failed["work_id"])
+    need(all(work[key] == failed[key] for key in ("task_id", "candidate_id", "intent_id", "runtime_path", "policy_id", "request_digest"))
+         and failed["policy_id"] == child_spec["policy_id"] == old["policy_id"]
+         and manifest.get("intent_id") == failed["intent_id"] and manifest.get("candidate_binding", {}).get("candidate_id") == failed["candidate_id"]
+         and manifest.get("request", {}).get("sha256") == failed["request_digest"]
+         and collection.get("sid") == failed.get("cli_sid"), "failed original work/manifest identity differs")
+    terminal = _read(root / "termination.json")
+    events = [json.loads(row) for row in _regular(root / "trace.jsonl").decode().splitlines()]
+    errors = [row.get("error", {}).get("message", "") for row in events if row.get("type") == "turn.failed"]
+    need(collection.get("process_ended") is True and collection.get("technical_accepted") is False
+         and collection.get("model_completed") is False and collection.get("delivery_complete") is (True if failed_delivery else False)
+         and type(terminal.get("returncode")) is int and terminal["returncode"] != 0
+         and terminal.get("timed_out") is False and not terminal.get("exception")
+         and len(errors) == 1 and (errors[0].startswith("stream disconnected before completion: Transport error: network error:")
+              or (direct_human or failed_delivery) and errors[0] == "stream disconnected before completion: error sending request")
+         and not any(row.get("type") == "turn.completed" for row in events), "sealed terminal network stream failure required")
+    if failed_delivery:
+        from taskflow.execution_runner import _info
+
+        names = ("intake.md", "issues.json", "adoption-readiness.json")
+        artifacts = collection.get("artifacts")
+        need(isinstance(artifacts, dict) and set(artifacts) == set(names)
+             and all((root / "artifacts" / name).is_file()
+                     and _info(root / "artifacts" / name) == artifacts[name] for name in names),
+             "failed delivery must retain all three exact collected originals")
+    else:
+        need(not collection.get("artifacts") and all(not (root / "artifacts" / name).exists()
+             for name in ("intake.md", "issues.json", "adoption-readiness.json")), "partial or signed review cannot be replayed")
+    candidate = store.get_candidate(state["candidate_id"])
+    need(child_spec["initial"]["candidate_id"] == candidate["candidate_id"]
+         and child_spec["initial"]["candidate_root"] == state["candidate_root"]
+         and failed["task_id"] == definition["task_id"] == old["task_id"], "same captured candidate required")
+    check = _candidate_structure(Path(state["candidate_root"]), definition["task_id"])
+    need(all(check[key] == candidate[key] for key in ("input_digest", "content_digest", "evaluation_digest")), "candidate bytes changed")
+    author, author_manifest = _author(store, old)
+    public, public_manifest = _predecessor(store, child_spec)
+    need(author_technically_complete(author) and public.get("state") == "completed"
+         and public.get("technical_accepted") is True and public.get("artifacts_complete") is True
+         and public.get("response_complete") is True and type(public.get("process_exit")) is int and public["process_exit"] == 0
+         and public["attempt_id"] == state["public_attempt_id"] and candidate.get("author_attempt") == author["attempt_id"]
+         and _handoff(Path(state["author_archive"]), old, author)["disposition"] == "candidate_complete",
+         "complete original author and public reconstruction required")
+    sids = {author.get("cli_sid"), public.get("cli_sid"), failed.get("cli_sid")}
+    need(None not in sids and len(sids) == 3, "three distinct original contexts required")
+    sids.update((previous_proof or {}).get("excluded_sids", []))
+    sids.update(candidate.get("external_author_sids", []))
+    sids.update(child_spec["initial"].get("excluded_review_sids", []))
+    sids.update(row["cli_sid"] for row in child_state.get("history", []) if row.get("cli_sid"))
+    for actor, archive in ((author, Path(state["author_archive"])), (public, Path(state["public_archive"])),
+                           (failed, Path(child_spec["directory"]) / "archives" / failed["attempt_id"])):
+        need((archive / "archive-binding.json").is_file(), "complete retained original archive required")
+        archive_full_attempt(Path(actor["runtime_path"]), archive)
+    if failed_delivery:
+        work = Path(manifest["cwd"])
+        archive = Path(child_spec["directory"]) / "archives" / failed["attempt_id"]
+        archived_work = archive / "supplemental" / "trees" / "work"
+        checkpoint = "public-responsibility-first.json"
+        need((work / checkpoint).is_file() and (archived_work / checkpoint).is_file()
+             and _info(work / checkpoint) == _info(archived_work / checkpoint),
+             "failed original public checkpoint and its archived copy must match")
+        need(all((work / name).is_file() and (archived_work / name).is_file()
+                 and (archive / "artifacts" / name).is_file()
+                 and _info(work / name) == artifacts[name]
+                 and _info(archived_work / name) == artifacts[name]
+                 and _info(archive / "artifacts" / name) == artifacts[name] for name in names),
+             "failed original work and archive copies must match collection")
+    preserved = ("task_id", "owner", "source_author_attempt", "source_author_binding", "source_author_work",
+                 "author_contract", "business_item", "next", "authorization", "role_template_ref")
+    need(all(canonical(definition[key]) == canonical(old[key]) for key in preserved), "original author/business/infrastructure binding changed")
+    target_directory, original_directory = Path(definition["directory"]).absolute(), Path(old["directory"]).absolute()
+    need((external is not None or definition["policy_id"] != old["policy_id"]) and target_directory.is_absolute()
+         and not target_directory.is_relative_to(original_directory) and not original_directory.is_relative_to(target_directory)
+         and not any(path.is_symlink() for path in (target_directory, *target_directory.parents)),
+         "fresh immutable policy and separate runtime required")
+    need(authority.get("action") == "prepare_failed_initial_whole_quality_successor_once"
+         and authority.get("controller") == definition["owner"] and authority.get("task_id") == definition["task_id"]
+         and type(authority.get("maximum_new_quality_attempts")) is int and authority["maximum_new_quality_attempts"] == 1
+         and authority.get("technical_source") == {key:value for key,value in technical.items() if key != "authority"}
+         and authority.get("candidate_binding") == _binding(candidate)
+         and authority.get("original_author_attempt") == author["attempt_id"]
+         and authority.get("original_public_attempt") == public["attempt_id"]
+         and authority.get("target_policy_id") == definition["policy_id"], "explicit bounded owner decision differs")
+    validate_evidence([authority["decision"], authority["model_selection"]])
+    decision = _read(Path(authority["decision"]["path"]))
+    if external is None:
+        need(type(decision.get("maximum_new_quality_attempts")) is int and decision["maximum_new_quality_attempts"] == 1
+             and decision.get("predecessor_attempt") == failed["attempt_id"]
+             and decision.get("predecessor_actual_sid") == failed["cli_sid"]
+             and decision.get("candidate_binding") == _binding(candidate)
+             and decision.get("requested_model") == authority.get("requested_model")
+             and decision.get("reasoning_effort") == authority.get("reasoning_effort"), "bounded decision source differs")
+    elif failed_delivery:
+        cost_path = Path(cost_ref["path"])
+        human_path = Path(external["external_state_event"]["path"])
+        cost = _read(cost_path)
+        need(type(decision.get("schema_version")) is int and decision["schema_version"] == 1
+             and decision.get("authority_kind") == "direct_human_instruction_in_q1_controller_chat"
+             and decision.get("candidate_id") == candidate["candidate_id"]
+             and all(decision.get(key) == candidate[key] for key in ("content_digest", "input_digest", "evaluation_digest"))
+             and decision.get("sole_q1_dispatcher") == definition["owner"]
+             and decision.get("quality") == ("One new independent whole-quality continuation, " + authority["requested_model"]
+                 + "/" + authority["reasoning_effort"] + ", thinking enabled. Public-first own checkpoint with actual SHA readback, then teacher materials.")
+             and decision.get("prior_explicit_data_and_cost_authorization") == cost_path.name
+             and cost_path.parent == human_path.parent
+             and cost.get("authority_kind") == "direct_human_instruction_in_q1_controller_chat"
+             and cost.get("source_thread_id") == decision.get("source_thread_id")
+             and cost.get("candidate_id") == candidate["candidate_id"]
+             and all(cost.get("candidate_" + key) == candidate[key] for key in ("content_digest", "input_digest", "evaluation_digest"))
+             and cost.get("sole_dispatcher") == definition["owner"]
+             and cost.get("quality_model") == authority["requested_model"] + "/" + authority["reasoning_effort"] + ", thinking enabled"
+             and type(cost.get("additional_quality_attempt_limit")) is int and cost["additional_quality_attempt_limit"] == 1
+             and all(isinstance(decision.get(key), str) and decision[key].strip() for key in ("source_thread_id", "human_quote", "scope", "after_quality"))
+             and isinstance(cost.get("provider_data_and_cost"), str) and cost["provider_data_and_cost"].strip(),
+             "fresh human instruction, candidate, model, dispatcher or earlier data/cost authority differs")
+    elif direct_human:
+        need(type(decision.get("schema_version")) is int and decision["schema_version"] == 1
+             and decision.get("authority_kind") == "direct_human_instruction_in_q1_controller_chat"
+             and type(decision.get("additional_quality_attempt_limit")) is int and decision["additional_quality_attempt_limit"] == 1
+             and decision.get("candidate_id") == candidate["candidate_id"]
+             and all(decision.get("candidate_" + key) == candidate[key] for key in
+                     ("content_digest", "input_digest", "evaluation_digest"))
+             and decision.get("quality_model") == authority.get("requested_model") + "/" + authority.get("reasoning_effort") + ", thinking enabled"
+             and decision.get("sole_dispatcher") == definition["owner"]
+             and all(isinstance(decision.get(key), str) and decision[key].strip() for key in
+                     ("source_thread_id", "human_quote", "scope", "provider_data_and_cost")),
+             "direct human decision differs from exact candidate/model/owner or one-call bound")
+    else:
+        need(type(decision.get("schema_version")) is int and decision["schema_version"] == 1
+             and type(decision.get("maximum_new_quality_attempts")) is int and decision["maximum_new_quality_attempts"] == 1
+             and decision.get("predecessor_failed_attempt") == failed["attempt_id"]
+             and decision.get("predecessor_sid") == failed["cli_sid"]
+             and all(decision.get(key) == candidate[key] for key in
+                     ("candidate_id", "content_digest", "evaluation_digest", "input_digest"))
+             and decision.get("model") == authority.get("requested_model")
+             and decision.get("reasoning_effort") == authority.get("reasoning_effort")
+             and decision.get("thinking") == "enabled"
+             and decision.get("sole_dispatcher") == definition["owner"]
+             and all(isinstance(decision.get(key), str) and decision[key].strip() for key in
+                     ("source_thread_id", "human_quote", "evidence_limit", "decision_maker", "decision")),
+             "explicit changed-state decision differs from exact source/candidate/model/owner")
+    old_policy = store.get_policy(old["policy_id"])["config"]
+    policy = store.get_policy(definition["policy_id"])["config"]
+    snapshot = validate_batch_policy(policy)
+    fixture = all(item.get("mode") == "test_fixture" for item in (manifest, author_manifest, public_manifest))
+    need(snapshot is not None or fixture, "confirmed target model batch required")
+    selected = policy_setting(policy, "quality", "quality" if snapshot is not None else None, definition["task_id"])
+    need(selected["model"] == authority.get("requested_model") and selected["reasoning_effort"] == authority.get("reasoning_effort")
+         and (fixture or selected.get("reasoning_selection") == "explicit" and selected.get("reasoning_context") is None),
+         "target role differs from explicit model decision")
+    if snapshot is not None:
+        from taskflow.execution_store import same_original_ref
+
+        need(same_original_ref(snapshot["user_model_confirmation"]["source"], authority["model_selection"]), "target model confirmation source differs")
+    metadata = {"roles", "model_slots", "batch_snapshot", "batch_infrastructure"}
+    need(canonical({k:v for k,v in old_policy.items() if k not in metadata})
+         == canonical({k:v for k,v in policy.items() if k not in metadata}), "operational policy changed")
+    old_roles, roles = _roles(store, old), _roles(store, definition)
+    fields = {"model", "reasoning_effort", "reasoning_selection", "reasoning_context", "native_provider"}
+    for name in roles:
+        before, after = old_roles[name]["runner"], roles[name]["runner"]
+        need(canonical({k:v for k,v in before.items() if k not in fields})
+             == canonical({k:v for k,v in after.items() if k not in fields}), "role CLI/permissions/timeout/request changed")
+        if after.get("native_provider") is not None:
+            from taskflow.execution_codex_provider import _checked, provider_settings
+
+            previous_provider = _read(_checked(before["native_provider"]))
+            provider = _read(_checked(after["native_provider"]))
+            mutable = {"model", "reasoning_effort", "catalog", "documentation"}
+            need(canonical({k:v for k,v in previous_provider.items() if k not in mutable})
+                 == canonical({k:v for k,v in provider.items() if k not in mutable}), "provider transport/home/credential binding changed")
+            filesystem = {":root":"deny", ":minimal":"read", ":tmpdir":"deny", ":slash_tmp":"deny",
+                          "/private/tmp":"deny", provider["codex_home"]:"deny"}
+            provider_settings({**after, "native_permissions":{"profile":"quality-successor-validation"}}, filesystem)
+        else:
+            need(before.get("native_provider") is None, "provider transport removed")
+    need(roles["quality"]["runner"].get("resume_sid") is None
+         and (roles["quality"]["runner"].get("quality_session") or {}).get("previous") is None
+         and (fixture or roles["quality"]["runner"].get("public_first_initial_listing")), "fresh public-first context required")
+    return {"source_flow_id":source["flow_id"], "source_definition_digest":source["definition_digest"],
+            "failed_attempt_id":failed["attempt_id"], "failed_sid":failed["cli_sid"], "authority":authority_ref,
+            "candidate_id":candidate["candidate_id"], "candidate_root":state["candidate_root"],
+            "author_archive":state["author_archive"], "public_archive":state["public_archive"],
+            "public_attempt_id":public["attempt_id"], "public_work_id":public["work_id"], "excluded_sids":sorted(sids),
+            **({"external_state_recovery":external_ref, "external_state_event":external["external_state_event"],
+                "previous_allowance_spent":True} if external is not None else {})}
 
 
 def _candidate_structure(root: Path, task_id: str) -> dict:
@@ -752,13 +1071,25 @@ def advance_author(store: object, record: dict) -> dict:
     author = reconcile_ended_attempt(store, author)
     if author["state"] in ("claimed", "starting", "running", "collecting"):
         return _wait(store, record, "source_author", author["state"])
-    if author["state"] != "completed":
+    from taskflow.execution_completion_observation import author_technically_complete, received_dependencies
+
+    if not author_technically_complete(author):
         raise TaskflowError("original author failed/uncertain/cancelled; never redraw: " + author["state"])
+    if state["stage"] == "author_quality_v1" and definition.get("technical_quality_successor") is not None:
+        proof = validate_technical_quality_successor(store, definition)
+        state.update({key:proof[key] for key in ("author_archive", "public_archive", "candidate_id", "candidate_root",
+                                               "public_attempt_id", "public_work_id")})
+        state.update(stage="child_quality", waiting=None, technical_quality_binding=proof,
+                     archives=[proof["author_archive"], proof["public_archive"]])
+        state["history"] = [{"kind":"technical_quality_originals_reused", "proof":proof,
+                             "new_author_dispatched":False, "new_public_dispatched":False}]
+        return _save(store, record, state, "author_quality_technical_originals_bound")
     if not state.get("author_archive"):
         root = Path(author["runtime_path"])
         if not (root / "collection.json").exists() or not (root / "collection-lock.json").exists():
             return _wait(store, record, "source_author", "collection_not_sealed")
-        archived = archive_full_attempt(root, Path(definition["directory"]) / "archives" / author["attempt_id"])
+        archived = archive_full_attempt(root, Path(definition["directory"]) / "archives" / author["attempt_id"],
+                                        received_dependencies=received_dependencies(author))
         state.update(author_archive=archived["path"], stage="author_handoff", waiting=None)
         state["archives"] = [*state["archives"], archived["path"]]
         state["history"] = [*state["history"], {"kind": "source_author_original_received", "attempt_id": author["attempt_id"],
@@ -872,6 +1203,8 @@ def advance_candidate_quality(store: object, record: dict, author: dict) -> dict
                             "roles": _roles(store, definition)}
         if definition.get("kind") == "baseline_quality_v1":
             definition_child["initial"]["excluded_review_sids"] = [author["cli_sid"]]
+        if state.get("technical_quality_binding") is not None:
+            definition_child["initial"]["excluded_review_sids"] = state["technical_quality_binding"]["excluded_sids"]
         refs = [*record["evidence"], evidence_ref(Path(state["public_archive"]) / "archive-binding.json", "actual fresh public original")]
         _publish_once(Path(definition["directory"]) / "quality-definition.json", {"definition": definition_child, "evidence": refs})
         child = register_workflow(store, definition_child, refs)

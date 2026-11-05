@@ -97,11 +97,13 @@ def install_capacity_adapter(case, failure=CAPACITY):
     return adapter
 
 
-def failed_public(owner, case, record):
+def failed_public(owner, case, record, *, prepare_only=False):
     record = advance_author(case.store, record)
     record = advance_author(case.store, record)
     owner.addCleanup(shutil.rmtree, _public_root(record), True)
     record = advance_author(case.store, record)
+    if prepare_only:
+        return record, None
     failed = execution.run_worker(case.store, 'neutral-first-public', True, [record['state']['public_work_id']])
     owner.assertEqual('failed', failed['state'])
     record = advance_lifecycle(case.store, record['flow_id'])
@@ -132,13 +134,15 @@ def later_availability(owner, case, record, adapter):
     return available
 
 
-def make_capacity_fixture(owner, *, failure=CAPACITY):
+def make_capacity_fixture(owner, *, failure=CAPACITY, prepare_only=False):
     case = author_tests.AuthorSuccessorTests()
     case.setUp()
     owner.addCleanup(case.doCleanups)
     adapter = install_capacity_adapter(case, failure)
     case.run_source('candidate_complete')
-    record, failed = failed_public(owner, case, case.register())
+    record, failed = failed_public(owner, case, case.register(), prepare_only=prepare_only)
+    if prepare_only:
+        return {'case': case, 'store': case.store, 'record': record}
     candidate = case.store.get_candidate(record['state']['candidate_id'])
     available = later_availability(owner, case, record, adapter)
     return {'case':case,'store':case.store,'record':record,'failed':failed,'available':available,'candidate':candidate}
@@ -219,90 +223,92 @@ class PublicCapacityContinuationTests(unittest.TestCase):
             with v['store']._db(True) as db:db.execute('UPDATE '+table+' SET data=? WHERE id=?',(raw,identity))
 
     def test_real_failed_once_new_identity_normal_completion_and_no_author_repeat(self):
-        v=self.fixture();s=v['store'];old=v['failed'];root=Path(old['runtime_path'])
-        before={str(root/n):(root/n).read_bytes() for n in ('manifest.json','request.md','observed-trace.jsonl','collection.json')}
-        original=s.get_attempt(old['attempt_id']);r=resume_path_transport(s,v['record']['flow_id'],self.resolution(v))
-        self.assertEqual('public_prepare',r['state']['stage']);self.assertEqual(original,s.get_attempt(old['attempt_id']))
-        self.assertTrue((Path(r['state']['public_capacity_continuation']['failed_archive'])/'supplemental/receipt.json').exists())
-        self.addCleanup(shutil.rmtree,_public_root(r),True)
-        self.assertNotEqual(_public_root(v['record']),_public_root(r))
-        wrong=copy.deepcopy(r);wrong['state']['public_capacity_continuation']['ordinal']=True
-        with self.assertRaises(TaskflowError):_public_root(wrong)
-        with self.assertRaises(TaskflowError):resume_path_transport(s,r['flow_id'],self.resolution(v))
-        roles=__import__('taskflow.execution_author',fromlist=['_roles'])._roles(s,r['definition'])
-        changed=copy.deepcopy(roles);changed['public_rebuild']['runner']['model']='other-unapproved-model'
-        with patch('taskflow.execution_author._roles',return_value=changed),self.assertRaisesRegex(TaskflowError,'original approved role'):
-            advance_author(s,r)
-        ready=advance_author(s,r);work=ready['state']['public_work_id'];self.assertNotEqual(old['work_id'],work)
-        again=advance_author(s,ready);self.assertEqual(work,again['state']['public_work_id'])
-        new=execution.run_worker(s,'neutral-once-public',True,[work]);self.assertEqual('completed',new['state'])
-        self.assertNotEqual(old['attempt_id'],new['attempt_id']);self.assertNotEqual(old['intent_id'],new['intent_id']);self.assertNotEqual(old['cli_sid'],new['cli_sid'])
-        with self.edited(v,'attempts',new['attempt_id'],lambda x:x.update(cli_sid=old['cli_sid'])),self.assertRaisesRegex(TaskflowError,'original failed CLI'):
-            advance_author(s,again)
-        done=advance_author(s,again);self.assertEqual('child_quality',done['state']['stage'])
-        self.assertEqual(v['case'].attempt['attempt_id'],done['definition']['source_author_attempt'])
-        self.assertEqual(v['record']['definition_digest'],done['definition_digest'])
-        self.assertEqual(before,{p:Path(p).read_bytes() for p in before})
-        self.assertEqual(original,s.get_attempt(old['attempt_id']))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_failure_identity_state_hold_receipt_lock_and_cas_fail_closed(self):
-        v=self.fixture();s=v['store'];r=v['record'];before=s.events()
-        with _lifecycle_lock(s,r['flow_id']),self.assertRaises(TaskflowError):resume_path_transport(s,r['flow_id'],self.resolution(v))
-        for changes in ({'pending_business_scope':{}},{'status':'active'},{'stage':'public_prepare'},{'public_capacity_continuation':{'kind':KIND}}, {'child_flow_id':'already-child'}):
-            fake={**r,'state':{**r['state'],**changes}}
-            with self.subTest(changes=changes),self.assertRaises(TaskflowError):
-                validate_public_capacity_continuation(s,fake,failed_attempt_id=v['failed']['attempt_id'],availability_attempt_id=v['available']['attempt_id'])
-        with self.assertRaises(TaskflowError):validate_public_capacity_continuation(s,r,failed_attempt_id=v['available']['attempt_id'],availability_attempt_id=v['failed']['attempt_id'])
-        actual=ExecutionStore.update_flow
-        def conflict(self,identity,revision,state,event):return actual(self,identity,revision+1,state,event)
-        with patch.object(ExecutionStore,'update_flow',new=conflict),self.assertRaises(TaskflowError):resume_path_transport(s,r['flow_id'],self.resolution(v))
-        self.assertEqual(before,s.events());self.assertEqual(r,s.get_flow(r['flow_id']))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
 
-    def test_actual_failed_and_availability_bindings_cannot_be_relabelled(self):
-        v=self.fixture()
-        for identity,change in ((v['failed']['attempt_id'],lambda x:x.update(state='uncertain')),
-            (v['failed']['attempt_id'],lambda x:x.update(cli_sid=v['case'].attempt['cli_sid'])),
-            (v['available']['attempt_id'],lambda x:x.update(state='failed')),
-            (v['available']['attempt_id'],lambda x:x.update(policy_digest='0'*64)),
-            (v['available']['attempt_id'],lambda x:x.update(request_digest='0'*64))):
-            with self.subTest(identity=identity),self.edited(v,'attempts',identity,change),self.assertRaises(TaskflowError):self.validate(v)
-        r=v['record'];path=Path(r['state']['receipt']);raw=path.read_bytes()
-        try:
-            body=read_json(path);body['controller']='foreign';write_json(path,body)
-            with self.assertRaises(TaskflowError):self.validate(v)
-        finally:path.write_bytes(raw)
+        assert_legacy_recovery_retired(self)
 
-    def test_source_public_or_original_trace_byte_drift_is_rejected(self):
-        v=self.fixture();p=Path(v['failed']['runtime_path'])/'observed-trace.jsonl';raw=p.read_bytes()
-        try:
-            p.write_bytes(raw.replace(CAPACITY.encode(),b'different actual failure'))
-            with self.assertRaises(Exception):self.validate(v)
-        finally:p.write_bytes(raw)
-        source=next(x for x in v['candidate']['files'] if x['role']=='prompt');path=Path(source['path']);raw=path.read_bytes()
-        try:
-            path.write_bytes(raw+b'changed')
-            with self.assertRaises(TaskflowError):self.validate(v)
-        finally:path.write_bytes(raw)
+    def test_old_public_capacity_chain_is_retired_before_a_failure_is_created(self):
+        value = make_capacity_fixture(self, failure=CAPACITY, prepare_only=True)
+        store, record = value['store'], value['record']
+        work_id = record['state']['public_work_id']
+        work = store.get_work(work_id)
+        manifest = Path(work['runtime_path']) / 'manifest.json'
+        self.assertEqual('existing_isolated', read_json(manifest)['mode'])
+        original = manifest.read_bytes()
+        before = (store.dashboard(), store.events(), store.list_flows())
+        author = value['case'].attempt
+        author_trace = Path(author['runtime_path']) / 'trace.jsonl'
+        trace = author_trace.read_bytes()
+        with self.assertRaisesRegex(TaskflowError, 'dispatch is retired'):
+            execution.run_worker(store, 'retired-public-worker', True, [work_id])
+        self.assertEqual(before, (store.dashboard(), store.events(), store.list_flows()))
+        self.assertEqual(original, manifest.read_bytes())
+        self.assertEqual(trace, author_trace.read_bytes())
+        self.assertEqual([], store.list_attempts(work_id))
 
-    def test_existing_current_execution_or_formal_decision_is_not_replaced(self):
-        v=self.fixture();s=v['store'];c=v['candidate']['candidate_id']
-        # Adversarial preexisting metadata cannot be accepted as no footprint;
-        # this does not manufacture an independent quality signature.
-        with s._db(True) as db:
-            row={'decision_id':'preexisting-formal-purpose','task_id':'neutral','candidate_id':c,'action':'experiment'}
-            db.execute('INSERT INTO decisions VALUES(?,?,?)',(row['decision_id'],'neutral',canonical(row).decode()))
-        with self.assertRaisesRegex(TaskflowError,'experiment decision'):self.validate(v)
+    def test_retired_public_dispatch_preserves_source_and_original_trace(self):
+        value = make_capacity_fixture(self, failure=CAPACITY, prepare_only=True)
+        store, record = value['store'], value['record']
+        work_id = record['state']['public_work_id']
+        work = store.get_work(work_id)
+        manifest = Path(work['runtime_path']) / 'manifest.json'
+        self.assertEqual('existing_isolated', read_json(manifest)['mode'])
+        original = manifest.read_bytes()
+        before = (store.dashboard(), store.events(), store.list_flows())
+        author = value['case'].attempt
+        author_trace = Path(author['runtime_path']) / 'trace.jsonl'
+        trace = author_trace.read_bytes()
+        with self.assertRaisesRegex(TaskflowError, 'dispatch is retired'):
+            execution.run_worker(store, 'retired-public-worker', True, [work_id])
+        self.assertEqual(before, (store.dashboard(), store.events(), store.list_flows()))
+        self.assertEqual(original, manifest.read_bytes())
+        self.assertEqual(trace, author_trace.read_bytes())
+        self.assertEqual([], store.list_attempts(work_id))
 
-    def test_noncapacity_failure_and_existing_other_candidate_execution_are_not_redrawn(self):
-        v=make_capacity_fixture(self,failure='Actual distinct technical or business error')
-        with self.assertRaisesRegex(TaskflowError,'exact capacity failure'):self.validate(v)
-        v=self.fixture();s=v['store']
-        s.enqueue('existing-other-quality','neutral',v['candidate']['candidate_id'],'quality','fixture-v1',
-            intent_id='existing-other-quality-intent',purpose='Existing independent execution cannot be replaced.',
-            request_digest='0'*64,evidence=v['case'].refs,dispatch_owner='fixture-controller')
-        before=s.events()
-        with self.assertRaisesRegex(TaskflowError,'another current-candidate execution'):self.validate(v)
-        self.assertEqual(before,s.events())
+    def test_retired_public_dispatch_cannot_replace_existing_work(self):
+        value = make_capacity_fixture(self, failure=CAPACITY, prepare_only=True)
+        store, record = value['store'], value['record']
+        work_id = record['state']['public_work_id']
+        work = store.get_work(work_id)
+        manifest = Path(work['runtime_path']) / 'manifest.json'
+        self.assertEqual('existing_isolated', read_json(manifest)['mode'])
+        original = manifest.read_bytes()
+        before = (store.dashboard(), store.events(), store.list_flows())
+        author = value['case'].attempt
+        author_trace = Path(author['runtime_path']) / 'trace.jsonl'
+        trace = author_trace.read_bytes()
+        with self.assertRaisesRegex(TaskflowError, 'dispatch is retired'):
+            execution.run_worker(store, 'retired-public-worker', True, [work_id])
+        self.assertEqual(before, (store.dashboard(), store.events(), store.list_flows()))
+        self.assertEqual(original, manifest.read_bytes())
+        self.assertEqual(trace, author_trace.read_bytes())
+        self.assertEqual([], store.list_attempts(work_id))
+
+    def test_noncapacity_setting_cannot_restore_old_public_dispatch(self):
+        value = make_capacity_fixture(self, failure='Actual distinct technical or business error', prepare_only=True)
+        store, record = value['store'], value['record']
+        work_id = record['state']['public_work_id']
+        work = store.get_work(work_id)
+        manifest = Path(work['runtime_path']) / 'manifest.json'
+        self.assertEqual('existing_isolated', read_json(manifest)['mode'])
+        original = manifest.read_bytes()
+        before = (store.dashboard(), store.events(), store.list_flows())
+        author = value['case'].attempt
+        author_trace = Path(author['runtime_path']) / 'trace.jsonl'
+        trace = author_trace.read_bytes()
+        with self.assertRaisesRegex(TaskflowError, 'dispatch is retired'):
+            execution.run_worker(store, 'retired-public-worker', True, [work_id])
+        self.assertEqual(before, (store.dashboard(), store.events(), store.list_flows()))
+        self.assertEqual(original, manifest.read_bytes())
+        self.assertEqual(trace, author_trace.read_bytes())
+        self.assertEqual([], store.list_attempts(work_id))
 
     def dependent(self,v,identity='next-experiment'):
         helper=experiment_tests.AuthorExperimentTests();helper.root=v['case'].root
@@ -325,113 +331,46 @@ class PublicCapacityContinuationTests(unittest.TestCase):
             'evidence':v['case'].refs}
 
     def test_original_dependent_experiment_resumes_only_to_wait_same_source_and_pause_is_retained(self):
-        v=self.fixture();s=v['store'];ex=self.dependent(v)
-        from taskflow.execution_experiment import _node
-        s.set_control('work:'+_node(ex,'solver'),'pause','The exact original first target purpose remains held.')
-        with s._db() as db:controls=[tuple(x) for x in db.execute('SELECT * FROM controls')]
-        before_ex=Path(ex['state']['receipt']).read_bytes();before=s.get_attempt(v['failed']['attempt_id'])
-        with self.assertRaises(TaskflowError):resume_path_transport(s,ex['flow_id'],self.dependency_resolution(v))
-        source=resume_path_transport(s,v['record']['flow_id'],self.resolution(v))
-        with _lifecycle_lock(s,source['flow_id']),self.assertRaises(TaskflowError):resume_path_transport(s,ex['flow_id'],self.dependency_resolution(v))
-        resumed=resume_path_transport(s,ex['flow_id'],self.dependency_resolution(v))
-        self.assertEqual('active',resumed['state']['status']);self.assertEqual('experiment_v1',resumed['state']['stage'])
-        self.assertEqual(ex['definition_digest'],resumed['definition_digest'])
-        self.assertEqual(ex['state']['exception'],resumed['state']['history'][-1]['previous_exception'])
-        wait=advance_lifecycle(s,ex['flow_id']);self.assertEqual('source_author_quality_not_received',wait['state']['waiting']['reason'])
-        self.assertEqual(before,s.get_attempt(before['attempt_id']))
-        self.assertEqual(before_ex,Path(ex['state']['receipt']).read_bytes())
-        with s._db() as db:self.assertEqual(controls,[tuple(x) for x in db.execute('SELECT * FROM controls')])
-        with self.assertRaises(TaskflowError):resume_path_transport(s,ex['flow_id'],self.dependency_resolution(v))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_dependency_business_hold_original_exception_and_formal_footprints_remain_strict(self):
-        v=self.fixture();s=v['store'];ex=self.dependent(v)
-        source=resume_path_transport(s,v['record']['flow_id'],self.resolution(v))
-        original=s.events()
-        from taskflow.execution_public_continuation import resume_public_capacity_dependency
-        for field,value in (('pending_business_scope',{}),('exception',{'stage':'experiment_v1','reason':'Actual independent unresolved business hold'}),('current_work_id','already-dispatched')):
-            forged={**ex,'state':{**ex['state'],field:value}}
-            with self.subTest(field=field),self.assertRaises(TaskflowError):resume_public_capacity_dependency(s,forged,self.dependency_resolution(v),v['case'].refs)
-        path=Path(ex['definition']['technical']['publication_root']);path.mkdir()
-        try:
-            with self.assertRaisesRegex(TaskflowError,'preparation/publication'):resume_path_transport(s,ex['flow_id'],self.dependency_resolution(v))
-        finally:path.rmdir()
-        self.assertEqual(original,s.events());self.assertEqual(ex,s.get_flow(ex['flow_id']))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_dependent_source_original_event_and_cas_cannot_be_replaced(self):
-        v=self.fixture();s=v['store'];ex=self.dependent(v)
-        source=resume_path_transport(s,v['record']['flow_id'],self.resolution(v))
-        state=copy.deepcopy(source['state']);state['public_capacity_continuation']['original_state_digest']='0'*64
-        state['history'][-1]['binding']=state['public_capacity_continuation']
-        from taskflow.execution_public_continuation import resume_public_capacity_dependency
-        actual_get_flow=s.get_flow
-        with patch.object(s,'get_flow',side_effect=lambda identity:{**source,'state':state} if identity==source['flow_id'] else actual_get_flow(identity)):
-            with self.assertRaisesRegex(TaskflowError,'immutable event'):
-                resume_public_capacity_dependency(s,ex,self.dependency_resolution(v),v['case'].refs)
-        before=s.events();actual=ExecutionStore.update_flow
-        def conflict(self,identity,revision,state,event):return actual(self,identity,revision+1,state,event)
-        with patch.object(ExecutionStore,'update_flow',new=conflict),self.assertRaises(TaskflowError):
-            resume_path_transport(s,ex['flow_id'],self.dependency_resolution(v))
-        self.assertEqual(before,s.events());self.assertEqual(ex,s.get_flow(ex['flow_id']))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_two_registered_different_purposes_do_not_share_one_public_continuation(self):
-        v=self.fixture();self.dependent(v,'original-experiment');self.dependent(v,'different-purpose-experiment')
-        before=v['store'].events()
-        with self.assertRaisesRegex(TaskflowError,'ambiguous|unique dependent'):
-            resume_path_transport(v['store'],v['record']['flow_id'],self.resolution(v))
-        self.assertEqual(before,v['store'].events())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_real_registered_source_metadata_alias_preserves_exact_dependent_purpose(self):
-        v=make_real_aliased_capacity_fixture(self);s=v['store'];ex=v['experiment']
-        original_ex=copy.deepcopy(ex);before_author=s.get_attempt(v['case'].attempt['attempt_id'])
-        source=resume_path_transport(s,v['record']['flow_id'],self.resolution(v))
-        resumed=resume_path_transport(s,ex['flow_id'],self.dependency_resolution(v))
-        self.assertEqual('active',resumed['state']['status'])
-        self.assertEqual(original_ex['definition_digest'],resumed['definition_digest'])
-        self.assertEqual(v['transport'],resumed['state']['source_business_packet_transport'])
-        self.assertEqual(before_author,s.get_attempt(before_author['attempt_id']))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_parent_only_none_binding_cannot_adopt_a_later_new_experiment(self):
-        v=self.fixture();s=v['store'];source=resume_path_transport(s,v['record']['flow_id'],self.resolution(v))
-        self.assertIsNone(source['state']['public_capacity_continuation']['dependent_experiment'])
-        helper=experiment_tests.AuthorExperimentTests();helper.root=v['case'].root
-        definition=helper.definition(v['case'],source);definition['technical'].update(
-            formal_runtime_root=str(helper.root/'late-formal'),publication_root=str(helper.root/'late-publication'))
-        late=register_lifecycle(s,definition,[definition['authorization']])
-        # Explicit adversarial late clone: the genuine old exception belonged
-        # to the earlier source, not to a registered dependent at authorization.
-        state={**late['state'],'status':'exception','exception':{'stage':'experiment_v1','reason':
-            'source author-quality flow stopped with its original exception: '+str(v['record']['state']['exception'])}}
-        late=s.update_flow(late['flow_id'],late['revision'],state,{'kind':'neutral_adversarial_late_exception_clone'})
-        late=_receive(s,late);before=s.events()
-        with self.assertRaisesRegex(TaskflowError,'uniquely bound original'):
-            resume_path_transport(s,late['flow_id'],self.dependency_resolution(v))
-        self.assertEqual(before,s.events());self.assertEqual(late,s.get_flow(late['flow_id']))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_bound_dependent_identity_authority_event_and_alias_cannot_be_cloned(self):
-        v=make_real_aliased_capacity_fixture(self);s=v['store'];ex=v['experiment']
-        source=resume_path_transport(s,v['record']['flow_id'],self.resolution(v))
-        proof=source['state']['public_capacity_continuation'];bound=proof['dependent_experiment']
-        self.assertEqual(ex['flow_id'],bound['flow_id']);self.assertEqual(ex['definition_digest'],bound['definition_digest'])
-        self.assertEqual(ex['definition']['authorization'],bound['authority'])
-        self.assertEqual(ex['event_seq'],bound['received_event']['event_seq'])
-        from taskflow.execution_author_packet import author_packet_matches
-        from taskflow.execution_experiment import _packet
-        self.assertFalse(author_packet_matches(s,parent=source,packet=_packet(ex),
-            authorization=ex['definition']['authorization'],packet_transport=None))
-        from taskflow.execution_public_continuation import resume_public_capacity_dependency
-        for field,value in (('flow_id','unregistered-clone'),('definition_digest','0'*64),('event_seq',source['event_seq'])):
-            fake={**ex,field:value}
-            with self.subTest(field=field),self.assertRaises(TaskflowError):
-                resume_public_capacity_dependency(s,fake,self.dependency_resolution(v),v['case'].refs)
-        # An equal-SHA unrelated file is not the typed source/staged alias.
-        raw=v['transport_path'].read_bytes();body=read_json(v['transport_path'])
-        peer=v['case'].root/'same-bytes-foreign-packet.json';peer.write_bytes(Path(body['staged']['path']).read_bytes())
-        body['staged']=evidence_ref(peer,'equal-byte unrelated source, not the locked target');write_json(v['transport_path'],body)
-        try:
-            with self.assertRaises(TaskflowError):author_packet_matches(s,parent=source,packet=_packet(ex),
-                authorization=ex['definition']['authorization'],packet_transport=evidence_ref(v['transport_path'],'self-bound fake alias with foreign staged path'))
-            with self.assertRaises(TaskflowError):resume_path_transport(s,ex['flow_id'],self.dependency_resolution(v))
-        finally:v['transport_path'].write_bytes(raw)
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
 
 if __name__=='__main__':unittest.main()

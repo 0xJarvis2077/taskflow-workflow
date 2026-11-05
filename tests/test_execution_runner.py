@@ -726,8 +726,8 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.prepare()
         original = runner.run_attempt(self.root)
         real_reconcile = runner.reconcile_attempt
-        def change_after_reconcile(root):
-            result = real_reconcile(root)
+        def change_after_reconcile(root, **kwargs):
+            result = real_reconcile(root, **kwargs)
             (root / "artifacts/answer.md").write_text("Raced after cached acceptance")
             return result
         target = self.base / "racing-archive"
@@ -1233,8 +1233,8 @@ class ExecutionRunnerTests(unittest.TestCase):
         self.prepare()
         runner.run_attempt(self.root)
         actual_archive = runner.archive_attempt
-        def changed_after_archive(root, destination, fault=None):
-            result = actual_archive(root, destination, fault=fault)
+        def changed_after_archive(root, destination, fault=None, **kwargs):
+            result = actual_archive(root, destination, fault=fault, **kwargs)
             (self.work / 'late.py').write_text('late writer')
             return result
         target = self.base / 'full-archive'
@@ -1283,8 +1283,8 @@ class ExecutionRunnerTests(unittest.TestCase):
         runner.archive_full_attempt(self.root, target)
         original = (target / 'archive-binding.json').read_bytes()
         actual_archive = runner.archive_attempt
-        def changed_after_validation(root, destination, fault=None):
-            result = actual_archive(root, destination, fault=fault)
+        def changed_after_validation(root, destination, fault=None, **kwargs):
+            result = actual_archive(root, destination, fault=fault, **kwargs)
             (self.work / 'changed-while-verifying.py').write_text('new')
             return result
         with mock.patch.object(runner, 'archive_attempt', side_effect=changed_after_validation):

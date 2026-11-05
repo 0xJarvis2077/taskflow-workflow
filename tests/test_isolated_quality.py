@@ -124,6 +124,24 @@ class IsolatedQualityTests(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.prepare()
 
+    def test_prepare_denies_a_historical_run_in_flat_or_grouped_packages(self) -> None:
+        for relative in ("tasks/flat", "tasks/topic/packages/grouped"):
+            with self.subTest(package=relative):
+                package = self.repository / relative
+                package.mkdir(parents=True)
+                (package / "task.json").write_text("{}\n", encoding="utf-8")
+                run = package / "runs" / "historical" / "run.json"
+                run.parent.mkdir(parents=True)
+                run.write_text("{}\n", encoding="utf-8")
+                self.prepare()
+                plan = quality.validate(self.root, require_probe=False)
+
+                self.assertIn(
+                    {"path": str(run), "kind": "file"}, plan["denied"]
+                )
+                self.root = self.base / "runtime-grouped"
+                (package / "task.json").unlink()
+
     def cli_args(self, action: str) -> list[str]:
         sources = ({"solver": self.solver, "snapshot": self.snapshot}
                    if action == "prepare" else {"task": self.task})

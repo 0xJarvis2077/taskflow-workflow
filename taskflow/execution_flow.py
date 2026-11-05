@@ -108,6 +108,8 @@ def register_workflow(store: ExecutionStore, definition: dict, evidence: list[di
         if role["runner"].get("role") != expected:
             raise TaskflowError("workflow runner role mismatch")
     store.get_policy(definition["policy_id"])
+    if initial.get("public_predecessor_reuse") is not None and not initial.get("predecessor_attempt"):
+        raise TaskflowError("public predecessor reuse requires its exact original attempt")
     if initial.get("predecessor_attempt"):
         _predecessor(store, definition)
     state = {"status": "active", "stage": "quality", "step": 0,
@@ -225,10 +227,15 @@ def resume_workflow(store: ExecutionStore, flow_id: str, *, reason: str, evidenc
         if any(item.get("evidence_digest") == evidence_digest for item in state.get("resolved_exceptions", [])):
             raise TaskflowError("previous resolution evidence cannot authorize another exception")
         definition = record["definition"]
+        from taskflow.execution_quality_reading import layout, validate_history
+
+        reading = layout(record)
         label = f"{state['step']}-{state['stage']}"
+        if reading is not None:
+            label = reading["label"]
         node_id = _identity(flow_id, label)
         work_id = (definition.get("first_work_id") if state["step"] == 0 else None) or node_id
-        runtime = Path(definition["directory"]) / "nodes" / label / "runtime"
+        runtime = (reading["root"] if reading is not None else Path(definition["directory"]) / "nodes" / label) / "runtime"
         if state.get("current_work_id") not in (None, work_id):
             raise TaskflowError("exception current work differs from the immutable workflow node")
         work = _get_or_none(store.get_work, work_id)
@@ -236,6 +243,38 @@ def resume_workflow(store: ExecutionStore, flow_id: str, *, reason: str, evidenc
                      or work["runtime_path"] != str(runtime)):
             raise TaskflowError("exception node has a different launch binding")
         attempts = store.list_attempts(work_id)
+        if reading is not None:
+            validate_history(store, record)
+            if not attempts:
+                if (work is not None and work["state"] != "ready"
+                        or state.get("current_node_id") not in (None, node_id)
+                        or state.get("current_runtime") not in (None, str(runtime))
+                        or state.get("exception", {}).get("work_id") not in (None, work_id)):
+                    raise TaskflowError("serial quality resume lost its zero-model preflight binding")
+            else:
+                from taskflow.execution_runner import _info, _validated_collection
+
+                if (state.get("current_node_id") != node_id or state.get("current_runtime") != str(runtime)
+                        or state.get("current_work_id") != work_id or work is None
+                        or state.get("exception", {}).get("work_id") != work_id
+                        or len(attempts) != 1 or attempts[0]["state"] != "completed"):
+                    raise TaskflowError("serial quality resume requires the exact completed original turn")
+                original = attempts[0]
+                manifest = _read(runtime / "manifest.json")
+                session = manifest.get("quality_session", {})
+                collected = _validated_collection(runtime, manifest)
+                expected_previous = state["serial_quality_reading"]["turns"][-1]["seal"] if reading["index"] else None
+                if (_read(runtime / "manifest-lock.json") != _info(runtime / "manifest.json")
+                        or original["runtime_path"] != str(runtime) or original["role"] != "quality"
+                        or original["candidate_id"] != state["candidate_id"] or not original["cli_sid"]
+                        or manifest.get("intent_id") != node_id or manifest.get("role") != "quality"
+                        or manifest.get("candidate_binding") != state["serial_quality_reading"]["candidate_binding"]
+                        or session.get("flow_id") != flow_id or session.get("index") != reading["index"]
+                        or session.get("phase") != reading["phase"] or session.get("plan") != reading["reference"]
+                        or session.get("previous") != expected_previous
+                        or collected.get("sid") != original["cli_sid"] or collected.get("status") != "completed"
+                        or collected.get("technical_accepted") is not True):
+                    raise TaskflowError("serial quality resume lost its locked manifest, collection or cursor binding")
         projection = None
         identity_proof = None
         if state.get("exception", {}).get("reason") == "repair defect_ids: list required":
@@ -286,6 +325,12 @@ def resume_workflow(store: ExecutionStore, flow_id: str, *, reason: str, evidenc
         resolved = {"exception": state.get("exception"), "receipt": state.get("receipt"),
                     "reason": reason, "evidence": refs, "revision": record["revision"],
                     "probe_reports": failed_reports, "evidence_digest": evidence_digest}
+        if reading is not None:
+            resolved["serial_quality_node"] = {
+                "plan": reading["reference"], "index": reading["index"], "phase": reading["phase"],
+                "node_id": node_id, "work_id": work_id, "runtime": str(runtime),
+                "attempt_id": attempts[0]["attempt_id"] if attempts else None,
+                "action": "consume_completed_original" if attempts else "retry_zero_model_preflight"}
         if identity_proof is not None:
             resolved["repair_defect_identity"] = identity_proof
             existing = state.get("repair_defect_identities", {}).get(identity_proof["attempt_id"])
@@ -335,19 +380,24 @@ def _predecessor(store: ExecutionStore, definition: dict) -> tuple[dict, dict]:
     attempt = store.get_attempt(initial["predecessor_attempt"])
     work = store.get_work(attempt["work_id"])
     candidate = store.get_candidate(initial["candidate_id"])
+    source_candidate = candidate
+    if initial.get("public_predecessor_reuse") is not None:
+        from taskflow.execution_public_predecessor import validate_public_reuse
+
+        source_candidate = validate_public_reuse(store, definition, attempt, candidate)
     declared = initial.get("predecessor_binding")
     identity = {key: attempt[key] for key in ("work_id", "intent_id", "candidate_id", "task_id")}
     if declared is not None and declared != identity:
         raise TaskflowError("workflow predecessor declared intent binding differs")
     if (attempt["task_id"] != definition["task_id"]
-            or attempt["candidate_id"] != initial["candidate_id"]
+            or attempt["candidate_id"] != source_candidate["candidate_id"]
             or candidate["task_id"] != definition["task_id"]):
         raise TaskflowError("workflow predecessor task/candidate binding differs")
     for key in ("task_id", "candidate_id", "intent_id", "runtime_path", "policy_id", "request_digest"):
         if work[key] != attempt[key]:
             raise TaskflowError("workflow predecessor work/attempt binding differs: " + key)
     for key in ("input_digest", "content_digest"):
-        if work[key] != candidate[key] or attempt[key] != candidate[key]:
+        if work[key] != source_candidate[key] or attempt[key] != source_candidate[key]:
             raise TaskflowError("workflow predecessor candidate version differs: " + key)
     for key, digest in initial.get("expected_digests", {}).items():
         if candidate[key] != digest:
@@ -360,7 +410,7 @@ def _predecessor(store: ExecutionStore, definition: dict) -> tuple[dict, dict]:
     if _read(root / "manifest-lock.json") != {"sha256": sha256(raw), "size": len(raw)}:
         raise TaskflowError("workflow predecessor manifest is not sealed")
     manifest = json.loads(raw)
-    if (manifest.get("candidate_binding") != _binding(candidate)
+    if (manifest.get("candidate_binding") != _binding(source_candidate)
             or manifest.get("intent_id") != attempt["intent_id"]
             or manifest.get("policy_version") != attempt["policy_id"]
             or manifest.get("role") != attempt["role"]
@@ -438,6 +488,10 @@ def _initialize(store: ExecutionStore, record: dict) -> dict:
         state["history"] = [{"kind": "adopted_predecessor", "attempt_id": predecessor,
                              "cli_sid": predecessor_sid, "archive": archived["path"],
                              "business_verdict": "not_inferred"}]
+        if initial.get("public_predecessor_reuse") is not None:
+            state["history"][0]["public_predecessor_reuse"] = validate_evidence([initial["public_predecessor_reuse"]])[0]
+            state["history"][0]["target_candidate_binding"] = _binding(candidate)
+            state["history"][0]["quality_transfer"] = False
     state["initialized"] = True
     state.pop("waiting_predecessor", None)
     return _save(store, record, state, "workflow_source_bound")
@@ -624,6 +678,49 @@ def _review_input_protocol(store: ExecutionStore, candidate: dict, root: Path,
         {"path": str(path), "kind": "source_metadata", "target": "execution/repair-diff.json"}, *historical]
 
 
+def _target_preflight_context(candidate, state, inputs, work):
+    """Describe the same bound predecessor aliases for a read-only self-check."""
+    archive_name = state.get("public_archive")
+    candidate_paths = set(_review_files(candidate))
+    observed_paths, source_errors = [], []
+    if archive_name:
+        archive = Path(archive_name)
+        if archive_name not in state.get("archives", []):
+            source_errors.append("public observation archive is outside the recorded provenance")
+        else:
+            try:
+                predecessor = _read(archive / "manifest.json").get("candidate_binding", {})
+                if any(predecessor.get(key) != candidate[key] for key in ("task_id", "input_digest")):
+                    source_errors.append("public observation archive belongs to another public candidate")
+            except (OSError, ValueError, TaskflowError) as error:
+                source_errors.append("public observation archive manifest is unavailable: " + str(error))
+        seen_targets = set()
+        for item in inputs:
+            if item.get("kind") not in ("submission", "trace"):
+                continue
+            target = item.get("target", "")
+            source = Path(item["path"])
+            if not source.is_relative_to(archive):
+                source_errors.append("public observation source is outside the exact public archive: " + target)
+            elif target in seen_targets:
+                source_errors.append("ambiguous public observation alias: " + target)
+            elif target in candidate_paths or not ((item["kind"] == "submission" and target.startswith(
+                    ("actual-public-work/", "actual-public-scratch/")))
+                    or (item["kind"] == "trace" and target == "actual-public-trace.jsonl")):
+                source_errors.append("Unsupported public-predecessor observation alias: " + target)
+            else:
+                try:
+                    _regular(source)
+                except (OSError, TaskflowError) as error:
+                    source_errors.append("public observation source cannot be read safely: " + target + ": " + str(error))
+                else:
+                    observed_paths.append(target)
+            seen_targets.add(target)
+    targets = {"candidate_paths": sorted(candidate_paths), "observed_paths": observed_paths,
+               "source_errors": source_errors, "work": str(work)}
+    return targets
+
+
 def _prepare_node(store: ExecutionStore, record: dict) -> dict:
     proof = record["state"].get("repair_capacity_continuation")
     if (proof is not None and record["state"].get("stage") == "repair"
@@ -653,12 +750,24 @@ def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
     slot = role["runner"].get("model_slot")
     setting = policy_setting(policy, "repair" if stage == "repair" else "quality", slot, definition["task_id"])
     if snapshot is not None:
+        from taskflow.execution_codex_provider import copy_provider_setting
+
+        copy_provider_setting(role["runner"], setting)
         role["runner"].update({key: setting[key] for key in
                               ("cli", "model", "reasoning_effort", "timeout_seconds", "reasoning_selection", "reasoning_context")})
         if stage == "public_rebuild":
+            copy_provider_setting(role["prepare"]["config"], setting)
             role["prepare"]["config"].update({key: setting[key] for key in
                                              ("cli", "model", "reasoning_effort", "reasoning_selection", "reasoning_context")})
     label = f"{number}-{stage}"
+    from taskflow.execution_quality_reading import layout, context_metadata, configure_runner
+
+    reading = layout(record)
+    if reading is not None:
+        from taskflow.execution_quality_reading import validate_history
+
+        validate_history(store, record)
+        label = reading["label"]
     node_id = _identity(record["flow_id"], label)
     work_id = definition.get("first_work_id") if number == 0 else None
     work_id = work_id or node_id
@@ -676,6 +785,9 @@ def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
             raise TaskflowError("repair continuation lacks its immutable issuing event")
     root = Path(definition["directory"]) / "nodes" / label
     runtime, work, scratch = root / "runtime", root / "work", root / "scratch"
+    if reading is not None:
+        root = reading["root"]
+        runtime, work, scratch = root / "runtime", reading["work"], reading["scratch"]
     existing = _get_or_none(store.get_work, work_id)
     if existing is not None:
         if (existing["intent_id"] != node_id or existing["candidate_id"] != candidate["candidate_id"]
@@ -684,6 +796,9 @@ def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
             raise TaskflowError("workflow node already exists with different launch identity")
         state.update(current_work_id=work_id, current_runtime=str(runtime), current_node_id=node_id)
         return _save(store, record, state, "workflow_existing_node_recovered")
+    if role["runner"].get("public_first_initial_listing") is not None and (
+            stage != "quality" or role.get("scope") != "whole_package" or reading is not None):
+        raise TaskflowError("neutral initial listing supports only the fresh ordinary whole-quality stage")
     frozen_spec = root / "spec.json"
     if frozen_spec.exists():
         specification = _read(frozen_spec)
@@ -715,6 +830,14 @@ def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
                "defect_ids": ([item["defect_id"] for item in state["defects"]]
                               if stage == "repair" else state["repaired_defects"]),
                "defects": state["defects"]}
+    continuation = next((row for row in reversed(state.get("history", []))
+                         if row.get("kind") in {"workflow_inconclusive_continued", "workflow_rejected_quality_continued"}
+                         and row.get("new_work_id") == (_identity(record["flow_id"], reading["canonical_label"])
+                                                       if reading is not None else node_id)), None)
+    if continuation is not None:
+        context["quality_continuation"] = continuation
+    if reading is not None:
+        context["serial_quality_reading"] = context_metadata(record, reading)
     process_inputs = []
     # Existing prepared specifications keep their own exact request and inputs;
     # new protocol material is produced only before the first specification.
@@ -739,7 +862,7 @@ def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
         runner["inputs"].append({"path": str(Path(state["candidate_root"]) / "task.json"),
                                  "kind": "source_metadata", "target": "execution/task.json"})
         runner["inputs"].extend(process_inputs)
-        if context.get("public_first"):
+        if context.get("public_first") and (reading is None or reading["index"] == 0):
             runner["request_sections"] = [{"kind": "operation", "text": public_first_instructions(context)},
                                           *runner.get("request_sections", [])]
         for item in _render(role.get("predecessor_inputs", []), context):
@@ -755,8 +878,10 @@ def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
             else:
                 runner["inputs"].append(item)
         for index, reference in enumerate(state.get("last_review_evidence", [])):
+            suffix = (".md" if continuation is not None
+                      and continuation["kind"] == "workflow_rejected_quality_continued" and index == 2 else ".json")
             runner["inputs"].append({"path": reference["path"], "kind": "history",
-                                     "target": f"execution/previous-review-{index}.json"})
+                                     "target": f"execution/previous-review-{index}{suffix}"})
         if stage == "repair":
             present = {item["path"] for item in runner["inputs"]}
             runner["inputs"] += [{"path": item["path"], "kind": "teacher", "target": item["package_path"]}
@@ -767,11 +892,57 @@ def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
         instructions += ("\nRead the authoritative current package under " + str(runtime / "inputs")
                          + "; execution/task.json is its declaration. Original source paths are provenance, not a request to bypass permissions. "
                          "covered_defect_ids uses only the current execution defect_ids supplied here; historical issue IDs remain historical evidence.\n")
+        if continuation is not None:
+            source_description = ("a rejected signed quality report" if continuation["kind"] == "workflow_rejected_quality_continued"
+                                  else "an inconclusive signature")
+            instructions += ("\nThis is one fresh independent whole review after " + source_description + ". "
+                "For compact pre-checkpoint routing metadata, use json.load on execution/current.json and "
+                'output only current["public_first"], current["inputs_root"], current["work"] and current["scratch"]. '
+                "Do not output other current fields before the checkpoint. "
+                "Before reading the informed continuation purpose, complete the public-first checkpoint, "
+                "save it, and print its actual SHA256 anchor. Only afterward use json.load on execution/current.json "
+                'and read exactly current["quality_continuation"]["purpose"]. Print only that field, in pages of at most '
+                "6000 UTF-8 bytes per tool response; if longer, continue at the next complete UTF-8 character without "
+                "omitting any part of the purpose. Do not dump the whole current object, task declaration or history. "
+                "Use the post-checkpoint purpose to locate the concrete unread duties and material entry points. "
+                "execution/current.json binds the preserved original, explicit purpose and current candidate; "
+                "execution/previous-review-0.json and previous-review-1.json are historical evidence. "
+                "Complete the previously unread source and public reconstruction scope as well as the whole current package. "
+                "Do not infer acceptance from the continuation authorization, source identity or previous partial checks. "
+                "Explicitly examine every supplied current repaired defect. Sign your own actual accepted, revision_required "
+                "or inconclusive outcome; retained limitations remain limitations.\n")
+            if continuation["kind"] == "workflow_rejected_quality_continued":
+                instructions += "The original unreceived intake is execution/previous-review-2.md, also historical evidence.\n"
         runner.setdefault("request_sections", []).append({"kind": "operation", "text": instructions})
         runner["request_sections"].append({"kind": "operation", "text":
             "Required final delivery files: " + ", ".join(runner.get("outputs", []))
             + ". Required complete output directories: " + ", ".join(runner.get("output_trees", []))
             + ". Deliver every declared file; a final message does not replace a requested file."})
+        if reading is not None:
+            configure_runner(record, reading, runner, context)
+        if stage != "repair" and (reading is None or reading.get("phase") == "final"):
+            # The same pure target policy used by intake, staged read-only in
+            # this attempt. This is a self-check, never a new acceptance gate.
+            import shlex
+            import sys
+
+            targets = _target_preflight_context(candidate, state, runner["inputs"], work)
+            target_context = root / "quality-target-paths.json"
+            _publish_once(target_context, targets)
+            helper = Path(__file__).with_name("execution_quality_progress_contract.py")
+            runner["inputs"].extend([
+                {"path": str(helper), "kind": "source_metadata", "target": "execution/quality-target-preflight.py"},
+                {"path": str(target_context), "kind": "source_metadata", "target": "execution/quality-target-paths.json"},
+            ])
+            python = runner.get("native_permissions", {}).get("python", sys.executable)
+            command = shlex.join(["rtk", "proxy", python, str(runtime / "inputs/execution/quality-target-preflight.py"),
+                                  "--target-scope-only", "--context", str(runtime / "inputs/execution/quality-target-paths.json")])
+            runner["request_sections"].append({"kind": "operation", "text":
+                "Before ending this same quality turn, run the read-only local target-scope check: " + command
+                + ". If it identifies an issue and affected path, independently clarify the actual responsibility "
+                  "and correct the signature or keep a truthful inconclusive result in this same turn. "
+                  "Do not weaken a genuine blocking finding or presume acceptance. The check does not decide quality, "
+                  "authenticate sources, add a review, or replace the original intake."})
     specification = {"work": {"work_id": work_id, "task_id": definition["task_id"],
                      "candidate_id": candidate["candidate_id"], "policy_id": definition["policy_id"],
                      "intent_id": node_id, "role": "repair" if stage == "repair" else "quality",
@@ -788,23 +959,25 @@ def _prepare_node_checked(store: ExecutionStore, record: dict) -> dict:
     return _save(store, record, state, "workflow_node_enqueued")
 
 
-def _review_metadata(record: dict, candidate: dict, attempt: dict) -> dict[str, dict]:
+def _review_metadata(record: dict, candidate: dict, attempt: dict, *, received_dependencies=None) -> dict[str, dict]:
     """Expose only the factory's locked, current candidate declaration alias."""
     from taskflow.execution_flow_contracts import review_metadata_aliases
     from taskflow.execution_runner import _validate
     from taskflow.packages import check_task
 
     runtime = Path(attempt["runtime_path"])
-    manifest = _validate(runtime)
+    manifest = (_validate(runtime) if received_dependencies is None
+                else _validate(runtime, received_dependencies=received_dependencies))
     if manifest["candidate_binding"] != _binding(candidate) or manifest["intent_id"] != attempt["intent_id"]:
         raise TaskflowError("review metadata belongs to a different candidate or intent")
-    aliases = review_metadata_aliases(candidate, manifest, runtime)
+    aliases = (review_metadata_aliases(candidate, manifest, runtime) if received_dependencies is None
+               else review_metadata_aliases(candidate, manifest, runtime, received_dependencies=received_dependencies))
     if not aliases or aliases["execution/task.json"]["path"] != str(Path(record["state"]["candidate_root"]) / "task.json"):
         raise TaskflowError("review declaration alias has a foreign source")
     return aliases
 
 
-def _review_observations(record: dict, candidate: dict, attempt: dict) -> dict[str, dict]:
+def _review_observations(record: dict, candidate: dict, attempt: dict, *, received_dependencies=None) -> dict[str, dict]:
     """Resolve only locked inputs from this candidate's actual public archive."""
     from taskflow.execution_runner import _validate
 
@@ -819,7 +992,8 @@ def _review_observations(record: dict, candidate: dict, attempt: dict) -> dict[s
     if any(old_binding.get(key) != candidate[key] for key in ("task_id", "input_digest")):
         raise TaskflowError("public observation archive belongs to another public candidate")
     runtime = Path(attempt["runtime_path"])
-    manifest = _validate(runtime)
+    manifest = (_validate(runtime) if received_dependencies is None
+                else _validate(runtime, received_dependencies=received_dependencies))
     if manifest["candidate_binding"] != _binding(candidate) or manifest["intent_id"] != attempt["intent_id"]:
         raise TaskflowError("public observation inputs have a foreign candidate/intent")
     aliases = {}
@@ -891,6 +1065,10 @@ def _consume_review(store: ExecutionStore, record: dict, attempt: dict, archive:
     prior_sids.update(definition.get("initial", {}).get("excluded_review_sids", []))
     if attempt.get("cli_sid") and attempt["cli_sid"] in prior_sids:
         raise TaskflowError("independent quality reused a public predecessor CLI identity")
+    rejected_sids = {item.get("source", {}).get("cli_sid") for item in state["history"]
+                     if item.get("kind") == "workflow_rejected_quality_continued"}
+    if attempt.get("cli_sid") and attempt["cli_sid"] in rejected_sids:
+        raise TaskflowError("independent quality reused a rejected quality CLI identity")
     role = definition["roles"][state["stage"]]
     candidate = store.get_candidate(state["candidate_id"])
     runtime = Path(attempt["runtime_path"])
@@ -1100,10 +1278,17 @@ def advance_workflow(store: ExecutionStore, flow_id: str) -> dict:
                 return advance_failed_capacity_retry(store, record, attempt)
             raise TaskflowError("role technical failure/uncertainty retained: " + attempt["attempt_id"])
         destination = Path(record["definition"]["directory"]) / "archives" / attempt["attempt_id"]
+        from taskflow.execution_quality_reading import layout, receive_progress
+        from taskflow.execution_quality_session import seal_turn
+
+        reading = layout(record)
+        turn_seal = seal_turn(Path(attempt["runtime_path"])) if reading is not None else None
         archive = archive_full_attempt(Path(attempt["runtime_path"]), destination)
         if archive["path"] not in state["archives"]:
             state["archives"] = [*state["archives"], archive["path"]]
             record = _save(store, record, state, "workflow_full_originals_archived")
+        if reading is not None and reading["phase"] == "progress":
+            return receive_progress(store, record, attempt, archive, turn_seal)
         if state["stage"] == "repair":
             return _consume_repair(store, record, attempt, archive)
         if state["stage"] == "public_rebuild":

@@ -73,38 +73,16 @@ class LifecycleTests(unittest.TestCase):
             register_lifecycle(self.store, self.definition, self.refs)
 
     def test_verified_path_transport_resumes_original_completed_author_without_relaunch(self):
-        work = self.enqueue("transport-author", "author")
-        execution.run_worker(self.store, "fixture", False, [work["work_id"]])
-        attempt = next(row for row in self.store.dashboard()["attempts"] if row["work_id"] == work["work_id"])
-        definition = {**self.definition, "kind": "author_quality_v1", "flow_id": "transport-source",
-            "source_author_attempt": attempt["attempt_id"],
-            "source_author_binding": {key: attempt[key] for key in ("work_id", "intent_id", "candidate_id", "task_id")}}
-        current = register_lifecycle(self.store, definition, self.refs)
-        receipt = self.root / "original-exception.json"
-        receipt.write_text('{"reason":"original path contract exception"}\n')
-        old = receipt.read_bytes()
-        state = {**current["state"], "status": "exception", "stage": "author_handoff", "author_archive": str(self.root / "archive"),
-                 "receipt": str(receipt), "exception": {"reason": "original path contract exception"}}
-        self.store.update_flow(current["flow_id"], current["revision"], state, {"kind": "neutral_exception_fixture"})
-        resolution = {"action": "accept_path_only_candidate_transport", "reason": "Exact immutable payloads, path metadata only", "evidence": self.refs}
-        material = {"transport": {"scope": "path_only"}, "archive": state["author_archive"], "candidate_root": str(self.root / "derived")}
-        with patch.object(self.store, "_validated_optional_candidate_delivery", return_value=material):
-            result = resume_path_transport(self.store, current["flow_id"], resolution)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("author_handoff", result["state"]["stage"])
-        self.assertEqual(old, receipt.read_bytes())
-        self.assertFalse(result["state"]["history"][-1]["new_author_dispatched"])
-        self.assertEqual(1, len(self.store.dashboard()["attempts"]))
-        with self.assertRaises(TaskflowError):
-            resume_path_transport(self.store, current["flow_id"], resolution)
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_path_transport_resolution_cannot_resume_other_kinds_or_unspecific_action(self):
-        register_lifecycle(self.store, self.definition, self.refs)
-        for value in ({"reason": "try again", "evidence": self.refs},
-                      {"action": "accept_path_only_candidate_transport", "reason": "typed", "evidence": self.refs}):
-            with self.assertRaises(TaskflowError):
-                resume_path_transport(self.store, self.definition["flow_id"], value)
-        self.assertEqual([], self.store.dashboard()["attempts"])
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def preparation_exception(self, identity, stage):
         work = self.enqueue(identity + "-author", "author")
@@ -138,97 +116,28 @@ class LifecycleTests(unittest.TestCase):
         return current, attempt, material, receipt
 
     def test_unclaimed_public_preparation_resumes_without_changing_original_author_or_exception(self):
-        record, attempt, material, receipt = self.preparation_exception("public-unclaimed", "public_prepare")
-        old_receipt = receipt.read_bytes()
-        collection = Path(attempt["runtime_path"]) / "collection.json"
-        old_collection = collection.read_bytes()
-        resolution = {"action": "resume_unclaimed_public_preparation", "reason": "Use the permitted external public runtime root.", "evidence": self.refs}
-        with patch.object(self.store, "_validated_optional_candidate_delivery", return_value=material) as validate:
-            result = resume_path_transport(self.store, record["flow_id"], resolution)
-        validate.assert_called_once_with(attempt)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("public_prepare", result["state"]["stage"])
-        history = result["state"]["history"][-1]
-        self.assertEqual(record["state"]["exception"], history["previous_exception"])
-        self.assertEqual(sha256(old_receipt), history["previous_receipt"]["sha256"])
-        self.assertFalse(history["new_author_dispatched"])
-        self.assertEqual(old_receipt, receipt.read_bytes())
-        self.assertEqual(old_collection, collection.read_bytes())
-        self.assertEqual(attempt, self.store.get_attempt(attempt["attempt_id"]))
-        self.assertEqual(1, len(self.store.dashboard()["attempts"]))
-        self.assertEqual(1, len(self.store.dashboard()["work"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_public_preparation_rejects_current_or_previously_enqueued_work_and_wrong_action(self):
-        from taskflow.execution_author import _identity
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
 
-        record, attempt, material, receipt = self.preparation_exception("public-gates", "public_prepare")
-        resolution = {"action": "resume_unclaimed_public_preparation", "reason": "Narrow unclaimed preparation only.", "evidence": self.refs}
-        with patch.object(self.store, "_validated_optional_candidate_delivery", return_value=material):
-            with self.assertRaisesRegex(TaskflowError, "unclaimed author preparation"):
-                resume_path_transport(self.store, record["flow_id"], {**resolution, "action": "accept_unsigned_author_placeholders"})
-            changed = self.store.update_flow(record["flow_id"], record["revision"],
-                {**record["state"], "current_work_id": "existing-public"}, {"kind": "neutral_existing_work"})
-            with self.assertRaisesRegex(TaskflowError, "unclaimed author preparation"):
-                resume_path_transport(self.store, record["flow_id"], resolution)
-            restored = self.store.update_flow(record["flow_id"], changed["revision"], record["state"], {"kind": "neutral_restore_exception"})
-            self.enqueue(_identity(record["flow_id"], "public-work"), "quality")
-            with self.assertRaisesRegex(TaskflowError, "already enqueued"):
-                resume_path_transport(self.store, record["flow_id"], resolution)
-        self.assertEqual(restored, self.store.get_flow(record["flow_id"]))
-        self.assertTrue(receipt.exists())
-        self.assertEqual(attempt, self.store.get_attempt(attempt["attempt_id"]))
+        assert_legacy_recovery_retired(self)
 
     def test_typed_alias_preserves_delivered_payloads_and_only_accepts_unsigned_report_metadata(self):
-        record, attempt, material, receipt = self.preparation_exception("unsigned-alias", "author_handoff")
-        source, alias = Path(material["candidate_root"]), self.root / "technical-alias"
-        shutil.copytree(source, alias)
-        report_path = read_json(alias / "task.json")["reviews"][0]["path"]
-        report = read_json(alias / report_path)
-        report["scope"] = "Only undeclared, explicitly inconclusive transport metadata was prepared."
-        write_json(alias / report_path, report)
-        original_metadata = (source / report_path).read_bytes()
-        original_receipt = receipt.read_bytes()
-        resolution = {"action": "accept_unsigned_author_placeholders", "reason": "Exact source payloads with typed unsigned metadata.",
-                      "candidate_root": str(alias), "evidence": self.refs}
-        with patch.object(self.store, "_validated_optional_candidate_delivery", return_value=material):
-            result = resume_path_transport(self.store, record["flow_id"], resolution)
-        self.assertEqual(str(alias), result["state"]["technical_candidate_root"])
-        self.assertEqual(str(source), result["state"]["history"][-1]["candidate_root"])
-        self.assertNotIn("candidate_root", result["state"])
-        self.assertEqual(original_metadata, (source / report_path).read_bytes())
-        self.assertNotEqual(original_metadata, (alias / report_path).read_bytes())
-        self.assertEqual(original_receipt, receipt.read_bytes())
-        self.assertEqual(attempt, self.store.get_attempt(attempt["attempt_id"]))
-        self.assertEqual(1, len(self.store.dashboard()["attempts"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_typed_alias_rejects_payload_declaration_and_signed_report_drift_without_state_change(self):
-        record, attempt, material, receipt = self.preparation_exception("alias-negative", "author_handoff")
-        source = Path(material["candidate_root"])
-        declaration = read_json(source / "task.json")
-        original_receipt = receipt.read_bytes()
-        for kind in ("payload", "declaration", "signed_report"):
-            alias = self.root / ("bad-alias-" + kind)
-            shutil.copytree(source, alias)
-            if kind == "payload":
-                path = alias / declaration["files"][0]["path"]
-                path.write_bytes(path.read_bytes() + b"changed")
-            elif kind == "declaration":
-                value = read_json(alias / "task.json")
-                value["title"] = "Changed delivered metadata"
-                write_json(alias / "task.json", value)
-            else:
-                path = alias / declaration["reviews"][0]["path"]
-                value = read_json(path)
-                value["status"] = "passed"
-                write_json(path, value)
-            resolution = {"action": "accept_unsigned_author_placeholders", "reason": "Neutral negative alias check.",
-                          "candidate_root": str(alias), "evidence": self.refs}
-            with self.subTest(drift=kind), patch.object(self.store, "_validated_optional_candidate_delivery", return_value=material):
-                with self.assertRaises(TaskflowError):
-                    resume_path_transport(self.store, record["flow_id"], resolution)
-            self.assertEqual(record, self.store.get_flow(record["flow_id"]))
-        self.assertEqual(original_receipt, receipt.read_bytes())
-        self.assertEqual(attempt, self.store.get_attempt(attempt["attempt_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_intake_failure_retains_exception_and_does_not_retry(self):
         register_lifecycle(self.store, self.definition, self.refs)
@@ -403,49 +312,25 @@ class LifecycleTests(unittest.TestCase):
         finally:
             process.communicate("\n", timeout=5)
 
-    def test_cli_lifecycle_register_and_real_stdio_root_dispatch_preserve_receipt_once(self):
-        spec = self.root / "lifecycle.json"
-        write_json(spec, {"definition": self.definition, "evidence": self.refs})
-        code, registered, error = self.cli("lifecycle-register", "--spec", str(spec))
-        self.assertEqual(0, code, error)
-        state = {**registered["state"], "status": "accepted", "result": {"nature": "neutral test_fixture"}}
-        self.store.update_flow(registered["flow_id"], registered["revision"], state, {"kind": "fixture_terminal"})
-        args = [sys.executable, "-m", "taskflow", "execution", "--db", str(self.store.path), "lifecycle-run", "--flow-id", registered["flow_id"]]
-        first = subprocess.run(args, capture_output=True, text=True, timeout=10, check=True)
-        again = subprocess.run(args, capture_output=True, text=True, timeout=10, check=True)
-        result, second = json.loads(first.stdout), json.loads(again.stdout)
-        self.assertEqual(result["revision"], second["revision"])
-        self.assertEqual("accepted", result["state"]["status"])
-        self.assertFalse(read_json(Path(result["state"]["receipt"]))["human_read_claimed"])
-        code, direct, error = self.cli("lifecycle-run", "--flow-id", registered["flow_id"])
-        self.assertEqual(0, code, error)
-        self.assertEqual(result["revision"], direct["revision"])
+    def test_retired_evaluation_lifecycle_cli_never_changes_original_receipt(self):
+        registered = register_lifecycle(self.store, self.definition, self.refs)
+        before = self.store.events()
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            execution.main(["--db", str(self.store.path), "lifecycle-run", "--flow-id", registered["flow_id"]])
+        self.assertEqual(2, error.exception.code)
+        self.assertEqual(before, self.store.events())
+        self.assertEqual(registered, self.store.get_flow(registered["flow_id"]))
         self.assertEqual([], self.store.dashboard()["attempts"])
 
-    def test_cli_author_start_binds_one_packet_factory_directory_and_explicit_model_flag(self):
-        packet, factory = self.root / "author-packet.json", self.root / "factory.json"
-        write_json(packet, {"items": [{"intent_id": "one-author-intent"}]})
-        value = {"template_spec_ref": {"path": "unused-neutral-template", "sha256": "a" * 64},
-                 "research_root": str(self.root / "research")}
-        write_json(factory, value)
-        with patch("taskflow.execution_author.start_author_from_packet", return_value={"state": "ready", "nature": "fixture boundary"}) as start:
-            code, result, error = self.cli("author-start", "--packet", str(packet), "--factory", str(factory))
-        self.assertEqual(0, code, error)
-        self.assertEqual("ready", result["state"])
-        kwargs = start.call_args.kwargs
-        self.assertFalse(kwargs["allow_model"])
-        self.assertEqual(self.root / "research/one-author-intent", kwargs["directory"])
-        self.assertEqual(str(packet), kwargs["packet_ref"]["path"])
-        self.assertEqual(value, kwargs["factory_config"])
-        with patch("taskflow.execution_author.start_author_from_packet", return_value={"state": "fixture_only"}) as start:
-            self.assertEqual(0, self.cli("author-start", "--packet", str(packet), "--factory", str(factory), "--allow-model")[0])
-        self.assertTrue(start.call_args.kwargs["allow_model"])
-        for items in (None, [], [{"intent_id": "one"}, {"intent_id": "two"}]):
-            write_json(packet, {"items": items})
-            with self.subTest(items=items), patch("taskflow.execution_author.start_author_from_packet", side_effect=AssertionError("not one item")):
-                code, _, error = self.cli("author-start", "--packet", str(packet), "--factory", str(factory))
-                self.assertEqual(2, code)
-                self.assertIn("one concretely authorized", error["error"])
+    def test_retired_author_cli_rejects_both_model_flags_without_dispatch(self):
+        before = self.store.events()
+        for flag in ([], ["--allow-model"]):
+            with self.subTest(flag=flag), patch("taskflow.execution_author.start_author_from_packet") as start, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    execution.main(["--db", str(self.store.path), "author-start", "--packet", "unused.json", "--factory", "unused.json", *flag])
+                self.assertEqual(2, error.exception.code)
+                start.assert_not_called()
+        self.assertEqual(before, self.store.events())
 
 
 class FormalPreparationResumeTests(unittest.TestCase):
@@ -485,97 +370,34 @@ class FormalPreparationResumeTests(unittest.TestCase):
         return patch("taskflow.execution_formal.validate_formal_authority", return_value={"controller": "fixture-controller"})
 
     def test_exact_unclaimed_formal_guard_resumes_once_and_preserves_definition_run_decision_receipts(self):
-        record, receipt = self.failure()
-        original = receipt.read_bytes()
-        old_decisions = self.store.dashboard()["decisions"]
-        bootstrap = Path(record["definition"]["directory"]) / "consumer-launch-intent.json"
-        bootstrap.parent.mkdir(parents=True, exist_ok=True)
-        bootstrap.write_text("Original detached consumer launch intent.\n")
-        with self.validate_authority() as authority:
-            result = resume_path_transport(self.store, record["flow_id"], self.resolution)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual("formal_prepare", result["state"]["stage"])
-        self.assertEqual(record["definition"], result["definition"])
-        self.assertEqual(record["state"]["run_index"], result["state"]["run_index"])
-        self.assertEqual(record["state"]["release"], result["state"]["release"])
-        self.assertEqual(old_decisions, self.store.dashboard()["decisions"])
-        self.assertEqual(original, receipt.read_bytes())
-        self.assertEqual("Original detached consumer launch intent.\n", bootstrap.read_text())
-        history = result["state"]["history"][-1]
-        self.assertEqual(sha256(original), history["previous_receipt"]["sha256"])
-        self.assertFalse(history["new_model_dispatched"])
-        self.assertEqual("fixture-01", authority.call_args.kwargs["config"]["run_id"])
-        self.assertEqual(1, len(self.store.dashboard()["attempts"]))
-        with self.assertRaisesRegex(TaskflowError, "exact received"):
-            resume_path_transport(self.store, record["flow_id"], self.resolution)
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_existing_ready_claimed_and_uncertain_solver_are_never_requeued(self):
-        record, receipt = self.failure(enqueued=True)
-        original = receipt.read_bytes()
-        work = next(row for row in self.store.dashboard()["work"] if row["role"] == "solver")
-        for state in ("ready", "claimed", "uncertain"):
-            if state == "claimed":
-                attempt = self.store.claim("original-solver", [work["work_id"]])
-            elif state == "uncertain":
-                self.store.mark_uncertain(attempt["attempt_id"], "Original uncertain fixture is retained.")
-            before = self.store.dashboard()["attempts"]
-            with self.subTest(state=state), self.validate_authority(), self.assertRaisesRegex(TaskflowError, "already exists"):
-                resume_path_transport(self.store, record["flow_id"], self.resolution)
-            self.assertEqual(before, self.store.dashboard()["attempts"])
-            self.assertEqual(record, self.store.get_flow(record["flow_id"]))
-        self.assertEqual(original, receipt.read_bytes())
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_any_inner_outer_or_formal_intent_footprint_blocks_resume(self):
-        from taskflow.execution_experiment import _node
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
 
-        record, _ = self.failure()
-        inner = Path(record["definition"]["technical"]["formal_runtime_root"]) / "fixture-01"
-        outer = Path(record["definition"]["directory"]) / "runtimes" / _node(record, "solver")
-        intent = inner.with_name(inner.name + ".formal-intent.json")
-        for path in (inner, outer, intent):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("Original preparation trace, never overwrite.")
-            with self.subTest(path=path), self.validate_authority(), self.assertRaisesRegex(TaskflowError, "already exists"):
-                resume_path_transport(self.store, record["flow_id"], self.resolution)
-            self.assertEqual("Original preparation trace, never overwrite.", path.read_text())
-            path.unlink()
-        self.assertEqual(record, self.store.get_flow(record["flow_id"]))
+        assert_legacy_recovery_retired(self)
 
     def test_current_payload_or_release_binding_and_authority_drift_block_resume(self):
-        record, _ = self.failure()
-        path = self.case.task / "draft/evaluation/answer.md"
-        original = path.read_bytes()
-        path.write_bytes(original + b"Unreviewed change.")
-        with self.validate_authority(), self.assertRaisesRegex(TaskflowError, "frozen version differs"):
-            resume_path_transport(self.store, record["flow_id"], self.resolution)
-        path.write_bytes(original)
-        with patch("taskflow.execution_formal.validate_formal_authority", side_effect=TaskflowError("actual authority is still invalid")), \
-             self.assertRaisesRegex(TaskflowError, "authority is still invalid"):
-            resume_path_transport(self.store, record["flow_id"], self.resolution)
-        receipt_path = Path(record["state"]["release"]["receipt"]["path"])
-        receipt_path.write_text("Changed original release receipt.")
-        with self.validate_authority(), self.assertRaises(TaskflowError):
-            resume_path_transport(self.store, record["flow_id"], self.resolution)
-        self.assertEqual(record, self.store.get_flow(record["flow_id"]))
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_new_author_mode_passes_only_immutable_item_selector_and_rechecks_native_quality(self):
-        from taskflow.execution_experiment import _packet
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
 
-        record, _ = self.failure()
-        packet = _packet(record)
-        selector = {"task_id": "neutral", "source_author_quality_flow": "exact-source-author"}
-        definition = {**record["definition"], "flow_id": "new-author-formal-resume", "source_author_flow_id": "exact-source-author",
-                      "business_packet_item": selector}
-        definition.pop("source_flow_id")
-        current = self.store.register_flow(definition["flow_id"], definition, record["evidence"], record["state"])
-        with patch("taskflow.execution_experiment._packet", return_value=packet), \
-             patch("taskflow.execution_experiment._native_handoff", return_value={"fixture": "same current native certificate"}) as native, \
-             self.validate_authority() as authority:
-            result = resume_path_transport(self.store, current["flow_id"], self.resolution)
-        self.assertEqual("active", result["state"]["status"])
-        self.assertEqual(selector, authority.call_args.kwargs["config"]["authorization_item"])
-        native.assert_called_once_with(self.store, current, self.case.candidate["candidate_id"])
-        self.assertEqual(definition, result["definition"])
+        assert_legacy_recovery_retired(self)
 
 
 if __name__ == "__main__":

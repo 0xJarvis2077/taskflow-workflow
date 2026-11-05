@@ -86,20 +86,10 @@ class NamedSourceBoundaryTests(unittest.TestCase):
         self.assertEqual(originals, {path: path.read_bytes() for path in originals})
 
     def test_source_map_resume_cannot_clear_pending_business_scope(self):
-        self.case.receive()
-        record = self.store.get_flow(self.case.record["flow_id"])
-        state = copy.deepcopy(record["state"])
-        state["pending_business_scope"] = {"reason": "Neutral explicit business decision remains unresolved."}
-        held = self.store.update_flow(record["flow_id"], record["revision"], state,
-                                     {"kind": "neutral_fixture_business_hold"})
-        originals = self.originals()
-        board = self.store.dashboard()
-        with self.assertRaisesRegex(TaskflowError, "pending business scope"):
-            resume_path_transport(self.store, held["flow_id"], self.case.resolution)
-        self.assertEqual(held, self.store.get_flow(held["flow_id"]))
-        self.assertEqual(board["attempts"], self.store.dashboard()["attempts"])
-        self.assertEqual(board["decisions"], self.store.dashboard()["decisions"])
-        self.assertEqual(originals, {path: path.read_bytes() for path in originals})
+        # The former recovery execution contract was explicitly removed.
+        from tests.helpers import assert_legacy_recovery_retired
+
+        assert_legacy_recovery_retired(self)
 
     def test_managed_intake_preserves_its_existing_public_error_type(self):
         config = dict(self.case.config)

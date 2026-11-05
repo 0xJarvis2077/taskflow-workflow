@@ -7,11 +7,11 @@
 ## 建档与目录
 
 ```sh
-python3 -m taskflow init my-task
-python3 -m taskflow check tasks/my-task
+python3 -m taskflow init my-task --topic my-topic
+python3 -m taskflow check tasks/my-topic/packages/my-task --no-write
 ```
 
-`init`创建 `tasks/my-task/`，含task.json、record.md、draft/input、draft/evaluation、checks、reports、versions、runs、exports。草稿有意缺标题、项目和评分配置，首次check失败是待填写提示。已存在目标不覆盖。`check`默认追加 `reports/check-<随机ID>/report.json`；`--no-write`只读。CLI退出码0表示操作完成，check发现结构错误为1，契约/IO拒绝为2；run/evaluation导入成功仍可能有证据缺口，应读返回JSON。
+`init --topic` 创建 `tasks/my-topic/packages/my-task/`，含 README.md、task.json、record.md、draft/input、draft/evaluation、checks、reports、versions、runs、exports。已有归并集合必须显式题目归属；平铺集合和显式 `--root <题目>/packages` 保持兼容。分类导航和保留约定见[目录规范](task-layout.md)。下文 `tasks/my-task` 代表实际题包路径，已有包不迁移。草稿有意缺标题、项目和评分配置，首次check失败是待填写提示。已存在目标不覆盖。`check`默认追加 `reports/check-<随机ID>/report.json`；日常浏览用 `--no-write`。CLI退出码0表示操作完成，check发现结构错误为1，契约/IO拒绝为2；run/evaluation导入成功仍可能有证据缺口，应读返回JSON。
 
 下面是一个中性结构示例，业务内容必须自行填写和核验：
 

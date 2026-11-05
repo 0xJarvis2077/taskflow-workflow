@@ -215,22 +215,16 @@ class BaselineQualityTests(unittest.TestCase):
             _author_source(self.store, waiting, item, require_candidate=True)
         self.assertEqual(1, len(self.store.dashboard()["work"]))
 
-    def test_cli_confirmed_batch_checks_precede_database_or_preparation(self):
-        malformed = self.root / "no-confirmation.json"
-        write_json(malformed, {"schema_version": 1, "policy_id": "batch-v1"})
+    def test_retired_baseline_cli_does_not_prepare_or_mutate(self):
+        before = self.store.events()
         missing_db = self.root / "must-not-exist.sqlite3"
-        with contextlib.redirect_stderr(io.StringIO()), patch("taskflow.execution_store.ExecutionStore",
-                side_effect=AssertionError("preflight must precede store")):
-            code = execution.main(["--db", str(missing_db), "batch-baseline-quality-start",
-                "--packet", str(self.packet_path), "--factory", str(malformed)])
-        self.assertEqual(2, code)
+        with contextlib.redirect_stderr(io.StringIO()), patch("taskflow.execution_store.ExecutionStore") as store:
+            with self.assertRaises(SystemExit) as error:
+                execution.main(["--db", str(missing_db), "batch-baseline-quality-start", "--packet", str(self.packet_path), "--factory", str(self.factory_path)])
+        self.assertEqual(2, error.exception.code)
+        store.assert_not_called()
         self.assertFalse(missing_db.exists())
-        with contextlib.redirect_stdout(io.StringIO()):
-            code = execution.main(["--db", str(self.store.path), "batch-baseline-quality-start",
-                "--packet", str(self.packet_path), "--factory", str(self.factory_path)])
-        self.assertEqual(0, code)
-        self.assertEqual(2, len(self.store.list_flows()))
-        self.assertEqual(1, len(self.store.dashboard()["attempts"]))
+        self.assertEqual(before, self.store.events())
 
     def test_terminal_source_receipt_drift_cannot_prepare_a_successor(self):
         record = self.start()
